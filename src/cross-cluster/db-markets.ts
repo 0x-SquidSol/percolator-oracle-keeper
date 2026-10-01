@@ -28,6 +28,10 @@ export interface DbMarketRow {
   symbol: string | null;
   mint_address: string;
   mainnet_ca: string | null;
+  /** The market's creator (review M-7 per-deployer ceiling). Absent in older fixtures. */
+  deployer?: string | null;
+  /** Row creation time; the ceiling keeps the OLDEST markets (the ones already being priced). */
+  created_at?: string | null;
 }
 
 /** Pool address -> DEX type, cached across cycles (a pool never changes owner). */
@@ -104,12 +108,97 @@ export function rowsToEntries(rows: readonly DbMarketRow[], dexByPool: DexCache)
   return out;
 }
 
+/**
+ * Keeper-side ceiling on the markets it prices (review M-7, 2026-10-01).
+ *
+ * Every market in the registry is one more PushAuthMark leg the keeper pays for, every cycle.
+ * Enrollment is gated in the app (percolator-launch keeper-register: finished market + per-creator
+ * and global caps), but a row can reach the table other ways (the admin path, a manual SQL edit,
+ * a future bug), and the keeper's SOL is what runs out. So the keeper bounds itself too: at most
+ * `maxTotal` priceable markets, at most `maxPerDeployer` from one creator, OLDEST first by
+ * `created_at` (slab address breaks ties), so markets already being priced keep their place and
+ * only the newest rows over a ceiling wait. Never empties a non-empty list (both caps are >= 1),
+ * so the wipe-the-board guard in register-poll keeps its meaning.
+ */
+export interface KeeperMarketCaps {
+  maxTotal: number;
+  maxPerDeployer: number;
+}
+
+export const DEFAULT_KEEPER_MAX_MARKETS = 50;
+export const DEFAULT_KEEPER_MAX_MARKETS_PER_DEPLOYER = 10;
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+  const n = raw === undefined ? NaN : Number(raw.trim());
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/** KEEPER_MAX_MARKETS / KEEPER_MAX_MARKETS_PER_DEPLOYER, else the defaults. */
+export function keeperMarketCapsFromEnv(env: NodeJS.ProcessEnv = process.env): KeeperMarketCaps {
+  return {
+    maxTotal: positiveInt(env.KEEPER_MAX_MARKETS, DEFAULT_KEEPER_MAX_MARKETS),
+    maxPerDeployer: positiveInt(env.KEEPER_MAX_MARKETS_PER_DEPLOYER, DEFAULT_KEEPER_MAX_MARKETS_PER_DEPLOYER),
+  };
+}
+
+const warnedCapped = new Set<string>();
+
+/**
+ * Apply the ceilings. Rows `isPriceable` rejects pass through uncounted (rowsToEntries drops them
+ * with its own warning), so an unpriceable row never takes a priced market's place.
+ */
+export function capMarketRows(
+  rows: readonly DbMarketRow[],
+  caps: KeeperMarketCaps,
+  isPriceable: (r: DbMarketRow) => boolean = () => true,
+): { kept: DbMarketRow[]; capped: DbMarketRow[] } {
+  const order = [...rows].sort((a, b) => {
+    const ta = a.created_at ? Date.parse(a.created_at) : Number.POSITIVE_INFINITY;
+    const tb = b.created_at ? Date.parse(b.created_at) : Number.POSITIVE_INFINITY;
+    const da = Number.isNaN(ta) ? Number.POSITIVE_INFINITY : ta;
+    const db = Number.isNaN(tb) ? Number.POSITIVE_INFINITY : tb;
+    if (da !== db) return da < db ? -1 : 1;
+    return a.slab_address < b.slab_address ? -1 : a.slab_address > b.slab_address ? 1 : 0;
+  });
+  const kept: DbMarketRow[] = [];
+  const capped: DbMarketRow[] = [];
+  const perDeployer = new Map<string, number>();
+  let total = 0;
+  for (const r of order) {
+    if (!isPriceable(r)) {
+      kept.push(r);
+      continue;
+    }
+    const who = r.deployer ?? "";
+    const n = perDeployer.get(who) ?? 0;
+    if (total >= caps.maxTotal || n >= caps.maxPerDeployer) {
+      capped.push(r);
+      if (!warnedCapped.has(r.slab_address)) {
+        warnedCapped.add(r.slab_address);
+        console.warn(
+          `[db-markets] NOT admitting ${r.slab_address.slice(0, 8)}… — over the keeper's ` +
+            (total >= caps.maxTotal
+              ? `market ceiling (${caps.maxTotal})`
+              : `per-deployer ceiling (${caps.maxPerDeployer} for ${who.slice(0, 8) || "unknown"}…)`),
+        );
+      }
+      continue;
+    }
+    perDeployer.set(who, n + 1);
+    total++;
+    kept.push(r);
+  }
+  return { kept, capped };
+}
+
 export interface FetchActiveConfig {
   supabaseUrl: string;
   supabaseAnonKey: string;
   network: string;
   mainnetConn: Connection;
   dexCache: DexCache;
+  /** Review M-7 ceilings; defaults to keeperMarketCapsFromEnv(). */
+  caps?: KeeperMarketCaps;
 }
 
 /**
@@ -123,10 +212,12 @@ export interface FetchActiveConfig {
 export async function fetchActiveMarkets(cfg: FetchActiveConfig): Promise<MarketEntry[] | null> {
   const url =
     `${cfg.supabaseUrl}/rest/v1/markets` +
-    `?select=slab_address,dex_pool_address,symbol,mint_address,mainnet_ca` +
+    `?select=slab_address,dex_pool_address,symbol,mint_address,mainnet_ca,deployer,created_at` +
     `&keeper_status=eq.active` +
     `&network=eq.${encodeURIComponent(cfg.network)}` +
-    `&dex_pool_address=not.is.null`;
+    `&dex_pool_address=not.is.null` +
+    // Oldest first: the ceiling (capMarketRows) keeps the markets already being priced.
+    `&order=created_at.asc,slab_address.asc`;
 
   let rows: DbMarketRow[];
   try {
@@ -167,5 +258,10 @@ export async function fetchActiveMarkets(cfg: FetchActiveConfig): Promise<Market
     return null;
   }
 
-  return rowsToEntries(rows, cfg.dexCache);
+  const { kept } = capMarketRows(
+    rows,
+    cfg.caps ?? keeperMarketCapsFromEnv(),
+    (r) => !!r.dex_pool_address && cfg.dexCache.has(r.dex_pool_address),
+  );
+  return rowsToEntries(kept, cfg.dexCache);
 }
