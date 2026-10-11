@@ -666,8 +666,10 @@ export async function crankOneMarket(
     // Liveness repairs (lapsed Fresh backing bucket, side stuck in ResetPending):
     // states no crank can leave, which revert every crank Custom(19) or every
     // open Custom(21). Prepended to this cycle's transaction; see liveness-repair.ts.
+    // K-8: planned on EVERY known layout (offsets per VERSION, liveness-repair.ts livenessOffsetsFor), not only the
+    // v2.1-compatible ones: on v2.2 this used to be skipped, so an ADL-reset side stayed ResetPending (opens refused 120).
     let repairs: LivenessRepair[] = [];
-    if (v21Decoders) {
+    if (detection.known) {
       try {
         repairs = planLivenessRepairs(decodeLivenessState(acct.value.data), BigInt(acct.context.slot));
       } catch {

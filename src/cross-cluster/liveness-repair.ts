@@ -46,11 +46,12 @@
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
   ACCOUNTS_EXPIRE_BACKING_BUCKET,
-  V17_MARKET_GROUP_LEN,
-  V17_MARKET_GROUP_OFF,
+  LAYOUTS_BY_VERSION,
   buildAccountMetas,
   encodeExpireBackingBucket,
 } from "@percolatorct/sdk";
+import { describeUnknownLayout, detectLayout, engineSlotBase } from "./market-layout.ts";
+import type { MarketLayout } from "./market-layout.ts";
 
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
@@ -114,22 +115,85 @@ function u64(d: Uint8Array, off: number): bigint {
   return new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(off, true);
 }
 
-export function decodeLivenessState(data: Uint8Array, assetIndex = 0): LivenessState {
-  const a = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
-  if (data.length < a + SLOT_BACKING_LONG + 2 * BACKING_LEN) {
+/**
+ * The engine-slot offsets the repairs read, for one market layout (K-8, 2026-10-12).
+ *
+ * The constants above are the v2.1 numbers (asset state 515 B, slot stride 2,325, group 758). On a v2.2 (VERSION 19)
+ * market the group header is 806 B (+48), the asset state 627 B (+112 band / rent words appended AFTER mode_short, so
+ * the asset-state prefix is unchanged) and the stride 2,661, so the old fixed offsets read 48 B early: the keeper never
+ * saw a ResetPending side or a lapsed bucket on v2.2 (JUP GtUe5hYy… stayed close-only, 120, until a manual tag 45).
+ * Every number now comes from the market's detected layout row (market-layout.ts, per VERSION and length) and the
+ * SDK's per-VERSION engine-slot table: v2.1 backing 963 / barrier 579, v2.2 backing 1,075 / barrier 691. The bucket
+ * struct (97 B, expiry @88, status @96) and the engine-slot field order are unchanged (engine 3ce4cbd1 v16.rs:8253-8260,
+ * :8518-8528).
+ */
+export interface LivenessOffsets {
+  /** Absolute offset of the asset's engine slot. */
+  engineBase: number;
+  storedPosLong: number; storedPosShort: number;
+  staleLong: number; staleShort: number;
+  pendingOblLong: number; pendingOblShort: number;
+  modeLong: number; modeShort: number;
+  barrierLong: number; barrierShort: number;
+  backingLong: number; backingShort: number;
+}
+
+/** v2.1 offsets (the constants above); kept for callers / tests that pin them. */
+export function livenessOffsetsV21(assetIndex = 0): LivenessOffsets {
+  return {
+    engineBase: 592 + 758 + assetIndex * ASSET_SLOT_LEN + ASSET_WRAPPER_LEN,
+    storedPosLong: AS_STORED_POS_LONG, storedPosShort: AS_STORED_POS_SHORT,
+    staleLong: AS_STALE_LONG, staleShort: AS_STALE_SHORT,
+    pendingOblLong: AS_PENDING_OBL_LONG, pendingOblShort: AS_PENDING_OBL_SHORT,
+    modeLong: AS_MODE_LONG, modeShort: AS_MODE_SHORT,
+    barrierLong: SLOT_BARRIER_LONG, barrierShort: SLOT_BARRIER_SHORT,
+    backingLong: SLOT_BACKING_LONG, backingShort: SLOT_BACKING_LONG + BACKING_LEN,
+  };
+}
+
+/** Offsets for a detected layout row; null when the pinned SDK has no engine-slot table for its VERSION. */
+export function livenessOffsetsFor(layout: MarketLayout, assetIndex = 0): LivenessOffsets | null {
+  const t = LAYOUTS_BY_VERSION.get(layout.wrapperVersion);
+  if (!t) return null;
+  return {
+    engineBase: engineSlotBase(layout, assetIndex),
+    storedPosLong: layout.asset.storedPosLong, storedPosShort: layout.asset.storedPosShort,
+    staleLong: layout.asset.staleLong, staleShort: layout.asset.staleShort,
+    pendingOblLong: layout.asset.pendingOblLong, pendingOblShort: layout.asset.pendingOblShort,
+    modeLong: layout.asset.modeLong, modeShort: layout.asset.modeShort,
+    barrierLong: layout.slot.barrierLong, barrierShort: layout.slot.barrierShort,
+    backingLong: t.engineSlot.backingLong, backingShort: t.engineSlot.backingShort,
+  };
+}
+
+/**
+ * Decode the repair-relevant state of asset `assetIndex`. The layout is detected from the account (VERSION + length)
+ * unless `offsets` is given; an unknown layout throws (never decoded with a guessed offset).
+ */
+export function decodeLivenessState(data: Uint8Array, assetIndex = 0, offsets?: LivenessOffsets): LivenessState {
+  let o = offsets;
+  if (!o) {
+    const det = detectLayout(data);
+    if (!det.known) throw new Error(`decodeLivenessState: ${describeUnknownLayout(det)}`);
+    const got = livenessOffsetsFor(det.layout, assetIndex);
+    if (!got) throw new Error(`decodeLivenessState: no SDK engine-slot table for VERSION ${det.layout.wrapperVersion}`);
+    o = got;
+  }
+  const a = o.engineBase;
+  if (data.length < a + o.backingShort + BACKING_LEN) {
     throw new Error(`decodeLivenessState: market account too short (${data.length} bytes)`);
   }
   const bucket = (i: 0 | 1): BucketState => {
-    const b = a + SLOT_BACKING_LONG + i * BACKING_LEN;
+    const b = a + (i === 0 ? o.backingLong : o.backingShort);
     return { domain: assetIndex * 2 + i, status: data[b + BK_STATUS], expirySlot: u64(data, b + BK_EXPIRY) };
   };
   const side = (s: 0 | 1): SideResetState => ({
     side: s,
-    mode: data[a + (s === 0 ? AS_MODE_LONG : AS_MODE_SHORT)],
-    storedPos: u64(data, a + (s === 0 ? AS_STORED_POS_LONG : AS_STORED_POS_SHORT)),
-    stale: u64(data, a + (s === 0 ? AS_STALE_LONG : AS_STALE_SHORT)),
-    pendingObligations: u64(data, a + (s === 0 ? AS_PENDING_OBL_LONG : AS_PENDING_OBL_SHORT)),
-    pendingDomainLossBarrier: u64(data, a + (s === 0 ? SLOT_BARRIER_LONG : SLOT_BARRIER_SHORT)),
+    mode: data[a + (s === 0 ? o.modeLong : o.modeShort)],
+    storedPos: u64(data, a + (s === 0 ? o.storedPosLong : o.storedPosShort)),
+    stale: u64(data, a + (s === 0 ? o.staleLong : o.staleShort)),
+    pendingObligations: u64(data, a + (s === 0 ? o.pendingOblLong : o.pendingOblShort)),
+    pendingDomainLossBarrier: u64(data, a + (s === 0 ? o.barrierLong : o.barrierShort)),
   });
   return { assetIndex, buckets: [bucket(0), bucket(1)], sides: [side(0), side(1)] };
 }
