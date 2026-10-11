@@ -746,8 +746,53 @@ const lastSentObservationSequence = new Map<string, bigint>();
 export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
   for (const m of [...quarantinedUntil.keys()]) if (!keep.has(m)) quarantinedUntil.delete(m);
   for (const m of [...quarantineStrikes.keys()]) if (!keep.has(m)) quarantineStrikes.delete(m);
-  for (const m of [...lastSentObservationSequence.keys()]) if (!keep.has(m)) lastSentObservationSequence.delete(m);
+  // K-7: these keys are `${market}:${assetIndex}` (pushGenerationKey), NOT bare market addresses. Comparing the
+  // whole key against `keep` deleted EVERY nonce reservation on every cycle (pruneDeregisteredMarkets runs at the
+  // top of each cycle), which silently disabled the 2026-09-28 self-race fix: each cycle proposed chain + 1 again,
+  // and whenever the previous cycle's batch had not landed by the read the two carried the same nonce; the later
+  // one reverted Custom(19) on chain (~15/h on the fresh v2.2 devnet, 411 in 30 h, always "ix 1").
+  for (const k of [...lastSentObservationSequence.keys()]) if (!keep.has(generationKeyMarket(k))) lastSentObservationSequence.delete(k);
   for (const m of [...terminalLogged]) if (!keep.has(m)) terminalLogged.delete(m);
+  for (const m of [...soloUntil.keys()]) if (!keep.has(m)) soloUntil.delete(m);
+  for (const m of [...landedRevertTimes.keys()]) if (!keep.has(m)) landedRevertTimes.delete(m);
+}
+
+/** The market part of a {@link pushGenerationKey} (`${market}:${assetIndex}`). */
+export function generationKeyMarket(key: string): string {
+  const i = key.lastIndexOf(":");
+  return i < 0 ? key : key.slice(0, i);
+}
+
+// ── K-7: landed-revert fault isolation ────────────────────────────────────────
+//
+// A batched PushAuthMark tx is atomic: if ONE market's push reverts on chain, every market in the batch loses that
+// cycle's price. Preflight already isolates a market that reverts in simulation (pushChunk), but a market whose nonce
+// is advanced by someone else between our preflight and our landing (another pusher on it, a duplicate keeper) reverts
+// only ON CHAIN, every time, taking the whole batch with it. reconcilePushOutcomes now attributes each landed revert
+// that is NOT a superseded late duplicate to the market at the failing instruction; after SOLO_AFTER_LANDED_REVERTS
+// such reverts within SOLO_STRIKE_WINDOW_MS, that market is pushed in its OWN tx for SOLO_MS, so it can only cost itself.
+export const SOLO_AFTER_LANDED_REVERTS = 2;
+export const SOLO_STRIKE_WINDOW_MS = 10 * 60_000;
+export const SOLO_MS = 10 * 60_000;
+const soloUntil = new Map<string, number>();
+const landedRevertTimes = new Map<string, number[]>();
+
+/** Markets currently pushed in their own tx (for /health and tests). */
+export function getSoloMarkets(nowMs: number = Date.now()): string[] {
+  return [...soloUntil].filter(([, until]) => until > nowMs).map(([m]) => m);
+}
+
+function noteLandedRevert(market: string, nowMs: number): void {
+  const times = (landedRevertTimes.get(market) ?? []).filter((t) => nowMs - t < SOLO_STRIKE_WINDOW_MS);
+  times.push(nowMs);
+  landedRevertTimes.set(market, times);
+  if (times.length >= SOLO_AFTER_LANDED_REVERTS && !((soloUntil.get(market) ?? 0) > nowMs)) {
+    soloUntil.set(market, nowMs + SOLO_MS);
+    console.warn(
+      `[push][SOLO] ${market.slice(0, 8)}… reverted on chain ${times.length}x in ${SOLO_STRIKE_WINDOW_MS / 60_000} min — ` +
+        `pushing it in its own tx for ${SOLO_MS / 60_000} min so it cannot void the other markets' batch`,
+    );
+  }
 }
 
 /**
@@ -832,6 +877,8 @@ export function resetPushLandingState(): void {
   pushLandingStats.unlanded = 0;
   lastLateDuplicateLogMs = 0;
   lateDuplicatesSinceLog = 0;
+  soloUntil.clear();
+  landedRevertTimes.clear();
 }
 
 /**
@@ -865,6 +912,7 @@ export async function reconcilePushOutcomes(devnetConn: Connection, nowMs: numbe
           lateDuplicatesSinceLog++;
         } else {
           pushLandingStats.otherReverts++;
+          if (failing !== null && failing.position < f.items.length) noteLandedRevert(f.items[failing.position].market, nowMs);
           console.error(
             `[push] LANDED REVERT ${f.signature.slice(0, 16)}… ${JSON.stringify(st.err).slice(0, 100)} — ` +
               `markets: ${f.items.map((it) => it.market.slice(0, 8) + "…").join(", ")}; not a superseded late duplicate`,
@@ -1008,7 +1056,12 @@ export async function pushAuthMarkBatch(
     };
   }
 
-  const chunks = chunkPushes(keeper, pushable, nowSlot, blockhash);
+  // K-7: a market isolated for landed reverts goes in its own tx; the rest batch as before.
+  const solo = new Set(getSoloMarkets());
+  const chunks = [
+    ...chunkPushes(keeper, pushable.filter((p) => !solo.has(p.marketAddress)), nowSlot, blockhash),
+    ...pushable.filter((p) => solo.has(p.marketAddress)).map((p) => [p]),
+  ].filter((c) => c.length > 0);
 
   if (dryRun) {
     console.log(
