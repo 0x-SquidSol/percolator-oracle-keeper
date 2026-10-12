@@ -159,7 +159,7 @@ import { createCrankLiveness, crankLivenessOptsFromEnv } from "./crank-liveness.
 import type { CrankLiveness } from "./crank-liveness.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
-import { decodeAdlState } from "./adl-state.ts";
+import { adlFraction, decodeAdlState } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { isLockFamilyCode } from "./lock-codes.ts";
@@ -1663,6 +1663,9 @@ function publishRefreshHealth(
             : "ok",
     updatedAt: Date.now(),
     ...(obs.layout ? { layout: obs.layout } : {}),
+    ...(obs.adl
+      ? { adl: { reduceOnly: obs.adl.reduceOnly, aLong: adlFraction(obs.adl.aLong), aShort: adlFraction(obs.adl.aShort), oiEffLong: obs.adl.oiEffLong.toString(), oiEffShort: obs.adl.oiEffShort.toString() } }
+      : {}),
     ...(obs.sweep ? { sweep: obs.sweep } : {}),
   });
 }

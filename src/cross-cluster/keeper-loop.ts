@@ -291,6 +291,10 @@ export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<str
         }
       : {}),
     ...(h.sweep ? sweepHealthFields(h.sweep) : {}),
+    // K-9: ADL (reduce-only) state, only when the cranker decoded it (v2.1 and v2.2 layouts).
+    ...(h.adl
+      ? { adlReduceOnly: h.adl.reduceOnly, adlALong: h.adl.aLong, adlAShort: h.adl.aShort, adlOiLong: h.adl.oiEffLong, adlOiShort: h.adl.oiEffShort }
+      : {}),
     crankStatus: h.status,
     // Sweep markets carry stale portfolios by design (every accrual re-stales them); there
     // `lossStale` means what users feel: a risk-increasing order would be refused now.

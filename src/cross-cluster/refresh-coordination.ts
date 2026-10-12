@@ -78,6 +78,11 @@ export interface CrankRefreshHealth {
    * laggard counts, pace. Absent on legacy markets, so their /health is unchanged.
    */
   sweep?: SweepHealth;
+  /**
+   * K-9: ADL state of asset 0 at this cycle's pre-crank read (adl-state.ts). Absent when the account could not be
+   * decoded (unknown layout), so a market the decoder cannot read shows no ADL fields rather than a guess.
+   */
+  adl?: { reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string };
 }
 
 /** Layout verdict for one market read. */

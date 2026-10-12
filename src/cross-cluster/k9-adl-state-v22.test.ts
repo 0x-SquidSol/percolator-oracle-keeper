@@ -79,3 +79,16 @@ describe("K-9 sweep: terminal-insurance's asset-0 insurance authority on v2.2", 
     assert.notEqual(parseAssetOracleProfileV17(SOL, 592 + 758).insuranceAuthority.toBase58(), vaultAuth.toBase58());
   });
 });
+
+describe("K-9: /health per-market fields carry the ADL state", () => {
+  it("crankHealthFields shows adl* for a decoded sample and nothing extra without one", async () => {
+    const { crankHealthFields } = await import("./keeper-loop.ts");
+    const base = { staleLong: 0, staleShort: 0, postStaleLong: null, postStaleShort: null, positioned: 0, overflow: 0, overflowRefreshed: 0, overflowError: null, lossStaleCycles: 0, status: "ok" as const, updatedAt: Date.now() };
+    const s = decodeAdlState(SOL)!;
+    const f = crankHealthFields({ ...base, adl: { reduceOnly: s.reduceOnly, aLong: "1.000000", aShort: "1.000000", oiEffLong: s.oiEffLong.toString(), oiEffShort: s.oiEffShort.toString() } });
+    assert.equal(f.adlReduceOnly, false);
+    assert.equal(f.adlOiLong, s.oiEffLong.toString());
+    // NEGATIVE CONTROL: no adl in the sample -> no adl* keys (shape unchanged for undecodable markets).
+    assert.equal(Object.keys(crankHealthFields(base)).some((k) => k.startsWith("adl")), false);
+  });
+});
