@@ -50,6 +50,7 @@ import type { BandHealth } from "./band.ts";
 import { setBondFeeDelegated, setLoneLpCrankSuppressor, setProtectiveTrigger, setSweepDelegate } from "./delegation.ts";
 import type { SweepDelegateArgs } from "./delegation.ts";
 import { setV22HealthProvider } from "./health.ts";
+import { adlHealthOf } from "../adl-state.ts";
 
 export interface V22LoopDeps {
   conn: Connection;
@@ -366,9 +367,13 @@ export class V22Loop {
 
   private async publishHealth(ctx: V22MarketCtx, r: MarketRuntime, positioned: V22Positioned, res: RoundResult): Promise<void> {
     let post = ctx.refresh;
+    let postData: Uint8Array | null = null;
     try {
       const info = await this.d.conn.getAccountInfo(ctx.market, "processed");
-      if (info) post = decodeMarketRefreshState(new Uint8Array(info.data));
+      if (info) {
+        postData = new Uint8Array(info.data);
+        post = decodeMarketRefreshState(postData);
+      }
     } catch {
       // keep the pre-read
     }
@@ -387,6 +392,8 @@ export class V22Loop {
       status: r.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES ? "loss-stale" : "ok",
       layout: { id: ctx.layout.id, problem: null, kind: "ok", accountLen: ctx.data.length, provisional: ctx.layout.provisional, hasPositions: positioned.all.length > 0 },
       updatedAt: this.now(),
+      // K-9: this record replaces the cranker's on v2.2 sweep markets, so it must carry the ADL state itself.
+      ...adlHealthOf(postData ?? ctx.data),
     });
   }
 

@@ -91,3 +91,18 @@ export function adlFraction(a: bigint): string {
   const scaled = (a * 1_000_000n) / ADL_ONE;
   return `${scaled / 1_000_000n}.${(scaled % 1_000_000n).toString().padStart(6, "0")}`;
 }
+
+/** The /health shape of an ADL state (refresh-coordination.ts `CrankRefreshHealth.adl`). */
+export function adlHealth(s: AdlState): { reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string } {
+  return { reduceOnly: s.reduceOnly, aLong: adlFraction(s.aLong), aShort: adlFraction(s.aShort), oiEffLong: s.oiEffLong.toString(), oiEffShort: s.oiEffShort.toString() };
+}
+
+/** `{ adl }` for a market account's bytes, or `{}` when it cannot be decoded (non-market / unknown layout): never a guess. */
+export function adlHealthOf(data: Uint8Array, assetIndex = 0): { adl?: ReturnType<typeof adlHealth> } {
+  try {
+    const s = decodeAdlState(data, assetIndex);
+    return s ? { adl: adlHealth(s) } : {};
+  } catch {
+    return {};
+  }
+}

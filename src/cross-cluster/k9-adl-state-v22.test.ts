@@ -92,3 +92,26 @@ describe("K-9: /health per-market fields carry the ADL state", () => {
     assert.equal(Object.keys(crankHealthFields(base)).some((k) => k.startsWith("adl")), false);
   });
 });
+
+describe("K-9: adlHealthOf (the record both health writers use, incl. the v2.2 sweep loop)", () => {
+  it("real v2.2 SOL bytes -> { adl } with fractions and OI strings; reduce-only bytes -> reduceOnly true", async () => {
+    const { adlHealthOf } = await import("./adl-state.ts");
+    const s = decodeAdlState(SOL)!;
+    assert.deepEqual(adlHealthOf(SOL), { adl: { reduceOnly: false, aLong: "1.000000", aShort: "1.000000", oiEffLong: s.oiEffLong.toString(), oiEffShort: s.oiEffShort.toString() } });
+    const d = new Uint8Array(JUP);
+    w128(d, ENGINE0_V22 + 65, (ADL_ONE * 8617n) / 10_000n);
+    assert.deepEqual([adlHealthOf(d).adl?.reduceOnly, adlHealthOf(d).adl?.aShort], [true, "0.861700"]);
+  });
+  it("NEGATIVE CONTROL: unknown VERSION / non-market bytes -> {} (no ADL fields, never a guess)", async () => {
+    const { adlHealthOf } = await import("./adl-state.ts");
+    const d = new Uint8Array(JUP);
+    new DataView(d.buffer).setUint16(8, 20, true);
+    assert.deepEqual(adlHealthOf(d), {});
+    assert.deepEqual(adlHealthOf(new Uint8Array(64)), {});
+  });
+  it("the v2.2 sweep loop's health record includes it (source guard: publishHealth spreads adlHealthOf)", () => {
+    const src = readFileSync(join(here, "v22", "loop.ts"), "utf8");
+    const body = src.slice(src.indexOf("private async publishHealth"), src.indexOf("/** One pass of the non-sweep jobs"));
+    assert.match(body, /\.\.\.adlHealthOf\(postData \?\? ctx\.data\)/);
+  });
+});
