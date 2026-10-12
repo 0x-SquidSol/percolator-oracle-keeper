@@ -36,6 +36,7 @@ import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import { rpcMetrics } from "./rpc-metrics.ts";
 import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
+import { healthFileConfigFromEnv, startHealthFileMirror } from "./health-file.ts";
 import type { SweepHealth } from "./positioned-sweep.ts";
 import {
   type WalletBalanceState,
@@ -279,7 +280,7 @@ export function publishLandedTicks(
  * has ended loss-stale (stale count > 0 after the keeper's refreshes) for
  * ALERT_LOSS_STALE_CYCLES cycles: every risk-increasing trade reverts Custom(21).
  */
-export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | boolean | null> {
+export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<string, string | number | boolean | null | NonNullable<CrankRefreshHealth["adlAssets"]>> {
   if (!h) return { crankStatus: null };
   return {
     ...(h.layout
@@ -295,6 +296,8 @@ export function crankHealthFields(h: CrankRefreshHealth | undefined): Record<str
     ...(h.adl
       ? { adlReduceOnly: h.adl.reduceOnly, adlALong: h.adl.aLong, adlAShort: h.adl.aShort, adlOiLong: h.adl.oiEffLong, adlOiShort: h.adl.oiEffShort }
       : {}),
+    // Multi-asset markets: every non-Disabled asset (QA retest 4: asset 0 alone hid the other assets).
+    ...(h.adlAssets ? { adlAssets: h.adlAssets, adlReduceOnlyAssets: h.adlAssets.filter((x) => x.reduceOnly).map((x) => x.asset).join(",") } : {}),
     crankStatus: h.status,
     // Sweep markets carry stale portfolios by design (every accrual re-stales them); there
     // `lossStale` means what users feel: a risk-increasing order would be refused now.
@@ -566,6 +569,12 @@ function maybeResetAuthorityLatches(): void {
 // to mainnet without that.
 const MARK_WINDOW_MS = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
 const markSmoother = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
+/**
+ * The same median over the same samples, at e12, for the per-LOT mark of v2.2 lot markets (per-lot precision, QA
+ * 2026-10-12). Every decision (withholding, circuit breaker, health) still uses the e6 smoother above; this one only
+ * supplies extra digits for a price the e6 path already accepted (auth-mark-pusher.ts perLotMarkFromE12 guards that).
+ */
+const markSmootherE12 = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
 
 function parseCrossClusterPositiveNumberEnv(
   name: string,
@@ -839,6 +848,7 @@ async function runCycle(
   // ── 2. Read ALL pool prices in ONE getMultipleAccounts (DEX-pool source) ────
   let prices: Map<string, bigint>;
   const priceSkipReasons = new Map<string, string>();
+  const pricesE12 = new Map<string, bigint>();
   try {
     prices = await readAllPoolPricesE6(
       mainnetConn,
@@ -848,6 +858,7 @@ async function runCycle(
       // market is registered — see the param's doc comment.
       process.env.SOL_USD_REFERENCE_POOL,
       priceSkipReasons,
+      pricesE12,
     );
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
@@ -862,7 +873,7 @@ async function runCycle(
   state.lastBatchReadError = null;
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
-  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }> = [];
+  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint }> = [];
   const smoothNowMs = Date.now();
   // Smooth once per POOL per cycle, not once per market: N markets sharing a
   // pool would insert N identical samples per cycle, silently shrinking the
@@ -870,6 +881,7 @@ async function runCycle(
   // the 180s window to ~149s — undoing the widening that was deployed
   // precisely because 90s was insufficient).
   const smoothedThisCycle = new Map<string, bigint | null>();
+  const smoothedE12ThisCycle = new Map<string, bigint | null>();
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
   for (const entry of registry.markets) {
     if (notPushable.has(entry.marketAddress)) continue;
@@ -895,6 +907,8 @@ async function runCycle(
     if (priceE6 === undefined) {
       priceE6 = markSmoother.smooth(entry.poolAddress, rawPriceE6, smoothNowMs);
       smoothedThisCycle.set(entry.poolAddress, priceE6);
+      // Same sample, same instant, at e12 (the e6 value x 1e6 when the read produced no e12), so the two windows stay aligned.
+      smoothedE12ThisCycle.set(entry.poolAddress, markSmootherE12.smooth(entry.poolAddress, pricesE12.get(entry.poolAddress) ?? rawPriceE6 * 1_000_000n, smoothNowMs));
     }
     if (priceE6 === null) {
       stat.totalErrors++;
@@ -969,10 +983,13 @@ async function runCycle(
     pendingCircuitBreakerStates.set(entry.marketAddress, deferred);
 
     stat.lastPriceE6 = publish.priceE6;
+    // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
+    const smoothedE12 = publish.priceE6 === priceE6 ? smoothedE12ThisCycle.get(entry.poolAddress) : null;
     pushes.push({
       marketAddress: entry.marketAddress,
       assetIndex: entry.assetIndex,
       priceE6: publish.priceE6,
+      ...(smoothedE12 ? { priceE12: smoothedE12 } : {}),
     });
   }
   if (pushes.length === 0) return;
@@ -1293,6 +1310,24 @@ export async function startKeeperLoop(
       `[keeper] Health: http://${config.healthBind}:${config.healthPort}/health`,
     );
   });
+  // Optional file mirror of /health for readers without access to the port (KEEPER_HEALTH_FILE; health-file.ts).
+  const healthFile = healthFileConfigFromEnv(process.env);
+  if (healthFile) {
+    const host = config.healthBind === "0.0.0.0" ? "127.0.0.1" : config.healthBind;
+    const readHealth = (): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const req = http.get({ host, port: config.healthPort, path: "/health", timeout: 5_000 }, (r) => {
+          let body = "";
+          r.setEncoding("utf8");
+          r.on("data", (c: string) => (body += c));
+          r.on("end", () => resolve(body));
+        });
+        req.on("timeout", () => req.destroy(new Error("health read timeout")));
+        req.on("error", reject);
+      });
+    startHealthFileMirror(healthFile, readHealth, `http://${host}:${config.healthPort}/health BUILDTAG=${process.env.BUILDTAG ?? "?"}`);
+    console.log(`[keeper] Health file: ${healthFile.file} every ${healthFile.intervalMs}ms`);
+  }
 
   // Graceful shutdown
   let stopping = false;

@@ -83,6 +83,8 @@ export interface CrankRefreshHealth {
    * decoded (unknown layout), so a market the decoder cannot read shows no ADL fields rather than a guess.
    */
   adl?: { reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string };
+  /** Multi-asset markets only: the ADL state of every non-Disabled asset slot (adl-state.ts adlHealthOf). */
+  adlAssets?: Array<{ asset: number; reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string }>;
 }
 
 /** Layout verdict for one market read. */

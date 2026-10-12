@@ -298,6 +298,26 @@ export function readMarketLotExp(data: Uint8Array, version: number, profileOff: 
 }
 
 /**
+ * Per-lot e6 mark from the UNROUNDED per-token price (QA 2026-10-12): `round(priceE12 x 10^lotExp / 1e6)`.
+ *
+ * The e6 token price of a cheap token has few significant digits (CHILLHOUSE $0.001206 = 1,206), so
+ * `priceE6 x 10^lotExp` moves in steps of 10^lotExp (~0.08% there). With the e12 price the per-lot mark keeps the
+ * digits the e6 rounding dropped. The e6 price stays authoritative: it is what the smoother and circuit breaker
+ * accepted, so the fine mark is used only when it is the SAME price to within one e6 unit per token
+ * (|fine - priceE6 x 10^lotExp| <= 10^lotExp). Anything else (no e12, lotExp 0, disagreement) falls back to the
+ * exact old value `perLotMarkE6(priceE6, lotExp)`; out-of-range still returns null (skip, never clamp).
+ */
+export function perLotMarkFromE12(tokenPriceE6: bigint, tokenPriceE12: bigint | undefined, lotExp: number): bigint | null {
+  const coarse = perLotMarkE6(tokenPriceE6, lotExp);
+  if (coarse === null || lotExp === 0 || tokenPriceE12 === undefined || tokenPriceE12 <= 0n) return coarse;
+  const unit = 10n ** BigInt(lotExp);
+  const fine = (tokenPriceE12 * unit + 500_000n) / 1_000_000n;
+  const diff = fine > coarse ? fine - coarse : coarse - fine;
+  if (fine <= 0n || diff > unit || fine > MAX_ORACLE_PRICE_E6) return coarse;
+  return fine;
+}
+
+/**
  * Per-lot e6 mark for a per-token e6 price: `tokenPriceE6 * 10^lotExp` (exact, via the SDK's shared lot helper).
  * null when the inputs are invalid or the mark would exceed MAX_ORACLE_PRICE (the push is skipped, not clamped).
  */
@@ -533,7 +553,13 @@ const MAX_TX_BYTES = 1232;
 const TX_SIZE_MARGIN = 32;
 
 /** Caller-facing push request — unchanged shape, so keeper-loop.ts needs no edits. */
-type AuthMarkPushInput = { marketAddress: string; assetIndex: number; priceE6: bigint };
+type AuthMarkPushInput = {
+  marketAddress: string;
+  assetIndex: number;
+  priceE6: bigint;
+  /** Optional: the same per-token price at e12, used only for the per-lot mark of a lot market (perLotMarkFromE12). */
+  priceE12?: bigint;
+};
 
 /**
  * Internal, enriched push item — `AuthMarkPushInput` plus the two v18-NEW
@@ -962,7 +988,7 @@ export function parseFailingPush(
 export async function pushAuthMarkBatch(
   devnetConn: Connection,
   keeper: Keypair,
-  pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
+  pushes: AuthMarkPushInput[],
   nowSlot: bigint,
   blockhash: { blockhash: string; lastValidBlockHeight: number },
   dryRun: boolean,
@@ -1030,7 +1056,7 @@ export async function pushAuthMarkBatch(
       missingGeneration.push(p.marketAddress);
       continue;
     }
-    const markE6 = perLotMarkE6(p.priceE6, fields.lotExp);
+    const markE6 = perLotMarkFromE12(p.priceE6, p.priceE12, fields.lotExp);
     if (markE6 === null) {
       console.warn(
         `[push] ${p.marketAddress.slice(0, 8)}… per-lot mark out of range (price ${p.priceE6} x 10^${fields.lotExp}) — skipped this cycle`,

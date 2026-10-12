@@ -97,11 +97,32 @@ export function adlHealth(s: AdlState): { reduceOnly: boolean; aLong: string; aS
   return { reduceOnly: s.reduceOnly, aLong: adlFraction(s.aLong), aShort: adlFraction(s.aShort), oiEffLong: s.oiEffLong.toString(), oiEffShort: s.oiEffShort.toString() };
 }
 
-/** `{ adl }` for a market account's bytes, or `{}` when it cannot be decoded (non-market / unknown layout): never a guess. */
-export function adlHealthOf(data: Uint8Array, assetIndex = 0): { adl?: ReturnType<typeof adlHealth> } {
+/** One asset's ADL state on /health (multi-asset markets). */
+export interface AdlAssetHealth { asset: number; reduceOnly: boolean; aLong: string; aShort: string; oiEffLong: string; oiEffShort: string }
+
+/** Engine `AssetLifecycleV16` byte at engine-slot +16: 0 Disabled, 1 PendingActivation, 2 Active, 3 DrainOnly, 4 Retired, 5 Recovery. */
+const AS_LIFECYCLE = 16;
+const LIFECYCLE_DISABLED = 0;
+
+/**
+ * `{ adl, adlAssets? }` for a market account's bytes, or `{}` when it cannot be decoded (non-market / unknown layout):
+ * never a guess. `adl` is asset `assetIndex` (the registry entry's asset). On a market with more than one asset slot,
+ * `adlAssets` lists EVERY slot that is not Disabled (K-9 partial, QA retest 4: /health showed asset 0 only), so a
+ * reduce-only asset other than the entry's own is visible too.
+ */
+export function adlHealthOf(data: Uint8Array, assetIndex = 0): { adl?: ReturnType<typeof adlHealth>; adlAssets?: AdlAssetHealth[] } {
   try {
     const s = decodeAdlState(data, assetIndex);
-    return s ? { adl: adlHealth(s) } : {};
+    if (!s) return {};
+    const det = detectLayout(data);
+    if (!det.known || det.slots <= 1) return { adl: adlHealth(s) };
+    const adlAssets: AdlAssetHealth[] = [];
+    for (let k = 0; k < det.slots; k++) {
+      if (data[engineSlotBase(det.layout, k) + AS_LIFECYCLE] === LIFECYCLE_DISABLED) continue;
+      const a = decodeAdlState(data, k);
+      if (a) adlAssets.push({ asset: k, ...adlHealth(a) });
+    }
+    return { adl: adlHealth(s), adlAssets };
   } catch {
     return {};
   }

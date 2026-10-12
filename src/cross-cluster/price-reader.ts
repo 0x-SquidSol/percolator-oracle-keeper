@@ -134,6 +134,20 @@ export function nonUsdQuoteSkipReason(dex: string, quoteMint: PublicKey): string
   return `${dex} quote mint ${quoteMint.toBase58()} is neither WSOL nor a USD stable — price is not USD, refused`;
 }
 
+/** The same conversion kept at e12 (USD per token x 1e12): `nativeE12 (SOL per token) x solPriceE6 / 1e6`. */
+export function meteoraWsolPriceToUsdE12(
+  poolData: Uint8Array,
+  decimals: { base: number; quote: number },
+  solPriceE6: bigint,
+): bigint {
+  const nativeE12 = computeDexSpotPriceE6("meteora-dlmm", poolData, undefined, {
+    base: decimals.base + 6,
+    quote: decimals.quote,
+  });
+  if (nativeE12 <= 0n) return 0n;
+  return (nativeE12 * solPriceE6) / 1_000_000n;
+}
+
 export function meteoraWsolPriceToUsdE6(
   poolData: Uint8Array,
   decimals: { base: number; quote: number },
@@ -875,6 +889,13 @@ export async function readAllPoolPricesE6(
    * alert) instead of the generic "no pool price this cycle".
    */
   skipReasons?: Map<string, string>,
+  /**
+   * Optional sink for the SAME prices at e12 (USD per token x 1e12), keyed by poolAddress, for pools where the read
+   * can produce it (meteora-dlmm, pumpswap). Used only to compute a v2.2 per-LOT mark without first rounding the
+   * per-token price to e6 (QA 2026-10-12: CHILLHOUSE at $0.0012 has 4 significant digits in e6, so its per-lot mark
+   * moved in ~0.08% steps). The returned e6 map is unchanged and stays the source of truth.
+   */
+  pricesE12?: Map<string, bigint>,
 ): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   if (entries.length === 0) return out;
@@ -998,6 +1019,16 @@ export async function readAllPoolPricesE6(
         if (priceE6 > 0n) {
           out.set(entry.poolAddress, priceE6);
           if (solPriceE6 === undefined && isSolUsdEntry(entry)) solPriceE6 = priceE6;
+          if (pricesE12) {
+            // Same price at e12 (6 extra base decimals; see meteoraWsolPriceToUsdE6). Best effort: e6 stays the source of truth.
+            try {
+              const dec = decimalsCache.get(entry.poolAddress)!;
+              const e12 = computeDexSpotPriceE6("meteora-dlmm", data, undefined, { base: dec.base + 6, quote: dec.quote });
+              if (e12 > 0n) pricesE12.set(entry.poolAddress, e12);
+            } catch {
+              /* no e12 this cycle: the per-lot mark falls back to the e6 price */
+            }
+          }
         }
       } else if (entry.dexType === "pumpswap") {
         const parsed = parseDexPool("pumpswap", pubkeys[i], data);
@@ -1071,7 +1102,13 @@ export async function readAllPoolPricesE6(
         if (!dec) continue;
         try {
           const usdE6 = meteoraWsolPriceToUsdE6(poolData, dec, solPriceE6);
-          if (usdE6 > 0n) out.set(entry.poolAddress, usdE6);
+          if (usdE6 > 0n) {
+            out.set(entry.poolAddress, usdE6);
+            if (pricesE12) {
+              const usdE12 = meteoraWsolPriceToUsdE12(poolData, dec, solPriceE6);
+              if (usdE12 > 0n) pricesE12.set(entry.poolAddress, usdE12);
+            }
+          }
         } catch {
           /* skip this pool for this cycle; next cycle retries */
         }
@@ -1166,15 +1203,18 @@ export async function readAllPoolPricesE6(
       }
 
       try {
-        const priceE6 =
-          computeDexSpotPriceE6(
-            "pumpswap",
-            poolData,
-            { base: new Uint8Array(baseVaultInfo.data), quote: new Uint8Array(quoteVaultInfo.data) },
-            pumpswapE12Decimals(dec),
-            solPriceE6,
-          ) / 1_000_000n;
-        if (priceE6 > 0n) out.set(entry.poolAddress, priceE6);
+        const priceE12 = computeDexSpotPriceE6(
+          "pumpswap",
+          poolData,
+          { base: new Uint8Array(baseVaultInfo.data), quote: new Uint8Array(quoteVaultInfo.data) },
+          pumpswapE12Decimals(dec),
+          solPriceE6,
+        );
+        const priceE6 = priceE12 / 1_000_000n;
+        if (priceE6 > 0n) {
+          out.set(entry.poolAddress, priceE6);
+          pricesE12?.set(entry.poolAddress, priceE12);
+        }
       } catch {
         // e.g. WSOL-quoted but solPriceE6 unavailable this cycle (SOL/USD read
         // itself failed) — skip and retry next cycle.

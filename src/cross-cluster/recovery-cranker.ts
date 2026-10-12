@@ -159,7 +159,8 @@ import { createCrankLiveness, crankLivenessOptsFromEnv } from "./crank-liveness.
 import type { CrankLiveness } from "./crank-liveness.ts";
 import type { CrankPlan, MarketRefreshState, PlannedCrank, PositionedPortfolio } from "./positioned-refresh.ts";
 import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./liveness-repair.ts";
-import { adlHealth, decodeAdlState } from "./adl-state.ts";
+import { adlHealth, adlHealthOf, decodeAdlState } from "./adl-state.ts";
+import type { AdlAssetHealth } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { isLockFamilyCode } from "./lock-codes.ts";
@@ -255,6 +256,8 @@ export interface CrankObservation {
   bankruptLiquidated: number;
   /** ADL reduce-only inputs from the pre-crank read (null: not a v18 market header). */
   adl: AdlState | null;
+  /** Multi-asset markets: every non-Disabled asset's ADL state (absent on single-asset markets). */
+  adlAssets?: AdlAssetHealth[];
   /** stale_account_count_long/short at the pre-crank read (null: header did not decode). */
   staleLong: number | null;
   staleShort: number | null;
@@ -1664,6 +1667,7 @@ function publishRefreshHealth(
     updatedAt: Date.now(),
     ...(obs.layout ? { layout: obs.layout } : {}),
     ...(obs.adl ? { adl: adlHealth(obs.adl) } : {}),
+    ...(obs.adlAssets ? { adlAssets: obs.adlAssets } : {}),
     ...(obs.sweep ? { sweep: obs.sweep } : {}),
   });
 }
@@ -1765,6 +1769,7 @@ export function observeMarket(
     bankruptFound: 0,
     bankruptLiquidated: 0,
     adl,
+    ...(adl ? (({ adlAssets }) => (adlAssets ? { adlAssets } : {}))(adlHealthOf(data)) : {}),
     staleLong: pre?.staleLong !== undefined ? Number(pre.staleLong) : null,
     staleShort: pre?.staleShort !== undefined ? Number(pre.staleShort) : null,
     positioned: 0,
