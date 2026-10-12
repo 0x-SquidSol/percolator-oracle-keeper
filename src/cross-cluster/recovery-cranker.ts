@@ -676,7 +676,8 @@ export async function crankOneMarket(
         repairs = [];
       }
     }
-    const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs, { skipAdl: !v21Decoders });
+    // K-9: the ADL decoder is per-layout now (v2.2 included); only an unknown layout skips it.
+    const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs, { skipAdl: !detection.known });
     obs.layout = layoutHealth;
     state.obs = obs;
     if (pre || layoutHealth.problem) observed = obs;

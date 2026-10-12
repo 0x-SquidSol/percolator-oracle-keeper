@@ -39,7 +39,7 @@ import {
   utilizationBps,
 } from "@percolatorct/sdk";
 import type { AssetGrowthV19, PortfolioV17 } from "@percolatorct/sdk";
-import { decodeAdlState } from "./adl-state.ts";
+import { decodeAdlState, isV18MarketHeader } from "./adl-state.ts";
 import type { Alert } from "./alerting.ts";
 import { readU64 } from "./p2b-markets.ts";
 import type { VaultMarketSnapshot } from "./p2b-markets.ts";
@@ -154,6 +154,8 @@ export async function evaluateHedgedLockouts(
       if (!s.bound || !s.vaultLp || !s.marketData) continue;
       const growth = decodeAssetGrowthV19(s.marketData, s.ref.assetIndex);
       if (growth === null) continue;
+      // K-9: the offsets below are v2.1; keep this check v2.1-only (decodeAdlState used to be the gate).
+      if (!isV18MarketHeader(s.marketData)) continue;
       const adl = decodeAdlState(s.marketData, s.ref.assetIndex);
       if (!adl) continue;
       const info = await conn.getAccountInfo(s.vaultLp.lpPortfolio, "confirmed");

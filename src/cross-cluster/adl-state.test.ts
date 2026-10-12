@@ -64,17 +64,18 @@ describe("decodeAdlState — v18 real bytes", () => {
     b.writeUInt16LE(17, 8);
     writeU128(b, ENGINE0 + 49, 0n);
     writeU128(b, ENGINE0 + 65, 0n);
-    assert.equal(decodeAdlState(new Uint8Array(b)), null);
+    // K-9 (2026-10-12): an unknown-layout market now THROWS (was null); still never decoded.
+    assert.throws(() => decodeAdlState(new Uint8Array(b)), /unknown market layout/);
   });
 
-  it("a non-market account kind or wrong magic is refused; a short buffer returns null", () => {
+  it("a non-market account kind or wrong magic is refused (null); a short buffer throws (unknown layout)", () => {
     const k = Buffer.from(fx("sol-market-v18-fees"));
     k[10] = 3;
     assert.equal(decodeAdlState(new Uint8Array(k)), null);
     const m = Buffer.from(fx("sol-market-v18-fees"));
     m[0] ^= 0xff;
     assert.equal(decodeAdlState(new Uint8Array(m)), null);
-    assert.equal(decodeAdlState(new Uint8Array(fx("sol-market-v18-fees").subarray(0, ENGINE0 + 100))), null);
+    assert.throws(() => decodeAdlState(new Uint8Array(fx("sol-market-v18-fees").subarray(0, ENGINE0 + 100))), /unknown market layout/);
   });
 });
 

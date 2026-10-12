@@ -17,11 +17,15 @@
  * ADL_ONE = 1e15 (engine lib.rs:16). The frontend reaches the same offsets via
  * offset_of! (wt-app-limits app/lib/limits/constants.ts).
  *
- * v18 ONLY: a v17 slab reads a_long = a_short = 0 at these offsets, which would
- * look like the reduce-only state. The header must be the wrapper magic,
- * VERSION 18 and kind 1 (market account) or this returns null.
+ * K-9 (2026-10-12): the asset slot is located through the market's detected layout (market-layout.ts, per VERSION
+ * and length), so v2.2 (VERSION 19: group 806, stride 2,661, engine slot 592 + 806 + 1,024 = 2,422) is read at its own
+ * offsets. Inside the engine slot the AssetStateV16Account PREFIX is unchanged in v2.2 (the band / rent words are
+ * appended after mode_short; engine 3ce4cbd1), so a_long @49 / a_short @65 / OI @289/@305 hold on both.
+ * A non-market account (wrong magic or kind) returns null; a market account whose layout the keeper does not know
+ * (v17, an unknown VERSION, a truncated / odd length) THROWS — never decoded at a guessed offset (a v17 slab reads
+ * a_long = a_short = 0 at these offsets, which would look like the reduce-only state).
  */
-import { V17_MARKET_GROUP_LEN, V17_MARKET_GROUP_OFF } from "@percolatorct/sdk";
+import { describeUnknownLayout, detectLayout, engineSlotBase } from "./market-layout.ts";
 
 export const ADL_ONE = 1_000_000_000_000_000n;
 
@@ -30,8 +34,6 @@ const WRAPPER_VERSION_V18 = 18;
 const HEADER_KIND_OFF = 10;
 const KIND_MARKET_ACCOUNT = 1;
 
-const ASSET_SLOT_LEN = 2325;
-const ASSET_WRAPPER_LEN = 1024;
 const AS_A_LONG = 49;
 const AS_A_SHORT = 65;
 const AS_OI_EFF_LONG = 289;
@@ -58,11 +60,21 @@ export function isV18MarketHeader(d: Uint8Array): boolean {
   return v.getBigUint64(0, true) === WRAPPER_MAGIC && v.getUint16(8, true) === WRAPPER_VERSION_V18 && d[HEADER_KIND_OFF] === KIND_MARKET_ACCOUNT;
 }
 
-/** null for a non-v18 market header or a too-short buffer — never a guess. */
+/** Wrapper magic + kind 1 (a market account), any VERSION. */
+export function isWrapperMarketHeader(d: Uint8Array): boolean {
+  if (d.length < 16) return false;
+  const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+  return v.getBigUint64(0, true) === WRAPPER_MAGIC && d[HEADER_KIND_OFF] === KIND_MARKET_ACCOUNT;
+}
+
+/** null for a non-market account; throws for a market of unknown layout (never a guess). */
 export function decodeAdlState(d: Uint8Array, assetIndex = 0): AdlState | null {
-  if (!isV18MarketHeader(d)) return null;
-  const a = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
-  if (d.length < a + AS_OI_EFF_SHORT + 16) return null;
+  if (!isWrapperMarketHeader(d)) return null;
+  const det = detectLayout(d);
+  if (!det.known) throw new Error(`decodeAdlState: ${describeUnknownLayout(det)}`);
+  if (!Number.isInteger(assetIndex) || assetIndex < 0 || assetIndex >= det.slots) throw new RangeError(`decodeAdlState: asset ${assetIndex} not present`);
+  const a = engineSlotBase(det.layout, assetIndex);
+  if (d.length < a + AS_OI_EFF_SHORT + 16) throw new Error("decodeAdlState: account too short for the asset state");
   const aLong = u128(d, a + AS_A_LONG);
   const aShort = u128(d, a + AS_A_SHORT);
   return {

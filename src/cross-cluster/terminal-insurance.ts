@@ -64,7 +64,7 @@ import {
 import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
 import type { StakePoolView } from "./stake-pool-decode.ts";
 import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
-import { selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
+import { assetSlotOffset, selectMarketGroupOffset } from "../wrapper-market-group-offset.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
@@ -93,7 +93,7 @@ import type { TerminalState } from "./market-state.ts";
 export function asset0InsuranceAuthority(d: Uint8Array): PublicKey | null {
   const g = selectMarketGroupOffset(d);
   if (!g.ok) return null;
-  const off = g.marketGroupOff + V17_MARKET_GROUP_LEN;
+  const off = assetSlotOffset(g, 0); // K-9 sweep: per-VERSION group length (806 on v2.2), not the v2.1 758
   if (d.length < off + V17_ASSET_ORACLE_PROFILE_LEN) return null;
   return parseAssetOracleProfileV17(d, off).insuranceAuthority;
 }

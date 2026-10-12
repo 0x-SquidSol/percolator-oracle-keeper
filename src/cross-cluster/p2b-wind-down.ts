@@ -55,7 +55,7 @@ import {
   V17_PORTFOLIO_ACCOUNT_LEN,
 } from "@percolatorct/sdk";
 import type { AdlEpisode } from "@percolatorct/sdk";
-import { ADL_ONE, decodeAdlState } from "./adl-state.ts";
+import { ADL_ONE, decodeAdlState, isV18MarketHeader } from "./adl-state.ts";
 import type { AdlState } from "./adl-state.ts";
 import { isComputeExhaustion, parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
@@ -100,6 +100,9 @@ export interface WindDownView {
 
 /** Decode everything the decision needs from the raw market account. null when it is not a v18 market / too short. */
 export function readWindDownView(marketData: Uint8Array, assetIndex: number, nowSlot: bigint): WindDownView | null {
+  // K-9: this view reads the rest of the asset at v2.1 offsets below, so it stays v2.1-only (decodeAdlState itself now
+  // decodes v2.2 too, which it used to refuse, and that refusal was this function's only gate).
+  if (!isV18MarketHeader(marketData)) return null;
   const adl = decodeAdlState(marketData, assetIndex);
   if (!adl) return null;
   const a = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * V17_MARKET_ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
