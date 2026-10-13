@@ -695,8 +695,19 @@ const lastSentObservationSequence = new Map<string, bigint>();
 export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
   for (const m of [...quarantinedUntil.keys()]) if (!keep.has(m)) quarantinedUntil.delete(m);
   for (const m of [...quarantineStrikes.keys()]) if (!keep.has(m)) quarantineStrikes.delete(m);
-  for (const m of [...lastSentObservationSequence.keys()]) if (!keep.has(m)) lastSentObservationSequence.delete(m);
+  // K-7: these keys are `${market}:${assetIndex}` (pushGenerationKey), NOT bare market addresses. Comparing the
+  // whole key against `keep` deleted EVERY nonce reservation on every cycle (pruneDeregisteredMarkets runs at the
+  // top of each cycle), which silently disabled the 2026-09-28 self-race fix: each cycle proposed chain + 1 again,
+  // and whenever the previous cycle's batch had not landed by the read the two carried the same nonce; the later
+  // one reverted Custom(19) on chain.
+  for (const k of [...lastSentObservationSequence.keys()]) if (!keep.has(generationKeyMarket(k))) lastSentObservationSequence.delete(k);
   for (const m of [...terminalLogged]) if (!keep.has(m)) terminalLogged.delete(m);
+}
+
+/** The market part of a {@link pushGenerationKey} (`${market}:${assetIndex}`). */
+export function generationKeyMarket(key: string): string {
+  const i = key.lastIndexOf(":");
+  return i < 0 ? key : key.slice(0, i);
 }
 
 /**
