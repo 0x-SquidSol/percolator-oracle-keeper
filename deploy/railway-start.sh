@@ -14,6 +14,22 @@ export TSX_DISABLE_CACHE=1
 : "${WRAPPER_PROGRAM_ID:?[fatal] WRAPPER_PROGRAM_ID missing}"
 : "${KEEPER_KEYPAIR:?[fatal] KEEPER_KEYPAIR secret missing}"
 
+# F2: the SECOND, INDEPENDENT pusher is the same image with KEEPER_ROLE=pusher (see deploy/PUSHER-RUNBOOK.md). It has no
+# cranks / jobs / Supabase; it reads a registry file (REGISTRY_PATH, or REGISTRY_SEED_JSON written once to the volume).
+if [[ "${KEEPER_ROLE:-}" == "pusher" ]]; then
+  : "${REGISTRY_PATH:?[fatal] pusher: REGISTRY_PATH missing (e.g. /data/registry.v22.json)}"
+  if [[ ! -f "$REGISTRY_PATH" ]]; then
+    : "${REGISTRY_SEED_JSON:?[fatal] pusher: $REGISTRY_PATH does not exist and REGISTRY_SEED_JSON is unset}"
+    mkdir -p "$(dirname "$REGISTRY_PATH")"
+    printf '%s' "$REGISTRY_SEED_JSON" > "$REGISTRY_PATH"
+    echo "[railway-start] pusher: seeded $REGISTRY_PATH from REGISTRY_SEED_JSON"
+  fi
+  : "${PUSHER_PRIMARY_DEVNET_RPC_URL:?[fatal] pusher: set PUSHER_PRIMARY_DEVNET_RPC_URL (the primary's endpoint) so the boot can refuse a shared endpoint}"
+  export CC_HEALTH_PORT="${PORT:-${CC_HEALTH_PORT:-18796}}"
+  echo "[railway-start] $(date -u +%Y-%m-%dT%H:%M:%SZ) ROLE=pusher BUILDTAG=${RAILWAY_GIT_COMMIT_SHA:0:7} wrapper=${WRAPPER_PROGRAM_ID} health=${CC_HEALTH_PORT} registry=${REGISTRY_PATH}"
+  exec node_modules/.bin/tsx src/pusher.ts
+fi
+
 # Devnet v2.1 fresh-ID cutover: the SAME image runs two services.
 #   - relaunch keeper (v1 / ETDLAdi, close-only markets): KEEPER_DEVNET_V21 unset -> unchanged below.
 #   - v2.1 keeper (second service, its own /data volume): KEEPER_DEVNET_V21=1 -> registry.v21.json,

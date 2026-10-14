@@ -76,7 +76,8 @@ export type AlertKind =
   | "p3-senior-draw"
   | "p3-senior-backing-exhausted"
   | "hedged-lockout"
-  | "earn-par-e3-gap";
+  | "earn-par-e3-gap"
+  | "pusher-takeover";
 
 export interface Alert {
   kind: AlertKind;

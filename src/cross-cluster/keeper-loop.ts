@@ -56,6 +56,12 @@ import {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface LoopConfig {
+  /**
+   * F2 (second independent pusher): markets for which this process is on STANDBY (the primary keeper is keeping them
+   * alive). A standby market is still read and smoothed (so the mark is warm at takeover) but never pushed, and it is
+   * counted as healthy for the no-push / zero-push alerts. Absent = every market is pushed (the primary keeper).
+   */
+  standby?: (marketAddress: string) => boolean;
   /** Milliseconds between cycle starts. */
   intervalMs: number;
   /** HTTP health server port. */
@@ -236,6 +242,8 @@ interface LoopState {
   terminalMarkets: Set<string>;
   /** K-1: markets whose push landed (or dry-ran) this cycle. Reset every cycle. */
   landedThisCycle: Set<string>;
+  /** F2: markets held on standby this cycle (not pushed on purpose). Reset every cycle. */
+  standbyThisCycle?: Set<string>;
   /** Chart tick publisher; no-op unless TICK_INGEST_URL + TICK_INGEST_KEY are set. */
   tickPublisher: TickPublisher;
 }
@@ -379,6 +387,19 @@ export function layoutProblemFields(layoutProblemMarkets: string[]): Record<stri
     // v2.2: the VERSION-keyed guard's refusal counters (by reason / on-chain VERSION); present only once one fired.
     ...(guard.refusals > 0 ? { layoutGuard: guard } : {}),
   };
+}
+
+/** F2: extra top-level /health fields (the pusher role). Unset = nothing is added, so the primary's payload is unchanged. */
+let healthExtension: (() => Record<string, unknown>) | null = null;
+export function setHealthExtension(fn: (() => Record<string, unknown>) | null): void {
+  healthExtension = fn;
+}
+function healthExtensionFields(): Record<string, unknown> {
+  try {
+    return healthExtension ? healthExtension() : {};
+  } catch {
+    return {};
+  }
 }
 
 export function withheldFromPush(market: string, withholdPush: ((m: string) => boolean) | undefined): boolean {
@@ -535,6 +556,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       ...p2bHealthFields(),
       // v2.2 layer, additive: `v22`. `{}` unless KEEPER_V22=on.
       ...v22HealthFields(),
+      ...healthExtensionFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(payload);
@@ -940,6 +962,13 @@ async function runCycle(
     if (priceE6 === null) {
       stat.totalErrors++;
       stat.lastErrorMsg = "mark smoother re-priming — withholding push until minSamples";
+      continue;
+    }
+    // F2: standby (the primary is alive). The smoother above is already warm; do not touch the breaker or push.
+    if (config.standby?.(entry.marketAddress)) {
+      (state.standbyThisCycle ??= new Set()).add(entry.marketAddress);
+      state.landedThisCycle.add(entry.marketAddress);
+      stat.sourcePriceE6 = priceE6;
       continue;
     }
 
@@ -1391,6 +1420,7 @@ export async function startKeeperLoop(
     state.cycleAttempted = 0;
     state.cyclePushed = 0;
     state.landedThisCycle = new Set();
+    state.standbyThisCycle = new Set();
     console.log(
       `\n[keeper] === Cycle ${state.cycleCount} ${new Date().toISOString()} ===`,
     );
@@ -1424,7 +1454,7 @@ export async function startKeeperLoop(
       state.landedThisCycle,
     );
     // B20: terminal markets can never be pushed; a board of only terminal markets is not an outage.
-    await reportPushCycle(state, countPushableMarkets(registry.markets, state.terminalMarkets));
+    await reportPushCycle(state, countPushableMarkets(registry.markets, state.terminalMarkets) - (state.standbyThisCycle?.size ?? 0));
     await reportMarketPush(state, registry);
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;

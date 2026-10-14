@@ -1,0 +1,17 @@
+# Railway: the SECOND, INDEPENDENT price pusher (F2). A SEPARATE service from the primary keeper (own project or at least own
+# service, own RPC key, ideally another region). Same Dockerfile; KEEPER_ROLE=pusher selects src/pusher.ts in deploy/railway-start.sh.
+# Point the service at this file: Settings -> Config-as-code -> railway.pusher.toml. Runbook: deploy/PUSHER-RUNBOOK.md. NOT deployed.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = ["src/**", "deploy/**", "Dockerfile", "railway.pusher.toml", "package.json", "pnpm-lock.yaml", "tsconfig.json"]
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 1000
+# One pusher only (a second replica would just duplicate the primary's job).
+numReplicas = 1
+overlapSeconds = 0
+drainingSeconds = 10
