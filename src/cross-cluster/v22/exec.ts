@@ -62,6 +62,11 @@ export interface ExecOptions {
    * is treated as null). The original list is never sent once an extended list was returned.
    */
   extend?: (post: ReadonlyArray<Uint8Array | null>) => readonly TransactionInstruction[] | null;
+  /**
+   * F1: called with the post-simulation accounts of the EXTENDED (second) simulation, when it was clean. Returning a reason rejects the
+   * extension: the original list (already simulated clean) is sent instead. Must not throw (a throw rejects nothing).
+   */
+  verifyExtended?: (post: ReadonlyArray<Uint8Array | null>) => string | null;
 }
 
 export type ExecOutcome =
@@ -165,6 +170,7 @@ export async function simulateAndSend(
         });
       let tx = make(list);
       let sim = await simulate(tx, o.extend !== undefined && o.accounts !== undefined);
+      const firstSim = sim;
       if (!sim.value.err && o.extend && o.accounts) {
         let ext: readonly TransactionInstruction[] | null = null;
         try {
@@ -176,7 +182,21 @@ export async function simulateAndSend(
         if (ext && ext.length > 0) {
           list = ext;
           tx = make(list);
-          sim = await simulate(tx, false);
+          sim = await simulate(tx, o.verifyExtended !== undefined);
+          if (!sim.value.err && o.verifyExtended) {
+            let why: string | null = null;
+            try {
+              const raw2 = (sim.value.accounts as Array<{ data: [string, string] } | null> | null | undefined) ?? [];
+              why = o.verifyExtended(o.accounts.map((_, i) => (raw2[i] ? new Uint8Array(Buffer.from(raw2[i]!.data[0], "base64")) : null)));
+            } catch {
+              why = null;
+            }
+            if (why) {
+              list = ixs;
+              tx = make(list);
+              sim = firstSim;
+            }
+          }
         }
       }
       const logs = sim.value.logs ?? [];

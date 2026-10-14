@@ -21,12 +21,12 @@ import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import { layoutById } from "../market-layout.ts";
 import {
   DEFAULT_LIQ_MAX_PER_TX, MAX_TX_BYTES, atOrBelowMaintenance, estimateBaseCu, fitLiquidations, liqExtraWeight, marginOf, markLiquidationCandidates,
-  readMarginParams, serializedTxSize, fitToPacket,
+  readMarginParams, serializedTxSize, fitToPacket, resetLiquidationGuard, liquidationMadeNoProgress, noteLiquidationLanded,
 } from "./liquidation.ts";
 import { DEFAULT_SWEEP_ROUND_CONFIG, buildSweepTxSlots, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
 import { resetJobCounters } from "./exec.ts";
 import { portfolioWeight, planSettleRound } from "./settle-pairing.ts";
-import { customAt, computeAt, execCtx, fakeExecConn, key } from "./test-helpers.ts";
+import { customAt, computeAt, execCtx, fakeExecConn, key, LAYOUT_V22 } from "./test-helpers.ts";
 import type { SentTx } from "./test-helpers.ts";
 import { v22FlagsFromEnv, describeV22Flags } from "./flags.ts";
 
@@ -62,7 +62,22 @@ function entry(n: number, b: Uint8Array, o: { lp?: boolean; risk?: boolean } = {
   return { pubkey: key(n), longLegs: 1, shortLegs: 0, isLp: o.lp === true, activeLegs: 1, lossWeight: BigInt(n), ...(o.risk === false ? {} : { risk: snapOf(b) }) };
 }
 
+/** The real underwater account after a REAL liquidation: the same legs with the basis cut to 45% (patched). */
+function withBasis(b: Uint8Array, basis: bigint): Uint8Array {
+  const c = new Uint8Array(b);
+  const v = new DataView(c.buffer);
+  const G = LAYOUT_V22.portfolio;
+  const p = parsePortfolioV17(b);
+  const i = p.legs.findIndex((l) => l.active);
+  const at = G.legsOff + i * G.legStride + G.leg.basisPosQ;
+  v.setBigUint64(at, basis & 0xffff_ffff_ffff_ffffn, true);
+  v.setBigUint64(at + 8, basis >> 64n, true);
+  return c;
+}
+const LIQUIDATED = withBasis(withCapital(UNDER, 5_800_000n), parsePortfolioV17(UNDER).legs.find((l) => l.active)!.basisPosQ * 45n / 100n);
+
 beforeEach(() => {
+  resetLiquidationGuard();
   resetPairingStats();
   resetJobCounters();
 });
@@ -100,15 +115,53 @@ describe("F1 margin arithmetic on real accounts", () => {
     assert.equal(atOrBelowMaintenance(m, 500), false);
   });
 
-  it("the boundary: exactly at the requirement counts, one atom above does not (pad 0); the pad moves it", () => {
+  it("the ENGINE predicate: STRICTLY below the requirement (ceil arithmetic). An account at exactly its requirement is NOT liquidatable; one atom under is", () => {
     const base = marginOf(snapOf(UNDER), PARAMS);
-    const at = withCapital(UNDER, 0n);
-    // capital such that equity == requirement
     const p = parsePortfolioV17(UNDER);
-    const need = base.requirement - (p.pnl + p.feeCredits);
-    assert.equal(atOrBelowMaintenance(marginOf(snapOf(withCapital(at, need)), PARAMS), 0), true);
-    assert.equal(atOrBelowMaintenance(marginOf(snapOf(withCapital(at, need + 1n)), PARAMS), 0), false);
-    assert.equal(atOrBelowMaintenance(marginOf(snapOf(withCapital(at, need + 1n)), PARAMS), 100), true);
+    const need = base.requirement - (p.pnl + p.feeCredits); // capital that makes equity == requirement
+    const exactly = marginOf(snapOf(withCapital(UNDER, need)), PARAMS);
+    assert.equal(exactly.equity, exactly.requirement);
+    assert.equal(atOrBelowMaintenance(exactly, 0), false, "exactly at MMR: the engine's deficit is 0, no crank");
+    assert.equal(atOrBelowMaintenance(marginOf(snapOf(withCapital(UNDER, need - 1n)), PARAMS), 0), true, "one atom under: liquidatable");
+    assert.equal(atOrBelowMaintenance(marginOf(snapOf(withCapital(UNDER, need + 1n)), PARAMS), 0), false);
+    assert.equal(atOrBelowMaintenance(marginOf(snapOf(withCapital(UNDER, need + 1n)), PARAMS), 100), true, "the pad (stage A only) widens it");
+  });
+
+  it("rounding is the engine's CEIL: notional and requirement round up, so the requirement is never below the floor arithmetic", () => {
+    const m = marginOf(snapOf(UNDER), PARAMS);
+    const q = BigInt(parsePortfolioV17(UNDER).legs.find((l) => l.active)!.basisPosQ);
+    const price = PARAMS.assets.get(0)!.priceE6;
+    const floorN = (q * price) / 1_000_000n;
+    assert.ok(m.notional === floorN || m.notional === floorN + 1n);
+    // with the target lag neutralised the requirement is exactly max(CEIL(notional * 600 / 10_000), floor)
+    const flat = marginOf(snapOf(UNDER), { ...PARAMS, assets: new Map([[0, { ...PARAMS.assets.get(0)!, rawTargetE6: price }]]) });
+    const ceilReq = (flat.notional * 600n + 9_999n) / 10_000n;
+    assert.equal(flat.requirement, ceilReq > 1_000_000n ? ceilReq : 1_000_000n);
+    assert.notEqual((flat.notional * 600n) % 10_000n, 0n, "the fixture is not divisible, so ceil != floor here");
+    assert.ok(flat.requirement > (flat.notional * 600n) / 10_000n);
+  });
+
+  it("an adverse target lag adds the engine's penalty to the requirement (long, raw target below the effective price)", () => {
+    const lagged = new Map(PARAMS.assets);
+    const a0 = PARAMS.assets.get(0)!;
+    lagged.set(0, { ...a0, rawTargetE6: a0.priceE6 - 1_000_000n });
+    const m0 = marginOf(snapOf(UNDER), PARAMS);
+    const m1 = marginOf(snapOf(UNDER), { ...PARAMS, assets: lagged });
+    assert.ok(m1.requirement > m0.requirement);
+    const favourable = new Map(PARAMS.assets);
+    favourable.set(0, { ...a0, rawTargetE6: a0.priceE6 + 1_000_000n });
+    const noLag = marginOf(snapOf(UNDER), { ...PARAMS, assets: favourable }).requirement;
+    assert.ok(noLag <= m0.requirement, "a favourable lag adds nothing");
+    assert.equal(marginOf(snapOf(UNDER), { ...PARAMS, assets: new Map([[0, { ...a0, rawTargetE6: a0.priceE6 }]]) }).requirement, noLag, "raw == effective and raw above effective both add 0 for a long");
+  });
+
+  it("the guard: after a landed liquidation, the same position/requirement is not cranked again until the state changes", () => {
+    const m = marginOf(snapOf(UNDER), PARAMS);
+    assert.equal(liquidationMadeNoProgress("k", m), false);
+    noteLiquidationLanded("k", m);
+    assert.equal(liquidationMadeNoProgress("k", { ...m, equity: m.equity - 80n }), true, "equity drift alone (funding) does not clear it");
+    assert.equal(liquidationMadeNoProgress("k", { ...m, notional: m.notional - 5_000_000n, requirement: m.requirement - 300_000n }), false, "the position moved: cleared");
+    assert.equal(liquidationMadeNoProgress("k", m), false, "entry was cleared");
   });
 
   it("a flat portfolio is never flagged; a market of another layout or a nonsense mmr reads as null (no guess)", () => {
@@ -276,8 +329,11 @@ const secondCrankIndex = (d: SentTx, k: string): number => {
 const LIQ = { layout: L, slots: 1, params: PARAMS };
 
 /** Post-simulation state: the market, and each requested portfolio as `state(addr)` (default: its pre-refresh bytes). */
-const postState = (state: (addr: string) => Uint8Array) => (_d: SentTx, _i: number, addrs: string[]): Array<Uint8Array | null> =>
-  addrs.map((a) => (a === MARKET.toBase58() ? PENGU_MARKET : state(a)));
+const postState = (state: (addr: string) => Uint8Array, tk: string = T, afterLiq: (addr: string) => Uint8Array = (a) => (a === tk ? LIQUIDATED : state(a))) => (d: SentTx, _i: number, addrs: string[]): Array<Uint8Array | null> => {
+  // the EXTENDED simulation (an account cranked twice) shows the account after a real liquidation; the plain one shows the post-refresh state
+  const extended = secondCrankIndex(d, tk) >= 0;
+  return addrs.map((a) => (a === MARKET.toBase58() ? PENGU_MARKET : extended ? afterLiq(a) : state(a)));
+};
 const book = () => [entry(1, HEALTHY), entry(2, UNDER), entry(3, HEALTHY)];
 const run = (f: ReturnType<typeof fakeExecConn>, input: Partial<Parameters<typeof runSettleRound>[2]> = {}, lines: string[] = []) =>
   runSettleRound(deps(f.conn, lines), { market: MARKET, label: "PENGU" }, { lp: LP, counterparties: book(), liq: LIQ, ...input }, DEFAULT_SWEEP_ROUND_CONFIG);
@@ -465,6 +521,47 @@ describe("F1 sweep: the liquidation crank rides in the same tx as the price-refr
     assert.deepEqual(last.keys, f.sent[0].keys, "what was simulated last is what was sent");
   });
 
+  it("DUST (the 2026-10-14 PENGU loop): a liquidation crank that would not move the position is NOT sent; the plain refresh is; next round the guard skips the extension", async () => {
+    // the extended simulation shows the SAME position (the engine's dust action)
+    const f = fakeExecConn({ simAccounts: postState((a) => (a === T ? UNDER : HEALTHY), T, (a) => (a === T ? UNDER : HEALTHY)) });
+    const lines: string[] = [];
+    const r = await run(f, {}, lines);
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].tags.length, 4, "the plain refresh went out");
+    assert.equal(countOf(f.sent[0], T), 1);
+    assert.equal(r.lpSettled, true);
+    assert.equal(r.liq.some((l) => l.result === "skipped" && l.note.includes("dust")), true);
+    assert.equal(pairingStats.liqLanded, 0);
+    assert.ok(lines.some((l) => l.startsWith("[liq] ") && l.includes("would not reduce the position")));
+    // next round, same state: the guard means ONE simulation and no extension attempt
+    const g = fakeExecConn({ simAccounts: postState((a) => (a === T ? UNDER : HEALTHY), T, (a) => (a === T ? UNDER : HEALTHY)) });
+    const r2 = await run(g);
+    assert.equal(g.sims.length, 1, "no second (extended) simulation while the state is unchanged");
+    assert.equal(g.sent[0].tags.length, 4);
+    assert.ok(r2.liq.some((l) => l.note.includes("no progress")));
+  });
+
+  it("NEGATIVE CONTROL (dust check): a real liquidation (notional cut 55%) IS sent with its crank", async () => {
+    const f = fakeExecConn({ simAccounts: postState((a) => (a === T ? UNDER : HEALTHY)) });
+    await run(f);
+    assert.equal(f.sent[0].tags.length, 5);
+  });
+
+  it("an account at EXACTLY its requirement in the post-refresh state is not cranked (the engine's deficit is 0)", async () => {
+    const base = marginOf(snapOf(UNDER), PARAMS);
+    const p = parsePortfolioV17(UNDER);
+    const AT = withCapital(UNDER, base.requirement - (p.pnl + p.feeCredits));
+    const f = fakeExecConn({ simAccounts: postState(() => AT) });
+    const r = await run(f);
+    assert.equal(f.sims.length, 1);
+    assert.equal(f.sent[0].tags.length, 4);
+    assert.equal(r.liq.length, 0);
+    // negative control: one atom under is cranked
+    const g = fakeExecConn({ simAccounts: postState((a) => (a === T ? withCapital(UNDER, base.requirement - (p.pnl + p.feeCredits) - 1n) : HEALTHY)) });
+    await run(g);
+    assert.equal(g.sent[0].tags.length, 5);
+  });
+
   it("BOUND: six accounts below maintenance with a cap of 1 per tx -> at most one second crank in any tx, the rest deferred and logged", async () => {
     const six = Array.from({ length: 6 }, (_, i) => entry(i + 1, UNDER));
     const f = fakeExecConn({ landedSlot: () => 1005, simAccounts: postState(() => UNDER) });
@@ -505,7 +602,7 @@ describe("F1 sweep: the liquidation crank rides in the same tx as the price-refr
 
   it("the counterparty-accrue form (no flat anchor, split round): the accrue target itself gets its second crank right after the observation crank", async () => {
     const many = Array.from({ length: 12 }, (_, i) => entry(i + 1, i === 0 ? UNDER : HEALTHY));
-    const f = fakeExecConn({ landedSlot: () => 1005, simAccounts: postState((a) => (a === key(1).toBase58() ? UNDER : HEALTHY)) });
+    const f = fakeExecConn({ landedSlot: () => 1005, simAccounts: postState((a) => (a === key(1).toBase58() ? UNDER : HEALTHY), key(1).toBase58()) });
     const r = await run(f, { counterparties: many });
     const withT1 = f.sent.filter((d) => countOf(d, key(1).toBase58()) === 2);
     assert.equal(withT1.length, 1);

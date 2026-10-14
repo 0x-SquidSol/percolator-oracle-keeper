@@ -32,7 +32,7 @@ import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { MarketLayout } from "../market-layout.ts";
 import {
   DEFAULT_LIQ_EXACT_PAD_BPS, DEFAULT_LIQ_MAX_PER_TX, DEFAULT_LIQ_PAD_BPS, atOrBelowMaintenance, estimateBaseCu, fitLiquidations,
-  markLiquidationCandidates, marginOf, readMarginParams, fitToPacket,
+  MIN_PROGRESS_BPS, markLiquidationCandidates, marginOf, readMarginParams, fitToPacket, liquidationMadeNoProgress, noteLiquidationLanded,
 } from "./liquidation.ts";
 import type { FlaggedAccount, MarginParams } from "./liquidation.ts";
 import { holdPushes as realHold, releasePushes as realRelease } from "../refresh-coordination.ts";
@@ -416,7 +416,14 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
           return;
         }
         const m = marginOf(riskSnapOf(parsed), params);
-        if (m.ratioBps !== null && atOrBelowMaintenance(m, liqCfg.exactPadBps)) flagged.push({ portfolio: c, ratioBps: m.ratioBps });
+        if (m.ratioBps !== null && atOrBelowMaintenance(m, liqCfg.exactPadBps)) {
+          if (liquidationMadeNoProgress(c.pubkey.toBase58(), m)) {
+            liqNote(c.pubkey.toBase58(), "skipped", null, "state unchanged since the last landed liquidation crank (no progress); not cranked again until it changes");
+            pairingStats.liqSkipped++;
+            return;
+          }
+          flagged.push({ portfolio: c, ratioBps: m.ratioBps, margin: m });
+        }
       });
       if (flagged.length === 0) return null;
       const fit = fitLiquidations({ flagged, baseCu: estimateBaseCu(accrue !== "none", refresh) + (accrue === "counterparty" ? 114_000 : 0), maxPerTx: liqCfg.maxPerTx });
@@ -440,7 +447,45 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
       chosen = new Map(take.map((f) => [f.portfolio.pubkey.toBase58(), f]));
       return list;
     };
-    const liqOpts: Pick<ExecOptions, "accounts" | "extend"> =
+    /**
+     * Stage B check on the EXTENDED simulation: a liquidation that does not move the position is not sent. An account the engine
+     * keeps leaving a hair under its requirement (funding / fee drag between rounds) makes each crank a dust action (measured on
+     * PENGU 7Jbxvq 2026-10-14: -3,237,984 atoms for the real liquidation, then 13 cranks of -60..-83 atoms each). Progress =
+     * the account's notional falls by at least MIN_PROGRESS_BPS of its pre-liquidation notional; else the plain tx goes out and the
+     * state is remembered (liquidationMadeNoProgress) until it changes.
+     */
+    const verifyLiquidations = (post: ReadonlyArray<Uint8Array | null>): string | null => {
+      if (!liqCfg || chosen.size === 0) return null;
+      const marketPost = post[0];
+      const params = marketPost ? readMarginParams(marketPost, liqCfg.layout, liqCfg.slots) : null;
+      if (!params) return null;
+      const noProgress: string[] = [];
+      cands.forEach((c, i) => {
+        const k = c.pubkey.toBase58();
+        const f = chosen.get(k);
+        const d = post[i + 1];
+        if (!f || !f.margin || !d) return;
+        let parsed;
+        try {
+          parsed = parsePortfolioV17(d);
+        } catch {
+          return;
+        }
+        const after = marginOf(riskSnapOf(parsed), params);
+        const dropped = f.margin.notional - after.notional;
+        if (dropped * 10_000n < f.margin.notional * BigInt(MIN_PROGRESS_BPS)) {
+          noProgress.push(k);
+          noteLiquidationLanded(k, f.margin);
+          pairingStats.liqSkipped++;
+          liqNote(k, "skipped", null, `the liquidation crank would not reduce the position (notional ${f.margin.notional} -> ${after.notional}): a dust action, not sent; plain refresh sent`);
+        }
+      });
+      if (noProgress.length === 0) return null;
+      // all-or-nothing keeps the tx simple: the plain tx (already simulated clean) is sent, the others are retried next round
+      chosen = new Map();
+      return `no progress on ${noProgress.length} account(s)`;
+    };
+    const liqOpts: Pick<ExecOptions, "accounts" | "extend" | "verifyExtended"> =
       liqCfg && cands.length > 0
         ? {
             accounts: [ctx.market.toBase58(), ...cands.map((c) => c.pubkey.toBase58())],
@@ -448,6 +493,7 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
               const ext = extendWithLiquidations(post, cands);
               return ext;
             },
+            verifyExtended: verifyLiquidations,
           }
         : {};
     const outcome = await simulateAndSend(deps.exec, ixs, {
@@ -462,7 +508,10 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     if (landed || outcome.kind === "dry-run") {
       for (const [k, f] of chosen) {
         pairingStats.liqIncluded++;
-        if (landed) pairingStats.liqLanded++;
+        if (landed) {
+          pairingStats.liqLanded++;
+          if (f.margin) noteLiquidationLanded(k, f.margin);
+        }
         liqNote(k, landed ? "landed" : "simulated", null, `${landed ? "liquidation crank landed" : "liquidation crank simulated OK (dry-run: not sent)"} with the refresh in one tx; margin ${f.ratioBps} bps of notional after the refresh`);
       }
       return { outcome, settled: settledKeys(), pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog };

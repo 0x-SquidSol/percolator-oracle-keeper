@@ -16,9 +16,7 @@
  *      the market, so the margin is measured exactly at the post-accrual price. Only accounts at or below maintenance there get
  *      a liquidation crank, appended right after their refresh, and the extended tx is simulated again before it is sent.
  *
- * MARGIN (the sim's validated formula, `sim/market.ts` keeperSweep): equity = capital + pnl + fee_credits;
- * notional = sum over legs of |basis * A_side / a_basis| * effective_price / POS_SCALE; requirement =
- * max(notional * maintenance_margin_bps / 10_000, min_nonzero_mm_req). Positive pnl is counted in full (the engine may haircut
+ * MARGIN (the engine's arithmetic, see marginOf): equity = capital + pnl + fee_credits; liquidatable iff equity < requirement, STRICTLY. Positive pnl is counted in full (the engine may haircut
  * unmatured pnl), which can only UNDER-flag; the pad and the simulation cover that: a liquidation crank on a healthy account
  * costs one pruned simulation (Custom(22)), a missed one costs the market. The engine is the authority; this is a screen.
  */
@@ -35,10 +33,12 @@ export const POS_SCALE = 1_000_000n;
 /** Offsets relative to the group base (`layout.groupOff`) of the variant-B `V16ConfigAccount` (packed: u16, u32, u128, u128, u64 x 2, ...). */
 export const V22_MARGIN_CFG_OFF = { minNonzeroMmReq: 38, maintenanceMarginBps: 86 } as const;
 /** Offsets relative to the engine slot base: `a_long`, `a_short` (u128 each) of AssetStateV16Account; `effective_price` is in market-layout. */
-export const V22_ASSET_A_OFF = { aLong: 49, aShort: 65 } as const;
+export const V22_ASSET_A_OFF = { aLong: 49, aShort: 65, rawTarget: 17 } as const;
 
 /** Most liquidation cranks one sweep tx carries (the 1.4M CU and 1,232 B limits bound it further). */
 export const DEFAULT_LIQ_MAX_PER_TX = 4;
+/** A liquidation crank must cut the account's notional by at least this many bps of it (0.5%) or it is a dust action and is not sent. */
+export const MIN_PROGRESS_BPS = 50;
 /** Stage A pad: a candidate is within this many bps of NOTIONAL above its maintenance requirement (default 5 points of notional). */
 export const DEFAULT_LIQ_PAD_BPS = 500;
 /**
@@ -58,6 +58,8 @@ export const SANE_MMR_BPS_MAX = 5_000n;
 
 export interface AssetMarginParams {
   priceE6: bigint;
+  /** `raw_oracle_target_price`: the engine adds a target-lag penalty to the requirement when it is adverse to a leg. */
+  rawTargetE6: bigint;
   aLong: bigint;
   aShort: bigint;
 }
@@ -91,9 +93,10 @@ export function readMarginParams(data: Uint8Array, layout: MarketLayout, slots: 
     const e = engineSlotBase(layout, i);
     if (data.length < e + V22_ASSET_A_OFF.aShort + 16) return null;
     const priceE6 = rd64(data, e + layout.asset.effectivePrice);
+    const rawTargetE6 = rd64(data, e + V22_ASSET_A_OFF.rawTarget);
     const aLong = rd128(data, e + V22_ASSET_A_OFF.aLong);
     const aShort = rd128(data, e + V22_ASSET_A_OFF.aShort);
-    assets.set(i, { priceE6, aLong, aShort });
+    assets.set(i, { priceE6, rawTargetE6, aLong, aShort });
   }
   return { mmrBps, minNonzeroMmReq, assets };
 }
@@ -107,27 +110,68 @@ export interface MarginState {
   ratioBps: bigint | null;
 }
 
-/** Margin of a risk snapshot under `params`. A leg on an asset the market does not carry is ignored. Pure. */
+const ceilDiv = (n: bigint, d: bigint): bigint => (n + d - 1n) / d;
+
+/**
+ * Margin of a risk snapshot under `params`, with the ENGINE's arithmetic (engine v16.rs 3ce4cbd1): per leg
+ * abs_q = |basis| * A_side / a_basis; risk_notional = CEIL(abs_q * effective_price / POS_SCALE) (`risk_notional_ceil`);
+ * target-lag penalty = CEIL(abs_q * adverse_delta / POS_SCALE), adverse_delta = effective - raw target for a long when raw < effective
+ * (raw - effective for a short when raw > effective), else 0; requirement = max(CEIL(sum notional * mmr_bps / 10_000),
+ * min_nonzero_mm_req) + sum penalty (`margin_requirement`, `health_requirements_from_notional_and_target_lag`). The account is
+ * liquidatable iff `certified_liq_deficit != 0`, and the deficit is `maintenance_req.saturating_sub(equity)` (equity >= 0) or
+ * |equity| (equity < 0): STRICTLY equity < requirement. An account the engine left at exactly its requirement is NOT liquidatable.
+ * A leg on an asset the market does not carry is ignored. Pure.
+ */
 export function marginOf(snap: RiskSnap, params: MarginParams): MarginState {
   let notional = 0n;
+  let penalty = 0n;
   for (const leg of snap.legs) {
     const a = params.assets.get(leg.assetIndex);
     if (!a || a.priceE6 <= 0n) continue;
     const abs = leg.basis < 0n ? -leg.basis : leg.basis;
     const side = leg.side === 0 ? a.aLong : a.aShort;
-    const eff = leg.aBasis > 0n ? (abs * side) / leg.aBasis : abs;
-    notional += (eff * a.priceE6) / POS_SCALE;
+    const q = leg.aBasis > 0n ? (abs * side) / leg.aBasis : abs;
+    notional += ceilDiv(q * a.priceE6, POS_SCALE);
+    const adverse = leg.side === 0 ? (a.rawTargetE6 < a.priceE6 ? a.priceE6 - a.rawTargetE6 : 0n) : a.rawTargetE6 > a.priceE6 ? a.rawTargetE6 - a.priceE6 : 0n;
+    if (adverse > 0n) penalty += ceilDiv(q * adverse, POS_SCALE);
   }
   if (notional === 0n) return { equity: snap.equity, notional, requirement: 0n, ratioBps: null };
-  const byBps = (notional * params.mmrBps) / 10_000n;
-  const requirement = byBps > params.minNonzeroMmReq ? byBps : params.minNonzeroMmReq;
+  const byBps = ceilDiv(notional * params.mmrBps, 10_000n);
+  const requirement = (byBps > params.minNonzeroMmReq ? byBps : params.minNonzeroMmReq) + penalty;
   return { equity: snap.equity, notional, requirement, ratioBps: (snap.equity * 10_000n) / notional };
 }
 
-/** At or below maintenance, with a pad of `padBps` of notional (0 = exactly at or below the requirement). */
+/**
+ * The engine's liquidation predicate: equity STRICTLY below the maintenance requirement (pad 0). A pad of `padBps` of notional
+ * widens it for Stage A (plan weight) only; Stage B uses pad 0 so an account left at exactly its requirement is never cranked.
+ */
 export function atOrBelowMaintenance(m: MarginState, padBps: number): boolean {
   if (m.notional === 0n) return false;
-  return m.equity <= m.requirement + (m.notional * BigInt(padBps)) / 10_000n;
+  return m.equity < m.requirement + (m.notional * BigInt(padBps)) / 10_000n;
+}
+
+/**
+ * No-progress guard. After a LANDED liquidation crank on an account the keeper remembers the margin it measured; while the next
+ * measurement shows the same state (notional and requirement each within one atom: the position did not move; equity drifts
+ * with funding so it is not compared) it does not crank that account again. Any other state clears the entry. Process-lifetime, bounded.
+ */
+const liqGuard = new Map<string, MarginState>();
+const LIQ_GUARD_MAX = 4_096;
+const near1 = (a: bigint, b: bigint): boolean => (a > b ? a - b : b - a) <= 1n;
+export function noteLiquidationLanded(key: string, m: MarginState): void {
+  if (liqGuard.size >= LIQ_GUARD_MAX) liqGuard.delete(liqGuard.keys().next().value as string);
+  liqGuard.set(key, m);
+}
+/** True when `m` is the state the last landed liquidation on `key` left (no progress): do not crank again. Clears a stale entry. */
+export function liquidationMadeNoProgress(key: string, m: MarginState): boolean {
+  const prev = liqGuard.get(key);
+  if (!prev) return false;
+  if (near1(prev.requirement, m.requirement) && near1(prev.notional, m.notional)) return true;
+  liqGuard.delete(key);
+  return false;
+}
+export function resetLiquidationGuard(): void {
+  liqGuard.clear();
 }
 
 /** Extra plan weight of a liquidation candidate: its liquidation crank in 35k-CU weight units, rounded up. */
@@ -162,6 +206,7 @@ export function markLiquidationCandidates(
 
 export interface FlaggedAccount {
   portfolio: PositionedPortfolio;
+  margin?: MarginState;
   /** margin ratio in bps of notional (lower = worse) */
   ratioBps: bigint;
 }
