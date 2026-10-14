@@ -94,7 +94,8 @@ export const STAKE_MINIMUM_LIQUIDITY = 1_000n;
  * A byte of 0 is a LEGACY pool — every pool on the currently deployed (pre-fix) stake program — which
  * keeps the old rule: one floor, `total_lp_supply - 1000` (saturating).
  *
- * TODO(repin): this is a local mirror because the keeper pins @percolatorct/sdk cb444db, which has no
+ * TODO(repin): kept as a local mirror after the 343882a repin: the SDK's `stakeRealLpSupply(pool)` takes a decoded pool
+ * (junior/senior split via `stakeDeadLp`), not `(totalLpSupply, floorFlags)`, so it is not the same contract. Original note: the keeper pinned @percolatorct/sdk cb444db, which has no
  * floor-flag decoding. Once the pin moves to the v2.2 SDK (percolator-sdk#406, `stakeRealLpSupply` /
  * `stakeHasRealLpHolders`), replace these with the SDK helpers and delete the mirror.
  */

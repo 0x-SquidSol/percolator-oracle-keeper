@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { Keypair } from "@solana/web3.js";
 import { resolveProgramIds } from "./program-ids.ts";
 
 const FRESH = {
@@ -19,7 +20,12 @@ describe("v2.2 fresh-ID program set via env (+ KEEPER_NFT_PROGRAM_ID alias)", ()
     assert.equal(ids.source.nft, "env KEEPER_NFT_PROGRAM_ID");
   });
   it("refuses unknown ids without the override flag", () => {
-    assert.throws(() => resolveProgramIds({ ...FRESH }), /KEEPER_ALLOW_PROGRAM_ID_OVERRIDE/);
+    // The v2.2 fresh set is in the SDK tables since the 343882a repin (it needs no flag any more, see program-ids.ts),
+    // so the refusal is asserted with ids the SDK does not know.
+    const unknown = { ...FRESH, WRAPPER_PROGRAM_ID: Keypair.generate().publicKey.toBase58() };
+    assert.throws(() => resolveProgramIds(unknown), /KEEPER_ALLOW_PROGRAM_ID_OVERRIDE/);
+    const known = resolveProgramIds({ ...FRESH });
+    assert.equal(known.wrapper.toBase58(), FRESH.WRAPPER_PROGRAM_ID);
   });
   it("refuses a disagreeing NFT_PROGRAM_ID + alias", () => {
     assert.throws(

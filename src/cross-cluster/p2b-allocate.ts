@@ -39,6 +39,7 @@ import type { ConfirmOptions } from "./tx-confirm.ts";
 import { classifyProbeError } from "./p2b-feature.ts";
 import { VAULT_LP_ALLOCATE_REFUSED } from "./lock-codes.ts";
 import type { VaultMarketSnapshot } from "./p2b-markets.ts";
+import { lpVaultRegistryBondFlag } from "./registry-flags.ts";
 
 export interface AllocateConfig {
   /** Mean pacing per market. */
@@ -228,6 +229,10 @@ export class VaultLpAllocator {
     const ix = buildVaultLpAllocateIxP2b(
       { programId, market: snap.market, registryDomain: snap.registry!.domain, lpPortfolio: snap.vaultLp!.lpPortfolio },
       keeper.publicKey,
+      undefined,
+      // EARN-10: on a market whose registry has the bond-tranche flag (byte 162) the program REQUIRES the
+      // ["bond_tranche", market] account at [9]; without it tag 103 fails NotEnoughAccountKeys.
+      { bondTranche: snap.registryData ? lpVaultRegistryBondFlag(snap.registryData) : false },
     );
     const tx = new Transaction();
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: this.cfg.computeUnits }));

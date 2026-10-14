@@ -108,10 +108,11 @@ export function patchedMarket(p: MarketPatch = {}, base = "sol-market-v18"): Uin
 }
 
 /** A real SOLCAT LP-vault registry (176 B, domain 0) with the bound / ext flag bytes set. */
-export function registryBytes(o: { bound?: boolean; ext?: boolean; domain?: number; feeShareBps?: number; boundByte?: number } = {}): Uint8Array {
+export function registryBytes(o: { bound?: boolean; ext?: boolean; domain?: number; feeShareBps?: number; boundByte?: number; bond?: boolean } = {}): Uint8Array {
   const b = Buffer.from(fx("solcat-lp-vault-registry-v18"));
   b[160] = o.boundByte ?? (o.bound ? 1 : 0);
   b[161] = o.ext ? 1 : 0;
+  b[162] = o.bond ? 1 : 0;
   if (o.domain !== undefined) b.writeUInt16LE(o.domain, 16 + 132);
   if (o.feeShareBps !== undefined) b.writeUInt16LE(o.feeShareBps, 16 + 128);
   return new Uint8Array(b);

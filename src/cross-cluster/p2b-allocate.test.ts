@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@solana/web3.js";
+import { deriveBondTrancheV22, deriveLpVaultRegistry } from "@percolatorct/sdk";
 import { DEFAULT_ALLOCATE_CONFIG, VaultLpAllocator, allocateConfigFromEnv } from "./p2b-allocate.ts";
 import type { AllocateConfig } from "./p2b-allocate.ts";
 import { KEEPER, PROGRAM, fakeConn, patchedMarket, registryBytes, snapshot, vaultLpStateBytes } from "./p2b-test-helpers.ts";
@@ -12,11 +13,11 @@ import { KEEPER, PROGRAM, fakeConn, patchedMarket, registryBytes, snapshot, vaul
 const ie = (detail: unknown) => ({ InstructionError: [1, detail] });
 const CFG: AllocateConfig = { ...DEFAULT_ALLOCATE_CONFIG, intervalMs: 60_000, jitter: 0.25 };
 
-function boundSnap(o: { outstanding?: bigint; registry?: Uint8Array | null; market?: Uint8Array | null; label?: string } = {}) {
+function boundSnap(o: { outstanding?: bigint; bond?: boolean; registry?: Uint8Array | null; market?: Uint8Array | null; label?: string } = {}) {
   const lp = Keypair.generate().publicKey;
   return snapshot({
     label: o.label ?? "SOL",
-    registryData: o.registry === undefined ? registryBytes({ bound: true }) : o.registry,
+    registryData: o.registry === undefined ? registryBytes({ bound: true, bond: o.bond }) : o.registry,
     marketData: o.market === undefined ? patchedMarket() : o.market,
     vaultLpData: vaultLpStateBytes({ lp, outstanding: o.outstanding ?? 0n }),
   });
@@ -236,5 +237,47 @@ describe("allocateConfigFromEnv", () => {
     assert.deepEqual([c.intervalMs, c.jitter, c.computeUnits, c.dryRun], [90_000, 0.1, 700_000, true]);
     assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_INTERVAL_MS: "5" }, false), /P2B_ALLOCATE_INTERVAL_MS/);
     assert.throws(() => allocateConfigFromEnv({ P2B_ALLOCATE_JITTER_PCT: "95" }, false), /P2B_ALLOCATE_JITTER_PCT/);
+  });
+});
+
+describe("tag 103: bond tranche account (EARN-10)", () => {
+  it("market WITHOUT a bond tranche: exactly the 9 accounts, no tranche", async () => {
+    const r = rig({ sims: [{ err: null }] });
+    const s = boundSnap({ bond: false });
+    await firstDue(r, s);
+    assert.equal(await r.a.runMarket(s), "sent");
+    const ix = r.c.sent[0].instructions[1];
+    assert.equal(ix.keys.length, 9);
+    assert.ok(!ix.keys.some((k) => k.pubkey.equals(deriveBondTrancheV22(PROGRAM, s.market)[0])));
+  });
+
+  it("market WITH a bond tranche (registry byte 162): 10 accounts, ['bond_tranche', market] read-only at [9]; first 9 unchanged", async () => {
+    const rPlain = rig({ sims: [{ err: null }] });
+    const plain = boundSnap({ bond: false });
+    await firstDue(rPlain, plain);
+    await rPlain.a.runMarket(plain);
+    const r = rig({ sims: [{ err: null }] });
+    const s = boundSnap({ bond: true });
+    await firstDue(r, s);
+    assert.equal(await r.a.runMarket(s), "sent");
+    const ix = r.c.sent[0].instructions[1];
+    assert.equal(ix.keys.length, 10);
+    const tranche = ix.keys[9];
+    assert.ok(tranche.pubkey.equals(deriveBondTrancheV22(PROGRAM, s.market)[0]));
+    assert.equal(tranche.isWritable, false);
+    assert.equal(tranche.isSigner, false);
+    assert.ok(ix.keys[2].pubkey.equals(deriveLpVaultRegistry(PROGRAM, s.market)[0]));
+    assert.ok(ix.keys[1].pubkey.equals(s.market));
+    assert.ok(ix.keys[4].pubkey.equals(s.vaultLp!.lpPortfolio));
+    assert.equal(ix.data.length, 17);
+    assert.equal(ix.data[0], 103);
+  });
+
+  it("the simulation carries the tranche too (simulate-first sees the same account list)", async () => {
+    const r = rig({ sims: [{ err: ie({ Custom: 100 }) }] });
+    const s = boundSnap({ bond: true });
+    await firstDue(r, s);
+    assert.equal(await r.a.runMarket(s), "no-room");
+    assert.equal(r.c.count("simulateTransaction"), 1);
   });
 });

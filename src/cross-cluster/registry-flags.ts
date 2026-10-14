@@ -33,3 +33,14 @@ export const LP_VAULT_REGISTRY_EXT_FLAG_OFF = 16 + 145;
 export function lpVaultRegistryExtFlag(data: Uint8Array): boolean {
   return data.length > LP_VAULT_REGISTRY_EXT_FLAG_OFF && data[LP_VAULT_REGISTRY_EXT_FLAG_OFF] === 1;
 }
+
+/**
+ * v2.2 "BondTrancheV20 exists" flag: `_reserved[2]`, absolute byte 162 (SDK `isLpVaultRegistryBondP2b`, wrapper
+ * `VAULT_LP_REGISTRY_BOND_FLAG_IDX = 2`). While set, tag 103 (and 78 bound / 97 / 102 Resolved) REQUIRE the
+ * `["bond_tranche", market]` account; tag 103 without it fails NotEnoughAccountKeys. Never throws: a short account or an
+ * unexpected byte reads as "no bond tranche" (the program rejects a bad byte itself).
+ */
+export const LP_VAULT_REGISTRY_BOND_FLAG_OFF = 16 + 146;
+export function lpVaultRegistryBondFlag(data: Uint8Array): boolean {
+  return data.length > LP_VAULT_REGISTRY_BOND_FLAG_OFF && data[LP_VAULT_REGISTRY_BOND_FLAG_OFF] === 1;
+}
