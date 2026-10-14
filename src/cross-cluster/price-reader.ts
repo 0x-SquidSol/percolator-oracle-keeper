@@ -896,6 +896,13 @@ export async function readAllPoolPricesE6(
    * moved in ~0.08% steps). The returned e6 map is unchanged and stays the source of truth.
    */
   pricesE12?: Map<string, bigint>,
+  /**
+   * Optional sink for the QUOTE reserve of x*y=k pools, in USD e6, keyed by poolAddress (G8 depth input, see
+   * push-depth.ts). Filled ONLY for constant-product venues (pumpswap) whose price was published this cycle, from the
+   * same vault read and the same SOL/USD rate as the price. Never filled for raydium-clmm / meteora-dlmm (not
+   * constant-product) or when the reserve is unreadable or unconvertible - absence means "send no depth".
+   */
+  quoteReservesUsdE6?: Map<string, bigint>,
 ): Promise<Map<string, bigint>> {
   const out = new Map<string, bigint>();
   if (entries.length === 0) return out;
@@ -1214,6 +1221,15 @@ export async function readAllPoolPricesE6(
         if (priceE6 > 0n) {
           out.set(entry.poolAddress, priceE6);
           pricesE12?.set(entry.poolAddress, priceE12);
+          if (quoteReservesUsdE6) {
+            const reserve = pumpswapQuoteDepthUsdE6(
+              new Uint8Array(quoteVaultInfo.data),
+              dec.quote,
+              pumpswapCandidates[c].quoteMint,
+              solPriceE6,
+            );
+            if (reserve !== null && reserve > 0n) quoteReservesUsdE6.set(entry.poolAddress, reserve);
+          }
         }
       } catch {
         // e.g. WSOL-quoted but solPriceE6 unavailable this cycle (SOL/USD read
