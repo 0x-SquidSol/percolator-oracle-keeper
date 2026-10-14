@@ -39,7 +39,7 @@ import type { ConfirmOptions } from "./tx-confirm.ts";
 import { classifyProbeError } from "./p2b-feature.ts";
 import { VAULT_LP_ALLOCATE_REFUSED } from "./lock-codes.ts";
 import type { VaultMarketSnapshot } from "./p2b-markets.ts";
-import { lpVaultRegistryBondFlag } from "./registry-flags.ts";
+import { lpVaultRegistryBondFlag } from "./v22/market.ts";
 
 export interface AllocateConfig {
   /** Mean pacing per market. */

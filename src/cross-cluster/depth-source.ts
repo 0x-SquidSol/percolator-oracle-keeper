@@ -1,10 +1,10 @@
 /**
  * v2.2 growth round 2 (R2.1 item 4): the wrapper's ON-CHAIN DEX depth source and PushAuthMark depth mode 2.
  *
- * Copied from the SDK (`sdk` feat/v22-sdk-growth @ 6871426, `src/abi/v22-depth-source.ts`; wrapper
- * `feat/v22-growth-dex-depth` @ e2c93138 `src/depth_src_v22.rs`).
- * TODO(repin): replace with the SDK exports `deriveDepthSourceV22` / `decodeDepthSourceV22` / `buildPushAuthMarkDexIxV22`
- * once the keeper's @percolatorct/sdk pin carries them.
+ * PDA derivation comes from the SDK (`deriveDepthSourceV22`, pin ec2b63e). The active-pin decoder stays local on purpose: the
+ * SDK's `decodeDepthSourceV22` THROWS on a bad/cleared record and returns every field, this one returns null and only the
+ * mode-2 fields. The mode-2 ix is built in auth-mark-pusher.ts; a test pins it byte-for-byte to the SDK's
+ * `buildPushAuthMarkDexIxV22`. (Wrapper `feat/v22-growth-dex-depth` @ e2c93138 `src/depth_src_v22.rs`.)
  *
  * The upgrade authority pins ONE pool per market (PDA `["depth_src", market]`, header kind 16). A mode-2 push is the 44 B
  * PushAuthMark with `depth_mode = 2`, `depth_e6 = 0`, plus `[2] depth_src [3] pool [4] base_vault [5] quote_vault`
@@ -14,6 +14,7 @@
  * Flag `KEEPER_PUSH_DEPTH_ONCHAIN` (default OFF, and only effective with `KEEPER_PUSH_DEPTH` on). Off = nothing here runs.
  */
 import { PublicKey } from "@solana/web3.js";
+import { deriveDepthSourceV22 } from "@percolatorct/sdk";
 import type { AccountInfo, Connection } from "@solana/web3.js";
 import { pushDepthEnabled } from "./push-depth.ts";
 import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
@@ -39,7 +40,7 @@ export function pushDepthOnchainEnabled(env: Record<string, string | undefined> 
 }
 
 export function deriveDepthSource(programId: PublicKey, market: PublicKey): PublicKey {
-  return PublicKey.findProgramAddressSync([Buffer.from(DEPTH_SOURCE_SEED), market.toBuffer()], programId)[0];
+  return deriveDepthSourceV22(programId, market)[0];
 }
 
 /** What a mode-2 push needs. */

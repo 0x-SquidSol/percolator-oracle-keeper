@@ -17,6 +17,7 @@ import {
 } from "@percolatorct/sdk";
 import { buildCrankFeesIx, crankLpFeesOnce } from "./lp-fee-cranker.ts";
 import { lpVaultRegistryExtFlag } from "./registry-flags.ts";
+import { deriveBondTrancheV22 } from "@percolatorct/sdk";
 import { DEFAULT_P2B_GATE_CONFIG, P2bFeatureGate, setP2bGate } from "./p2b-feature.ts";
 import { KEEPER, PROGRAM, deriveLpVaultRegistry, deriveVaultLpState, fx, registryBytes, vaultLpStateBytes } from "./p2b-test-helpers.ts";
 
@@ -252,5 +253,41 @@ describe("race: a tag 103 creates the ext between our registry read and our send
     } finally {
       setP2bGate(null);
     }
+  });
+});
+
+describe("tag 78 on a BOND market with the ext (SDK table: bond tranche at [9], writable)", () => {
+  const TRANCHE = deriveBondTrancheV22(PROGRAM, MARKET)[0];
+
+  it("buildCrankFeesIx without a bond tranche: exactly 9 accounts (state, ext, LP)", () => {
+    const ix = buildCrankFeesIx({
+      keeper: KEEPER.publicKey, market: MARKET, registry: REG_KEY,
+      ledger: deriveLpBackingLedger(PROGRAM, MARKET, 0)[0], siblingLedger: deriveLpBackingLedger(PROGRAM, MARKET, 1)[0],
+      domainIdx: 0, bound: true, tail: { vaultLpExt: EXT_KEY, lpPortfolio: LP },
+    });
+    assert.equal(ix.keys.length, 9);
+  });
+
+  it("buildCrankFeesIx with the bond tranche: 10 accounts, [8] LP writable, [9] the ['bond_tranche', market] PDA writable", () => {
+    const ix = buildCrankFeesIx({
+      keeper: KEEPER.publicKey, market: MARKET, registry: REG_KEY,
+      ledger: deriveLpBackingLedger(PROGRAM, MARKET, 0)[0], siblingLedger: deriveLpBackingLedger(PROGRAM, MARKET, 1)[0],
+      domainIdx: 0, bound: true, tail: { vaultLpExt: EXT_KEY, lpPortfolio: LP, bondTranche: TRANCHE },
+    });
+    assert.deepEqual(ix.keys.slice(6).map((k) => k.pubkey.toBase58()), [STATE_KEY.toBase58(), EXT_KEY.toBase58(), LP.toBase58(), TRANCHE.toBase58()]);
+    assert.equal(ix.keys[8].isWritable, true);
+    assert.equal(ix.keys[9].isWritable, true);
+  });
+
+  it("crankLpFeesOnce: registry bond byte 162 set -> the sent tx carries the tranche; clear -> 9 accounts", async () => {
+    const bondReg = registryBytes({ bound: true, ext: true, bond: true });
+    const r = rig({ registries: [bondReg], state: vaultLpStateBytes({ lp: LP }) });
+    assert.equal(await crankLpFeesOnce(r.conn as never, KEEPER, MARKET.toBase58(), false), "cranked");
+    const ix = crankIx(r.sent[0]);
+    assert.equal(ix.keys.length, 10);
+    assert.ok(ix.keys[9].pubkey.equals(TRANCHE));
+    const r2 = rig({ registries: [registryBytes({ bound: true, ext: true })], state: vaultLpStateBytes({ lp: LP }) });
+    assert.equal(await crankLpFeesOnce(r2.conn as never, KEEPER, MARKET.toBase58(), false), "cranked");
+    assert.equal(crankIx(r2.sent[0]).keys.length, 9);
   });
 });

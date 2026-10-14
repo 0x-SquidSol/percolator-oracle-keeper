@@ -59,6 +59,8 @@ import {
   parseLpVaultRegistry,
   deriveVaultLpExtP2b,
   withCrankFeesBoundTailP2b,
+  deriveBondTrancheV22,
+  withBondTailV22,
 } from "@percolatorct/sdk";
 import { SystemProgram } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
@@ -209,7 +211,7 @@ export async function crankLpFeesOnce(
   // pre-P2b program, so for them `ext` stays null and the transaction is byte-identical to before.
   let ext: BoundExtTail | null = null;
   if (bound && lpVaultRegistryExtFlag(new Uint8Array(registryInfo.data))) {
-    const t = await resolveExtTail(devnetConn, market);
+    const t = await resolveExtTail(devnetConn, market, lpVaultRegistryBondFlag(new Uint8Array(registryInfo.data)));
     if ("error" in t) return { error: t.error };
     ext = t;
   }
@@ -225,7 +227,7 @@ export async function crankLpFeesOnce(
     try {
       const [fresh] = (await devnetConn.getMultipleAccountsInfo([registry], "confirmed")) as Array<{ data: Buffer } | null>;
       if (fresh && lpVaultRegistryExtFlag(new Uint8Array(fresh.data))) {
-        const t = await resolveExtTail(devnetConn, market);
+        const t = await resolveExtTail(devnetConn, market, lpVaultRegistryBondFlag(new Uint8Array(fresh.data)));
         if (!("error" in t)) out = await attempt(t);
       }
     } catch {
@@ -239,18 +241,28 @@ export async function crankLpFeesOnce(
 export interface BoundExtTail {
   vaultLpExt: PublicKey;
   lpPortfolio: PublicKey;
+  /**
+   * EARN-10 / SDK table: on a BOND market (registry byte 162) with the ext, tag 78 also REQUIRES the bond tranche at [9]
+   * (writable). Absent = no bond tranche (the 9-account list). The v22 bond fee job adds the tranche itself and leaves this unset.
+   */
+  bondTranche?: PublicKey;
 }
 
 /** Derive the ext PDA and read the vault LP portfolio from `vault_lp_state`. One extra read, only when the ext flag is set. */
 async function resolveExtTail(
   conn: Pick<LpFeeConnection, "getMultipleAccountsInfo">,
   market: PublicKey,
+  bond = false,
 ): Promise<BoundExtTail | { error: string }> {
   try {
     const [si] = (await conn.getMultipleAccountsInfo([deriveVaultLpState(WRAPPER_PROGRAM_ID, market)], "confirmed")) as Array<{ data: Buffer } | null>;
     const st = si ? decodeVaultLpState(new Uint8Array(si.data)) : null;
     if (!st) return { error: "ext tail: vault_lp_state unreadable (cannot resolve the vault LP portfolio for tag 78 [8])" };
-    return { vaultLpExt: deriveVaultLpExtP2b(WRAPPER_PROGRAM_ID, market)[0], lpPortfolio: st.lpPortfolio };
+    return {
+      vaultLpExt: deriveVaultLpExtP2b(WRAPPER_PROGRAM_ID, market)[0],
+      lpPortfolio: st.lpPortfolio,
+      ...(bond ? { bondTranche: deriveBondTrancheV22(WRAPPER_PROGRAM_ID, market)[0] } : {}),
+    };
   } catch (err) {
     return { error: `ext tail read failed: ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}` };
   }
@@ -282,13 +294,14 @@ export function buildCrankFeesIx(p: {
   if (!p.bound || !p.tail) return base;
   // The SDK helper takes the 6-account base and appends [6] state, [7] ext, [8] vault LP.
   const six = new TransactionInstruction({ programId: base.programId, keys: base.keys.slice(0, 6), data: base.data });
-  return withCrankFeesBoundTailP2b(six, {
+  const withExt = withCrankFeesBoundTailP2b(six, {
     programId: WRAPPER_PROGRAM_ID,
     market: p.market,
     registryDomain: p.domainIdx,
     lpPortfolio: p.tail.lpPortfolio,
     vaultLpExt: p.tail.vaultLpExt,
   });
+  return p.tail.bondTranche ? withBondTailV22(withExt, p.tail.bondTranche) : withExt;
 }
 
 async function sendCrankFeesOnce(

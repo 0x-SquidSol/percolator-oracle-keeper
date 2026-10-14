@@ -13,6 +13,7 @@ import {
   V17_ASSET_ORACLE_WRAPPER_LEN,
   V17_ASSET_CONTROL_SEQUENCES_OFF,
   encodePushAuthMark,
+  buildPushAuthMarkDexIxV22,
 } from "@percolatorct/sdk";
 import {
   DepthSourceCache,
@@ -103,6 +104,17 @@ describe("wire", () => {
     const off = buildPushAuthMarkIx(auth, market, 2, 5n, 99n, 1_000_000n, 7n);
     assert.equal(off.keys.length, 2);
     assert.deepEqual(new Uint8Array(off.data), encodePushAuthMark(args));
+  });
+});
+
+describe("parity with the SDK builder", () => {
+  it("mode-2 ix == SDK buildPushAuthMarkDexIxV22 (keys, flags, data)", () => {
+    const auth = k(), market = k();
+    const pin: DexDepthPin = { depthSource: deriveDepthSource(WRAPPER_PROGRAM_ID, market), pool: k(), baseVault: k(), quoteVault: k(), ammProgram: PUMP, assetIndex: 2, marketId: 5n };
+    const mine = buildPushAuthMarkIx(auth, market, 2, 5n, 99n, 1_000_000n, 7n, null, pin);
+    const sdk = buildPushAuthMarkDexIxV22({ programId: WRAPPER_PROGRAM_ID, oracleAuthority: auth, market, push: { assetIndex: 2, marketId: 5n, nowSlot: 99n, markE6: 1_000_000n, observationSequence: 7n }, pool: pin.pool, baseVault: pin.baseVault, quoteVault: pin.quoteVault });
+    assert.deepEqual(mine.keys.map((x) => [x.pubkey.toBase58(), x.isSigner, x.isWritable]), sdk.keys.map((x) => [x.pubkey.toBase58(), x.isSigner, x.isWritable]));
+    assert.deepEqual(new Uint8Array(mine.data), new Uint8Array(sdk.data));
   });
 });
 
