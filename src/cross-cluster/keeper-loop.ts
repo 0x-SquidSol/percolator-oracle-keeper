@@ -38,6 +38,7 @@ import { getCachedBlockhash, invalidateBlockhash } from "./blockhash-cache.ts";
 import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import { healthFileConfigFromEnv, startHealthFileMirror } from "./health-file.ts";
 import type { SweepHealth } from "./positioned-sweep.ts";
+import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth.ts";
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -115,6 +116,10 @@ interface MarketStat {
   sourceUnchangedSince: number | null;
   /** The last raw pool price read (E6), for sourceUnchangedSince. */
   lastRawPriceE6: bigint;
+  /** G8: the depth_e6 carried by the last landed push (null = that push was the 35 B form, or none yet). */
+  lastDepthE6: bigint | null;
+  /** G8: where that depth came from (null when lastDepthE6 is null). */
+  lastDepthSource: string | null;
 }
 
 /** A fresh /health stat record for one registry entry. */
@@ -136,6 +141,8 @@ export function newMarketStat(m: { label: string; marketAddress: string; poolAdd
     markGap: null,
     sourceUnchangedSince: null,
     lastRawPriceE6: 0n,
+    lastDepthE6: null,
+    lastDepthSource: null,
   };
 }
 
@@ -452,6 +459,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         totalErrors: stat.totalErrors,
         authorityMismatch: stat.authorityMismatch,
         lastError: stat.lastErrorMsg,
+        depthE6: stat.lastDepthE6 === null ? null : stat.lastDepthE6.toString(),
+        depthSource: stat.lastDepthSource,
         ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
     }
@@ -513,6 +522,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
           : null,
       dryRun: config.dryRun,
+      pushDepth: pushDepthEnabled(),
       intervalMs: config.intervalMs,
       markets,
       // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
@@ -849,6 +859,8 @@ async function runCycle(
   let prices: Map<string, bigint>;
   const priceSkipReasons = new Map<string, string>();
   const pricesE12 = new Map<string, bigint>();
+  const quoteReservesUsdE6 = new Map<string, bigint>();
+  const pushDepthOn = pushDepthEnabled();
   try {
     prices = await readAllPoolPricesE6(
       mainnetConn,
@@ -859,6 +871,7 @@ async function runCycle(
       process.env.SOL_USD_REFERENCE_POOL,
       priceSkipReasons,
       pricesE12,
+      pushDepthOn ? quoteReservesUsdE6 : undefined,
     );
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
@@ -873,7 +886,7 @@ async function runCycle(
   state.lastBatchReadError = null;
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
-  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint }> = [];
+  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null }> = [];
   const smoothNowMs = Date.now();
   // Smooth once per POOL per cycle, not once per market: N markets sharing a
   // pool would insert N identical samples per cycle, silently shrinking the
@@ -990,6 +1003,8 @@ async function runCycle(
       assetIndex: entry.assetIndex,
       priceE6: publish.priceE6,
       ...(smoothedE12 ? { priceE12: smoothedE12 } : {}),
+      // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
+      depth: resolvePushDepth(pushDepthOn, quoteReservesUsdE6.get(entry.poolAddress)),
     });
   }
   if (pushes.length === 0) return;
@@ -1065,6 +1080,8 @@ async function runCycle(
       stat.authorityMismatch = false;
       if (config.dryRun) {
         stat.lastSig = "DRY_RUN";
+        stat.lastDepthE6 = p.depth?.depthE6 ?? null;
+        stat.lastDepthSource = p.depth?.source ?? null;
         stat.noPushCycles = 0;
         state.landedThisCycle.add(p.marketAddress);
       } else if (pushedSet.has(p.marketAddress) && res.signature) {
@@ -1082,6 +1099,8 @@ async function runCycle(
           );
         }
         recordLandedPush(stat, stamp, res.signature);
+        stat.lastDepthE6 = p.depth?.depthE6 ?? null;
+        stat.lastDepthSource = p.depth?.source ?? null;
         state.landedThisCycle.add(p.marketAddress);
       } else {
         stat.totalErrors++;

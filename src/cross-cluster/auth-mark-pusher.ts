@@ -37,7 +37,6 @@ import {
   ComputeBudgetProgram,
 } from "@solana/web3.js";
 import {
-  encodePushAuthMark,
   ACCOUNTS_PUSH_AUTH_MARK,
   buildAccountMetas,
   parseAssetOracleProfileV17,
@@ -47,6 +46,7 @@ import {
 } from "@percolatorct/sdk";
 import { assetSlotOffset, selectMarketGroupOffset, VERSION_19 } from "../wrapper-market-group-offset.ts";
 import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
+import { encodePushAuthMarkMaybeDepth, type PushDepth } from "./push-depth.ts";
 import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 
 /**
@@ -337,7 +337,7 @@ export function perLotMarkE6(tokenPriceE6: bigint, lotExp: number): bigint | nul
  * but the TransactionInstruction class is from the keeper's web3.js so it
  * is identity-compatible with keeper-owned Transaction objects.
  */
-function buildPushAuthMarkIx(
+export function buildPushAuthMarkIx(
   oracleAuthority: PublicKey,
   market: PublicKey,
   assetIndex: number,
@@ -345,18 +345,23 @@ function buildPushAuthMarkIx(
   nowSlot: bigint,
   priceE6: bigint,
   observationSequence: bigint,
+  /** G8: keeper-attested +2% depth. Omitted/null = the legacy 35 B bytes, exactly as before. */
+  depth?: PushDepth | null,
 ): TransactionInstruction {
   const accountMetas = buildAccountMetas(ACCOUNTS_PUSH_AUTH_MARK, {
     oracleAuthority,
     market,
   });
-  const data = encodePushAuthMark({
-    assetIndex,
-    marketId,
-    nowSlot,
-    markE6: priceE6,
-    observationSequence,
-  });
+  const data = encodePushAuthMarkMaybeDepth(
+    {
+      assetIndex,
+      marketId,
+      nowSlot,
+      markE6: priceE6,
+      observationSequence,
+    },
+    depth,
+  );
   return new TransactionInstruction({
     programId: WRAPPER_PROGRAM_ID,
     keys: accountMetas,
@@ -559,6 +564,8 @@ type AuthMarkPushInput = {
   priceE6: bigint;
   /** Optional: the same per-token price at e12, used only for the per-lot mark of a lot market (perLotMarkFromE12). */
   priceE12?: bigint;
+  /** G8: keeper-attested depth for the 44 B form. Absent = the 35 B form (also zeroes the stored depth on chain). */
+  depth?: PushDepth | null;
 };
 
 /**
@@ -603,6 +610,7 @@ function buildPushTx(
         nowSlot,
         p.markE6,
         p.observationSequence,
+        p.depth,
       ),
     );
   }
