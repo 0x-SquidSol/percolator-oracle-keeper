@@ -522,7 +522,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
           : null,
       dryRun: config.dryRun,
-      pushDepth: pushDepthEnabled(),
+      // G8: present only when KEEPER_PUSH_DEPTH is on, so the flag-off payload keeps today's exact key set.
+      ...(pushDepthEnabled() ? { pushDepth: true } : {}),
       intervalMs: config.intervalMs,
       markets,
       // v2.1 (P2b), additive: `earnVaults` + `p2b`. `{}` (nothing added) unless the wrapper supports P2b.
