@@ -52,6 +52,7 @@ import {
 } from "@solana/web3.js";
 import type { Connection, Keypair } from "@solana/web3.js";
 import {
+  deriveInsuranceUnitsV22,
   deriveMarketVaultAccounts,
   deriveStakePool,
   deriveStakeVaultAuth,
@@ -78,6 +79,15 @@ import { NFT_PROGRAM_ID } from "../program-ids.ts";
 export const STAKE_TAG_RECOVER_TERMINAL_INSURANCE = 29;
 export const STAKE_ERR_MARKET_NOT_TERMINAL = 30;
 export const STAKE_ERR_NOTHING_TO_RECOVER = 31;
+/** Stake `InvalidAccount`: what the pre-S1 program answers to an unexpected extra account (the v5 shape). */
+export const STAKE_ERR_INVALID_ACCOUNT = 16;
+/** Stake S1: the terminal settlement owes the creator and no creator token account was passed. */
+export const STAKE_ERR_CREATOR_ACCOUNT_REQUIRED = 46;
+const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+/** pool.admin's classic-token collateral ATA (SDK `creatorCollateralAtaV5`). */
+export function creatorCollateralAta(admin: PublicKey, collateralMint: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync([admin.toBuffer(), TOKEN_PROGRAM.toBuffer(), collateralMint.toBuffer()], ATA_PROGRAM)[0];
+}
 /** Wrapper EngineLockActive, surfaced through the tag-41 CPI: cooldown or capacity. */
 export const WRAPPER_ERR_LOCK_ACTIVE = 21;
 
@@ -116,6 +126,12 @@ export function buildRecoverTerminalInsuranceIx(p: {
   collateralMint: PublicKey;
   amount: bigint;
   stray?: PublicKey;
+  /**
+   * S1 shape (upgraded stake only; the deployed program refuses it with 16). Mirrors the SDK
+   * `recoverTerminalInsuranceAccounts`: FIRST_LOSS (`insuranceUnits` set) -> `[9] units, [10] creator, [11] stray?`;
+   * FEE_ONLY -> `[stray?, creator]`. Absent = today's `[0..8] + stray?`.
+   */
+  v5?: { insuranceUnits?: PublicKey; creatorToken: PublicKey };
 }): TransactionInstruction {
   const [vaultAuth] = deriveStakeVaultAuth(p.pool, p.stakeProgramId);
   const w = deriveMarketVaultAccounts(p.wrapperProgramId, p.market, p.collateralMint);
@@ -130,7 +146,14 @@ export function buildRecoverTerminalInsuranceIx(p: {
     { pubkey: TOKEN_PROGRAM, isSigner: false, isWritable: false },
     { pubkey: p.wrapperProgramId, isSigner: false, isWritable: false },
   ];
-  if (p.stray) keys.push({ pubkey: p.stray, isSigner: false, isWritable: true });
+  const wr = (pubkey: PublicKey) => ({ pubkey, isSigner: false, isWritable: true });
+  if (p.v5?.insuranceUnits) {
+    keys.push(wr(p.v5.insuranceUnits), wr(p.v5.creatorToken));
+    if (p.stray) keys.push(wr(p.stray));
+  } else {
+    if (p.stray) keys.push(wr(p.stray));
+    if (p.v5) keys.push(wr(p.v5.creatorToken));
+  }
   return new TransactionInstruction({ programId: p.stakeProgramId, keys, data: encodeRecoverTerminalInsurance(p.amount) });
 }
 
@@ -224,6 +247,23 @@ export class TerminalInsuranceState {
   readonly done = new Set<string>();
   readonly unbookedStreak = new Map<string, number>();
   readonly cleanup = new CleanupState();
+  /** Does the deployed stake accept the S1 account shape? Cached for probeTtlMs; "legacy" is re-probed so an upgrade is picked up. */
+  shape: { value: "v5" | "legacy"; at: number } | null = null;
+  /** Markets already logged for stake error 46 (log once, not per cycle). */
+  readonly creatorWarned = new Set<string>();
+}
+
+/**
+ * True for the exact signature of the PRE-S1 stake program refusing the extra creator/units account:
+ * InstructionError at the stake ix (index 1) = Custom(16) InvalidAccount or NotEnoughAccountKeys.
+ */
+export function isLegacyShapeRefusal(err: unknown): boolean {
+  if (!err || typeof err !== "object" || !("InstructionError" in err)) return false;
+  const ie = (err as { InstructionError: unknown }).InstructionError;
+  if (!Array.isArray(ie) || ie[0] !== 1) return false;
+  const e = ie[1];
+  if (e === "NotEnoughAccountKeys") return true;
+  return !!e && typeof e === "object" && "Custom" in e && (e as { Custom: unknown }).Custom === STAKE_ERR_INVALID_ACCOUNT;
 }
 
 function mkTx(keeper: Keypair, blockhash: string, ix: TransactionInstruction): Transaction {
@@ -265,7 +305,7 @@ export async function tag29Support(
 
 export interface WindDownStep {
   amount: bigint;
-  outcome: "sent" | "nothing" | "cooldown" | "not-terminal" | "failed" | "dry-run";
+  outcome: "sent" | "nothing" | "cooldown" | "not-terminal" | "creator-required" | "failed" | "dry-run";
   detail: string;
 }
 
@@ -437,10 +477,26 @@ export async function windDownOnce(
       (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${r.reason}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
     : "";
 
-  const build = (amount: bigint, stray?: PublicKey) =>
+  // S1 account shape. Only a v5 pool has a creator account; it needs the creator's collateral ATA to EXIST (an
+  // uninitialised one would read as 16 and look like an old program). Whether the DEPLOYED stake accepts the shape is
+  // decided below by simulating it (see resolveShape).
+  let v5Plan: { insuranceUnits?: PublicKey; creatorToken: PublicKey } | null = null;
+  if (poolState.version === 5 && poolState.riskMode !== undefined) {
+    const ata = creatorCollateralAta(poolState.admin, poolState.collateralMint);
+    try {
+      const ai = await conn.getAccountInfo(ata, "confirmed");
+      if (ai && ai.owner.equals(TOKEN_PROGRAM) && ai.data.length >= 165 && ai.data[108] === 1) {
+        v5Plan = { creatorToken: ata, ...(poolState.riskMode === 1 ? { insuranceUnits: deriveInsuranceUnitsV22(cfg.wrapperProgramId, market)[0] } : {}) };
+      }
+    } catch {
+      v5Plan = null;
+    }
+  }
+  let useV5 = false;
+  const build = (amount: bigint, stray?: PublicKey, v5?: typeof v5Plan) =>
     buildRecoverTerminalInsuranceIx({
       stakeProgramId: cfg.stakeProgramId, wrapperProgramId: cfg.wrapperProgramId, caller: keeper.publicKey,
-      market, pool, poolVault: poolState!.vault, collateralMint, amount, stray,
+      market, pool, poolVault: poolState!.vault, collateralMint, amount, stray, ...(v5 ? { v5 } : {}),
     });
 
   const support = await tag29Support(conn, keeper, build(0n), st, cfg);
@@ -449,11 +505,42 @@ export async function windDownOnce(
     return res(unbookedAlert(why) ?? { kind: "skipped", reason: why }, { state, budget, stakeBound, support });
   }
 
+  // Shape gate: simulate the S1 shape (amount 0). Only the pre-S1 program's exact refusal (16 / NotEnoughAccountKeys at
+  // the stake ix) keeps the legacy shape; any other answer (31, 30, 21, ok, 46) means the program parsed the extra
+  // accounts, i.e. it is upgraded. RPC failure = legacy this cycle, not cached. Re-probed after probeTtlMs.
+  if (v5Plan) {
+    const nowMs = (cfg.now ?? Date.now)();
+    if (st.shape && nowMs - st.shape.at < cfg.probeTtlMs) {
+      useV5 = st.shape.value === "v5";
+    } else {
+      try {
+        const { blockhash } = await conn.getLatestBlockhash("confirmed");
+        const r = await simulate(conn, mkTx(keeper, blockhash, build(0n, undefined, v5Plan)));
+        const value = r.err && isLegacyShapeRefusal(r.err) ? "legacy" : "v5";
+        st.shape = { value, at: nowMs };
+        useV5 = value === "v5";
+      } catch {
+        useV5 = false;
+      }
+    }
+  }
+
+  // Stake error 46 CreatorAccountRequired: retryable once the creator's collateral ATA exists / the S1 shape is used. Logged
+  // once per market (not per cycle) and never an alert by itself; the unbooked-budget streak still escalates if it persists.
+  const creatorRequired = (amount: bigint): WindDownStep => {
+    if (!st.creatorWarned.has(marketAddress)) {
+      st.creatorWarned.add(marketAddress);
+      console.warn(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: stake Custom(46) CreatorAccountRequired — the terminal settlement owes the creator; ${v5Plan ? "retrying with the creator ATA" : `create ${poolState!.version === 5 ? creatorCollateralAta(poolState!.admin, poolState!.collateralMint).toBase58() : "pool.admin's collateral ATA"} (pool.admin's collateral ATA) to unblock`}`);
+    }
+    st.shape = null; // re-decide the account shape next cycle
+    return { amount, outcome: "creator-required", detail: "Custom(46) CreatorAccountRequired: creator collateral ATA missing or shape not accepted — retry next cycle" };
+  };
+
   // One tag-29 call: simulate, classify, send.
   const call = async (amount: bigint, stray?: PublicKey): Promise<WindDownStep> => {
     try {
       const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
-      const tx = mkTx(keeper, blockhash, build(amount, stray));
+      const tx = mkTx(keeper, blockhash, build(amount, stray, useV5 ? v5Plan : null));
       const sim = await simulate(conn, tx);
       if (sim.err) {
         const ie = parseInstructionError(sim.err);
@@ -461,6 +548,7 @@ export async function windDownOnce(
         if (code === STAKE_ERR_NOTHING_TO_RECOVER) return { amount, outcome: "nothing", detail: "Custom(31) NothingToRecover" };
         if (code === WRAPPER_ERR_LOCK_ACTIVE) return { amount, outcome: "cooldown", detail: "Custom(21): insurance-withdraw cooldown or capacity — retry later" };
         if (code === STAKE_ERR_MARKET_NOT_TERMINAL) return { amount, outcome: "not-terminal", detail: "Custom(30) MarketNotTerminal" };
+        if (code === STAKE_ERR_CREATOR_ACCOUNT_REQUIRED) return creatorRequired(amount);
         return { amount, outcome: "failed", detail: `sim ${JSON.stringify(sim.err)} ${(sim.logs ?? []).filter((l) => /Error|failed/i.test(l)).slice(-1).join("")}`.slice(0, 200) };
       }
       if (dryRun) return { amount, outcome: "dry-run", detail: "simulated clean; not sent" };
@@ -468,6 +556,7 @@ export async function windDownOnce(
       const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, cfg.confirm);
       if (c.status === "landed") return { amount, outcome: "sent", detail: `sig=${sig.slice(0, 16)}… [${c.via}]` };
       if (c.status === "failed" && c.code === STAKE_ERR_NOTHING_TO_RECOVER) return { amount, outcome: "nothing", detail: "Custom(31) on chain" };
+      if (c.status === "failed" && c.code === STAKE_ERR_CREATOR_ACCOUNT_REQUIRED) return creatorRequired(amount);
       return { amount, outcome: "failed", detail: c.status === "failed" ? `landed but failed ${JSON.stringify(c.err)}` : `not landed: ${c.reason}` };
     } catch (err) {
       return { amount, outcome: "failed", detail: (err instanceof Error ? err.message : String(err)).slice(0, 160) };

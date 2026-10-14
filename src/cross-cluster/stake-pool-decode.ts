@@ -31,6 +31,10 @@ export interface StakePoolView {
   /** 0 = insurance pool (the only mode the fee / wind-down jobs act on). */
   poolMode: number;
   totalLpSupply: bigint;
+  /** Pool admin (the creator whose seed is returned at terminal, stake S1). */
+  admin: PublicKey;
+  /** v5 only: 1 = FIRST_LOSS, 2 = FEE_ONLY. undefined on legacy pools. */
+  riskMode?: number;
 }
 
 /** True when the bytes are a v5 (v2.2) StakePool by length + version byte. */
@@ -51,6 +55,8 @@ export function decodeStakePoolAnyVersion(data: Uint8Array): StakePoolView {
       percolatorProgram: p.percolatorProgram,
       poolMode: p.poolMode,
       totalLpSupply: p.totalLpSupply,
+      admin: p.admin,
+      riskMode: p.riskMode,
     };
   }
   const p = decodeStakePool(data);
@@ -63,5 +69,6 @@ export function decodeStakePoolAnyVersion(data: Uint8Array): StakePoolView {
     percolatorProgram: p.percolatorProgram,
     poolMode: p.poolMode,
     totalLpSupply: p.totalLpSupply,
+    admin: p.admin,
   };
 }
