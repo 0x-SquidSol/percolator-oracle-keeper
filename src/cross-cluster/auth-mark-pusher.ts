@@ -46,7 +46,8 @@ import {
 } from "@percolatorct/sdk";
 import { assetSlotOffset, selectMarketGroupOffset, VERSION_19 } from "../wrapper-market-group-offset.ts";
 import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
-import { encodePushAuthMarkMaybeDepth, type PushDepth } from "./push-depth.ts";
+import { encodePushAuthMarkDexMode, encodePushAuthMarkMaybeDepth, type PushDepth } from "./push-depth.ts";
+import { WRAPPER_ERR_DEPTH_SOURCE_INVALID, type DexDepthPin } from "./depth-source.ts";
 import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 
 /**
@@ -347,21 +348,20 @@ export function buildPushAuthMarkIx(
   observationSequence: bigint,
   /** G8: keeper-attested +2% depth. Omitted/null = the legacy 35 B bytes, exactly as before. */
   depth?: PushDepth | null,
+  /** Round 2: on-chain DEX depth (mode 2: 44 B, depth 0, four read-only accounts). Takes precedence over `depth`. */
+  dex?: DexDepthPin | null,
 ): TransactionInstruction {
   const accountMetas = buildAccountMetas(ACCOUNTS_PUSH_AUTH_MARK, {
     oracleAuthority,
     market,
   });
-  const data = encodePushAuthMarkMaybeDepth(
-    {
-      assetIndex,
-      marketId,
-      nowSlot,
-      markE6: priceE6,
-      observationSequence,
-    },
-    depth,
-  );
+  const pushArgs = { assetIndex, marketId, nowSlot, markE6: priceE6, observationSequence };
+  if (dex) {
+    for (const pubkey of [dex.depthSource, dex.pool, dex.baseVault, dex.quoteVault]) {
+      accountMetas.push({ pubkey, isSigner: false, isWritable: false });
+    }
+  }
+  const data = dex ? encodePushAuthMarkDexMode(pushArgs) : encodePushAuthMarkMaybeDepth(pushArgs, depth);
   return new TransactionInstruction({
     programId: WRAPPER_PROGRAM_ID,
     keys: accountMetas,
@@ -566,6 +566,8 @@ type AuthMarkPushInput = {
   priceE12?: bigint;
   /** G8: keeper-attested depth for the 44 B form. Absent = the 35 B form (also zeroes the stored depth on chain). */
   depth?: PushDepth | null;
+  /** Round 2: the market's active, same-cluster depth-source pin (mode 2). Used only if it matches the live asset generation. */
+  dex?: DexDepthPin | null;
 };
 
 /**
@@ -611,6 +613,7 @@ function buildPushTx(
         p.markE6,
         p.observationSequence,
         p.depth,
+        p.dex,
       ),
     );
   }
@@ -847,6 +850,8 @@ function recordSentObservationSequence(p: AuthMarkPushItem): void {
 
 /** PercolatorError::EngineStale — the wrapper's error for a non-increasing observation_sequence. */
 const ENGINE_STALE_CUSTOM = 19;
+/** Markets already logged for a mode-2 refusal (129); cleared when their mode-2 push lands again. */
+const dexRefusalLogged = new Set<string>();
 
 // ── Late-duplicate Custom(19) (landed reverts, 2026-10-04) ────────────────────
 //
@@ -1010,6 +1015,10 @@ export async function pushAuthMarkBatch(
   skippedMarkets: string[];
   /** B20: Resolved / tombstoned markets, not pushed and not counted as drops. */
   terminalMarkets?: string[];
+  /** Round 2: markets whose landed push was mode 2 (on-chain DEX depth). */
+  dexPushedMarkets?: string[];
+  /** Round 2: markets whose mode-2 push was refused with 129 and went out on the attested path instead (re-read their pin). */
+  dexRefusedMarkets?: string[];
 }> {
   if (pushes.length === 0) {
     return { pushed: false, count: 0, pushedMarkets: [], skippedMarkets: [] };
@@ -1072,7 +1081,9 @@ export async function pushAuthMarkBatch(
       missingGeneration.push(p.marketAddress);
       continue;
     }
-    pushable.push({ ...p, marketId: fields.marketId, observationSequence: fields.observationSequence, lotExp: fields.lotExp, markE6 });
+    // Mode 2 only for the pin made for THIS asset slot and generation; anything else stays on the attested path.
+    const dex = p.dex && p.dex.assetIndex === p.assetIndex && p.dex.marketId === fields.marketId ? p.dex : undefined;
+    pushable.push({ ...p, dex, marketId: fields.marketId, observationSequence: fields.observationSequence, lotExp: fields.lotExp, markE6 });
   }
   if (missingGeneration.length > 0) {
     console.warn(
@@ -1092,8 +1103,11 @@ export async function pushAuthMarkBatch(
 
   // K-7: a market isolated for landed reverts goes in its own tx; the rest batch as before.
   const solo = new Set(getSoloMarkets());
+  // Mode-2 (on-chain depth) pushes are chunked apart from every other push, so a mode-2 failure can never share a
+  // transaction with (and so can never fail) a market on the attested path.
   const chunks = [
-    ...chunkPushes(keeper, pushable.filter((p) => !solo.has(p.marketAddress)), nowSlot, blockhash),
+    ...chunkPushes(keeper, pushable.filter((p) => !solo.has(p.marketAddress) && !p.dex), nowSlot, blockhash),
+    ...chunkPushes(keeper, pushable.filter((p) => !solo.has(p.marketAddress) && p.dex), nowSlot, blockhash),
     ...pushable.filter((p) => solo.has(p.marketAddress)).map((p) => [p]),
   ].filter((c) => c.length > 0);
 
@@ -1113,6 +1127,8 @@ export async function pushAuthMarkBatch(
 
   let firstSig: string | undefined;
   const pushedMarkets: string[] = [];
+  const dexPushedMarkets: string[] = [];
+  const dexRefusedMarkets: string[] = [];
   const errors: string[] = [];
 
   /**
@@ -1181,6 +1197,10 @@ export async function pushAuthMarkBatch(
       if (inFlightPushes.length > MAX_IN_FLIGHT_PUSHES) inFlightPushes.splice(0, inFlightPushes.length - MAX_IN_FLIGHT_PUSHES);
       for (const p of chunk) {
         pushedMarkets.push(p.marketAddress);
+        if (p.dex) {
+          dexPushedMarkets.push(p.marketAddress);
+          dexRefusalLogged.delete(p.marketAddress);
+        }
         // A clean push clears any accumulated strikes…
         quarantineStrikes.delete(p.marketAddress);
         // …and reserves its nonce, so the NEXT cycle proposes above it even if
@@ -1228,7 +1248,8 @@ export async function pushAuthMarkBatch(
     let pending = chunk;
     let refreshed = false;
     // Each non-refresh iteration removes one market, so this is bounded.
-    for (let guard = 0; pending.length > 0 && guard <= chunk.length + 1; guard++) {
+    // (+ one downgrade per mode-2 market, which does not shrink `pending`.)
+    for (let guard = 0; pending.length > 0 && guard <= 2 * chunk.length + 2; guard++) {
       const simErr = await preflight(pending);
       if (!simErr) {
         await send(pending);
@@ -1264,6 +1285,21 @@ export async function pushAuthMarkBatch(
           continue;
         }
       }
+      // Round 2: 129 on a mode-2 push = the pin no longer matches the chain. That is not a bad market: fall back to the
+      // attested path (mode 1 if the cycle has a depth, else 35 B) for THIS cycle, log once, no strike, and let the
+      // caller re-read the pin next cycle.
+      if (failing.custom === WRAPPER_ERR_DEPTH_SOURCE_INVALID && culprit.dex) {
+        dexRefusedMarkets.push(culprit.marketAddress);
+        if (!dexRefusalLogged.has(culprit.marketAddress)) {
+          dexRefusalLogged.add(culprit.marketAddress);
+          console.warn(
+            `[push] ${culprit.marketAddress.slice(0, 8)}… mode-2 depth refused (Custom(129) DepthSourceInvalid) — ` +
+              `falling back to the attested path this cycle; the depth source is re-read next cycle`,
+          );
+        }
+        pending = pending.map((p, i) => (i === failing.position ? { ...p, dex: undefined } : p));
+        continue;
+      }
       strike(culprit, simErr);
       pending = pending.filter((_, i) => i !== failing.position);
       if (pending.length > 0) {
@@ -1293,5 +1329,7 @@ export async function pushAuthMarkBatch(
     // caller must not stamp these as freshly pushed (that was the /health lie).
     skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !pushedSet.has(m) && !terminal.has(m)),
     terminalMarkets,
+    dexPushedMarkets,
+    dexRefusedMarkets,
   };
 }

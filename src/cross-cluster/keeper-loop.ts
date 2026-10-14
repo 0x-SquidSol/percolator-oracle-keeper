@@ -39,6 +39,11 @@ import type { CrankRefreshHealth } from "./refresh-coordination.ts";
 import { healthFileConfigFromEnv, startHealthFileMirror } from "./health-file.ts";
 import type { SweepHealth } from "./positioned-sweep.ts";
 import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth.ts";
+import { DEPTH_SOURCE_ONCHAIN_DEX, DepthSourceCache, pushDepthOnchainEnabled, type DexDepthPin } from "./depth-source.ts";
+import { WRAPPER_PROGRAM_ID as DEPTH_WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+
+/** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
+const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -862,6 +867,14 @@ async function runCycle(
   const pricesE12 = new Map<string, bigint>();
   const quoteReservesUsdE6 = new Map<string, bigint>();
   const pushDepthOn = pushDepthEnabled();
+  const pushDepthOnchain = pushDepthOnchainEnabled();
+  if (pushDepthOnchain) {
+    try {
+      await depthSourceCache.refresh(devnetConn, DEPTH_WRAPPER_PROGRAM_ID, registry.markets.map((m) => m.marketAddress));
+    } catch (err) {
+      console.warn(`[loop] depth-source refresh failed (attested path this cycle): ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`);
+    }
+  }
   try {
     prices = await readAllPoolPricesE6(
       mainnetConn,
@@ -887,7 +900,7 @@ async function runCycle(
   state.lastBatchReadError = null;
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
-  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null }> = [];
+  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null; dex?: DexDepthPin | null }> = [];
   const smoothNowMs = Date.now();
   // Smooth once per POOL per cycle, not once per market: N markets sharing a
   // pool would insert N identical samples per cycle, silently shrinking the
@@ -1006,6 +1019,8 @@ async function runCycle(
       ...(smoothedE12 ? { priceE12: smoothedE12 } : {}),
       // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
       depth: resolvePushDepth(pushDepthOn, quoteReservesUsdE6.get(entry.poolAddress)),
+      // Round 2: the active, same-cluster pin (mode 2); the pusher re-checks it against the live generation.
+      ...(pushDepthOnchain ? { dex: depthSourceCache.get(entry.marketAddress) } : {}),
     });
   }
   if (pushes.length === 0) return;
@@ -1075,6 +1090,8 @@ async function runCycle(
     const pushedSet = new Set(res.pushedMarkets);
     const terminalSet = new Set(res.terminalMarkets ?? []);
     state.terminalMarkets = terminalSet;
+    const dexPushed = new Set(res.dexPushedMarkets ?? []);
+    for (const m of res.dexRefusedMarkets ?? []) depthSourceCache.invalidate(m);
     for (const p of pushes) {
       if (terminalSet.has(p.marketAddress)) continue; // B20: Resolved/closed — not an error
       const stat = state.stats.get(p.marketAddress)!;
@@ -1100,8 +1117,8 @@ async function runCycle(
           );
         }
         recordLandedPush(stat, stamp, res.signature);
-        stat.lastDepthE6 = p.depth?.depthE6 ?? null;
-        stat.lastDepthSource = p.depth?.source ?? null;
+        stat.lastDepthE6 = dexPushed.has(p.marketAddress) ? null : (p.depth?.depthE6 ?? null);
+        stat.lastDepthSource = dexPushed.has(p.marketAddress) ? DEPTH_SOURCE_ONCHAIN_DEX : (p.depth?.source ?? null);
         state.landedThisCycle.add(p.marketAddress);
       } else {
         stat.totalErrors++;

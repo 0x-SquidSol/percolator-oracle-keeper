@@ -101,3 +101,16 @@ export function encodePushAuthMarkMaybeDepth(args: PushAuthMarkArgs, depth?: Pus
   new DataView(out.buffer).setBigUint64(PUSH_AUTH_MARK_LEN + 1, depth.depthE6, true);
   return out;
 }
+
+/**
+ * PushAuthMark mode 2 (on-chain DEX depth): the SDK 35 B + `[mode u8 = 2][depth_e6 u64 = 0]`. depth_e6 is ZERO by
+ * definition (the program reads the reserves itself). This is the ONLY place a 44 B push with depth 0 is produced; the
+ * mode-1 encoder above refuses a zero depth, so an attested push can never go out with depth 0 by accident.
+ */
+export function encodePushAuthMarkDexMode(args: PushAuthMarkArgs): Uint8Array {
+  const base = encodePushAuthMark(args);
+  const out = new Uint8Array(PUSH_AUTH_MARK_WITH_DEPTH_LEN);
+  out.set(base, 0);
+  out[PUSH_AUTH_MARK_LEN] = 2;
+  return out; // bytes 36..44 stay zero
+}
