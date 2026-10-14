@@ -171,6 +171,28 @@ export function marketHasPositions(s: MarketRefreshState): boolean {
   return s.storedPosLong !== 0n || s.storedPosShort !== 0n;
 }
 
+/** One active leg as the margin screen needs it (F1, v22/liquidation.ts). */
+export interface RiskLeg {
+  assetIndex: number;
+  /** 0 = long, 1 = short */
+  side: number;
+  basis: bigint;
+  aBasis: bigint;
+}
+/** Settled equity (capital + pnl + fee_credits) and the active legs of a portfolio, as of the account bytes read. */
+export interface RiskSnap {
+  equity: bigint;
+  legs: RiskLeg[];
+}
+
+/** Snapshot of a decoded portfolio for the margin screen. Pure. */
+export function riskSnapOf(parsed: { capital: bigint; pnl: bigint; feeCredits: bigint; legs: ReadonlyArray<{ active: boolean; assetIndex: number; side: number; basisPosQ: bigint; aBasis: bigint }> }): RiskSnap {
+  return {
+    equity: parsed.capital + parsed.pnl + parsed.feeCredits,
+    legs: parsed.legs.filter((l) => l.active).map((l) => ({ assetIndex: l.assetIndex, side: l.side, basis: l.basisPosQ, aBasis: l.aBasis })),
+  };
+}
+
 export interface PositionedPortfolio {
   pubkey: PublicKey;
   longLegs: number;
@@ -187,6 +209,10 @@ export interface PositionedPortfolio {
   /** Lowest `kf_epoch_snap` of the active long / short legs on the asset (null: no leg on that side). */
   kfEpochSnapLong?: bigint | null;
   kfEpochSnapShort?: bigint | null;
+  /** F1: settled equity and legs for the liquidation screen (absent on hand-built entries: never a candidate). */
+  risk?: RiskSnap;
+  /** F1: extra plan weight of a liquidation candidate (its liquidation crank); absent / 0 = not a candidate. */
+  liqWeight?: number;
 }
 
 /**

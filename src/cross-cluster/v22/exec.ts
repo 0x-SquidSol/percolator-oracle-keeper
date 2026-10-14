@@ -51,6 +51,22 @@ export interface ExecOptions {
   priorityMicroLamportsPerCu?: number;
   /** Evaluated AFTER a clean simulation and BEFORE the send: return a reason to hold the tx (nothing is sent). */
   beforeSend?: () => string | null;
+  /**
+   * F1: accounts whose POST-simulation state the first simulation returns (base58, market first). Used with `extend`.
+   */
+  accounts?: ReadonlyArray<string>;
+  /**
+   * F1: called with the post-simulation accounts (index-aligned with `accounts`, null where missing) after a CLEAN first
+   * simulation. Returning a list REPLACES the instruction list: it is simulated again and what that simulation says is the
+   * outcome (a refusal index is relative to the returned list). Returning null keeps the original. Must not throw (a throw
+   * is treated as null). The original list is never sent once an extended list was returned.
+   */
+  extend?: (post: ReadonlyArray<Uint8Array | null>) => readonly TransactionInstruction[] | null;
+  /**
+   * F1: called with the post-simulation accounts of the EXTENDED (second) simulation, when it was clean. Returning a reason rejects the
+   * extension: the original list (already simulated clean) is sent instead. Must not throw (a throw rejects nothing).
+   */
+  verifyExtended?: (post: ReadonlyArray<Uint8Array | null>) => string | null;
 }
 
 export type ExecOutcome =
@@ -139,10 +155,50 @@ export async function simulateAndSend(
   async function run(): Promise<ExecOutcome> {
     try {
       const { blockhash, lastValidBlockHeight } = await ctx.conn.getLatestBlockhash("confirmed");
-      const tx = buildTx(ctx.keeper, ixs, o, blockhash);
       const dry = ctx.dryRun || o.dryRun === true;
-      if (!dry) tx.sign(ctx.keeper, ...(ctx.extraSigners ?? []));
-      const sim = await ctx.conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "processed" });
+      let list: readonly TransactionInstruction[] = ixs;
+      const make = (l: readonly TransactionInstruction[]): Transaction => {
+        const t = buildTx(ctx.keeper, l, o, blockhash);
+        if (!dry) t.sign(ctx.keeper, ...(ctx.extraSigners ?? []));
+        return t;
+      };
+      const simulate = (t: Transaction, withAccounts: boolean) =>
+        ctx.conn.simulateTransaction(new VersionedTransaction(t.compileMessage()), {
+          sigVerify: false,
+          commitment: "processed",
+          ...(withAccounts && o.accounts ? { accounts: { encoding: "base64" as const, addresses: [...o.accounts] } } : {}),
+        });
+      let tx = make(list);
+      let sim = await simulate(tx, o.extend !== undefined && o.accounts !== undefined);
+      const firstSim = sim;
+      if (!sim.value.err && o.extend && o.accounts) {
+        let ext: readonly TransactionInstruction[] | null = null;
+        try {
+          const raw = (sim.value.accounts as Array<{ data: [string, string] } | null> | null | undefined) ?? [];
+          ext = o.extend(o.accounts.map((_, i) => (raw[i] ? new Uint8Array(Buffer.from(raw[i]!.data[0], "base64")) : null)));
+        } catch {
+          ext = null;
+        }
+        if (ext && ext.length > 0) {
+          list = ext;
+          tx = make(list);
+          sim = await simulate(tx, o.verifyExtended !== undefined);
+          if (!sim.value.err && o.verifyExtended) {
+            let why: string | null = null;
+            try {
+              const raw2 = (sim.value.accounts as Array<{ data: [string, string] } | null> | null | undefined) ?? [];
+              why = o.verifyExtended(o.accounts.map((_, i) => (raw2[i] ? new Uint8Array(Buffer.from(raw2[i]!.data[0], "base64")) : null)));
+            } catch {
+              why = null;
+            }
+            if (why) {
+              list = ixs;
+              tx = make(list);
+              sim = firstSim;
+            }
+          }
+        }
+      }
       const logs = sim.value.logs ?? [];
       const units = sim.value.unitsConsumed ?? null;
       if (sim.value.err) {
@@ -153,8 +209,8 @@ export async function simulateAndSend(
         return { kind: "refused", code, index: index !== null && index >= 0 ? index : null, name: formatProgramError(o.program ?? "wrapper", code), expected, logs };
       }
       if (dry) {
-        log(`[v22][DRY-RUN] ${o.job} ${o.label}: would send ${ixs.length} instruction(s) [${ixs.map((i) => `tag ${i.data[0]}`).join(", ")}] units=${o.units} simulated=${units ?? "n/a"}`);
-        return { kind: "dry-run", unitsConsumed: units, logs, ixCount: ixs.length };
+        log(`[v22][DRY-RUN] ${o.job} ${o.label}: would send ${list.length} instruction(s) [${list.map((i) => `tag ${i.data[0]}`).join(", ")}] units=${o.units} simulated=${units ?? "n/a"}`);
+        return { kind: "dry-run", unitsConsumed: units, logs, ixCount: list.length };
       }
       const hold = o.beforeSend?.() ?? null;
       if (hold) return { kind: "held", reason: hold };

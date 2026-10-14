@@ -58,10 +58,13 @@ export CC_HEALTH_PORT="${CC_HEALTH_PORT:-18797}"
 # --- v2.2 layer (stake v5 sync, paired positioned sweep for the 4-leg cap, bond fee crank) ---
 export KEEPER_V22="${KEEPER_V22:-on}"
 export KEEPER_V22_SWEEP="${KEEPER_V22_SWEEP:-on}"
+export KEEPER_V22_LIQUIDATE="${KEEPER_V22_LIQUIDATE:-on}"   # F1: liquidation crank in the same sweep tx as the refresh (simulate first, falls back to the plain refresh)
 export KEEPER_V22_SETTLE_PAIRING="${KEEPER_V22_SETTLE_PAIRING:-prefer}"
 export KEEPER_V22_FEE_CRANK_BOND="${KEEPER_V22_FEE_CRANK_BOND:-on}"
 export KEEPER_V22_STAKE_SYNC="${KEEPER_V22_STAKE_SYNC:-on}"
 export KEEPER_V22_TICK_MS="${KEEPER_V22_TICK_MS:-20000}"
+# G8 depth push (44-byte PushAuthMark). ON 2026-10-14 after post-upgrade checks passed; set KEEPER_PUSH_DEPTH=off to revert.
+export KEEPER_PUSH_DEPTH="${KEEPER_PUSH_DEPTH:-on}"
 # off by default: rent, dust, G9, earn-exit (not part of a first bring-up)
 
 if [[ "$MODE" == "dry" ]]; then

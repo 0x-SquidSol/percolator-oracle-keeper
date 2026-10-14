@@ -26,12 +26,19 @@
  * accrued" and re-sent refresh-only.
  */
 import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
-import { buildObservationCrankIx, buildRefreshCrankIx } from "../positioned-refresh.ts";
+import { parsePortfolioV17 } from "@percolatorct/sdk";
+import { buildObservationCrankIx, buildRefreshCrankIx, riskSnapOf } from "../positioned-refresh.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
+import type { MarketLayout } from "../market-layout.ts";
+import {
+  DEFAULT_LIQ_EXACT_PAD_BPS, DEFAULT_LIQ_MAX_PER_TX, DEFAULT_LIQ_PAD_BPS, atOrBelowMaintenance, estimateBaseCu, fitLiquidations,
+  MIN_PROGRESS_BPS, markLiquidationCandidates, marginOf, readMarginParams, fitToPacket, liquidationMadeNoProgress, noteLiquidationLanded,
+} from "./liquidation.ts";
+import type { FlaggedAccount, MarginParams } from "./liquidation.ts";
 import { holdPushes as realHold, releasePushes as realRelease } from "../refresh-coordination.ts";
 import { BAND_EXPECTED_CODES } from "./errors.ts";
 import { simulateAndSend, simulateOnly } from "./exec.ts";
-import type { ExecContext, ExecOutcome } from "./exec.ts";
+import type { ExecContext, ExecOptions, ExecOutcome } from "./exec.ts";
 import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, legAwareTxUnits, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
 import type { PairingMode } from "./flags.ts";
@@ -131,6 +138,14 @@ export interface PairingStats {
   shrinkDeferrals: number;
   feeAfterRound: number;
   feeUnpairedLpSettles: number;
+  /** F1: liquidation cranks added to a sweep tx (included in a simulated tx), landed, dropped because the engine had nothing to do (22) or refused, and deferred (tx budget). */
+  liqIncluded: number;
+  liqLanded: number;
+  liqNothingToDo: number;
+  liqRefused: number;
+  liqDeferred: number;
+  /** F1: the extended tx failed as a whole (compute, an unrelated refusal, a landed failure): liquidation was skipped and the plain refresh went out. */
+  liqSkipped: number;
 }
 
 const zeroStats = (): PairingStats => ({
@@ -138,7 +153,7 @@ const zeroStats = (): PairingStats => ({
   lpHeldPhase1Unlanded: 0, lpHeldCounterpartyMiss: 0, gapExceeded: 0, gapBackoffRounds: 0, consecutiveGapExceeded: 0,
   lastGapSlots: null, maxGapSlots: 0, bandExpected: 0, prunedCurrent: 0, hardRefusals: 0, quarantinedNow: 0,
   anchorAccrues: 0, anchorFallbacks: 0, quarantineCapped: 0, deferralEscalations: 0, lpTimeBoundRounds: 0, counterpartyAccrues: 0, accrueAlreadyDone: 0, protectiveRounds: 0, rentSettlesInRound: 0, shrinkDeferrals: 0,
-  feeAfterRound: 0, feeUnpairedLpSettles: 0,
+  feeAfterRound: 0, feeUnpairedLpSettles: 0, liqIncluded: 0, liqLanded: 0, liqNothingToDo: 0, liqRefused: 0, liqDeferred: 0, liqSkipped: 0,
 });
 
 export const pairingStats: PairingStats = zeroStats();
@@ -187,6 +202,26 @@ export interface RoundInput {
   rent?: RentPlanInput;
   /** The LP itself needs a crank now: legacy full recovery shape, never alone, no gap / phase-1 hold. */
   protective?: boolean;
+  /** F1: liquidation cranks in the sweep tx (KEEPER_V22_LIQUIDATE). Absent = today's tx shape, byte for byte. */
+  liq?: LiqRoundInput;
+}
+
+/** F1 settings of one market's round. `params` null = the market's margin parameters were unreadable: no candidates. */
+export interface LiqRoundInput {
+  layout: MarketLayout;
+  slots: number;
+  params: MarginParams | null;
+  padBps?: number;
+  exactPadBps?: number;
+  maxPerTx?: number;
+}
+
+/** One liquidation-crank attempt, for the `[liq]` log line, /health and the tests. */
+export interface LiqRecord {
+  key: string;
+  result: "landed" | "simulated" | "nothing-to-do" | "refused" | "skipped" | "deferred";
+  code: number | null;
+  note: string;
 }
 
 /** current = Custom 22 (already settled); band = expected band state; hard = any other PROGRAM code; deferred = no program code (compute / runtime). */
@@ -211,6 +246,8 @@ export interface RoundResult {
   gapSlots: number | null;
   abandoned: string | null;
   outcomes: ExecOutcome[];
+  /** F1: every liquidation-crank attempt of the round. */
+  liq: LiqRecord[];
 }
 
 export interface BuildTxArgs {
@@ -219,15 +256,42 @@ export interface BuildTxArgs {
   refresh: ReadonlyArray<PositionedPortfolio>;
   oracleAccounts?: ReadonlyArray<PublicKey>;
   tail?: ReadonlyArray<TransactionInstruction>;
+  /**
+   * F1: base58 keys of portfolios that get a SECOND no-observation crank (the liquidation crank) immediately after their
+   * first crank (the refresh, or the observation crank when the portfolio is the tx's accrue target). The engine liquidates
+   * only on a second crank on the account in the SAME tx. A key that is neither refreshed nor the accrue target is ignored.
+   */
+  liquidate?: ReadonlySet<string>;
+}
+
+/** What each instruction of a sweep tx is (the simulation reports a refusal by instruction index). */
+export interface SweepSlot {
+  ix: TransactionInstruction;
+  kind: "accrue" | "refresh" | "liq" | "tail";
+  key: string | null;
+}
+
+/** The slots of one planned tx: accrue crank first, then each refresh (followed by its liquidation crank when asked), then a tail. */
+export function buildSweepTxSlots(owner: PublicKey, market: PublicKey, tx: BuildTxArgs): SweepSlot[] {
+  const slots: SweepSlot[] = [];
+  const liq = tx.liquidate ?? new Set<string>();
+  if (tx.accrue !== "none" && tx.accrueTarget) {
+    const k = tx.accrueTarget.toBase58();
+    slots.push({ ix: buildObservationCrankIx(owner, market, tx.accrueTarget, tx.oracleAccounts ?? []), kind: "accrue", key: k });
+    if (tx.accrue === "counterparty" && liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, tx.accrueTarget), kind: "liq", key: k });
+  }
+  for (const p of tx.refresh) {
+    const k = p.pubkey.toBase58();
+    slots.push({ ix: buildRefreshCrankIx(owner, market, p.pubkey), kind: "refresh", key: k });
+    if (liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, p.pubkey), kind: "liq", key: k });
+  }
+  for (const t of tx.tail ?? []) slots.push({ ix: t, kind: "tail", key: null });
+  return slots;
 }
 
 /** The instruction list of one planned tx (accrue crank first, then the refreshes, then a tail). */
 export function buildSweepTxIxs(owner: PublicKey, market: PublicKey, tx: BuildTxArgs): TransactionInstruction[] {
-  const ixs: TransactionInstruction[] = [];
-  if (tx.accrue !== "none" && tx.accrueTarget) ixs.push(buildObservationCrankIx(owner, market, tx.accrueTarget, tx.oracleAccounts ?? []));
-  for (const p of tx.refresh) ixs.push(buildRefreshCrankIx(owner, market, p.pubkey));
-  for (const t of tx.tail ?? []) ixs.push(t);
-  return ixs;
+  return buildSweepTxSlots(owner, market, tx).map((s) => s.ix);
 }
 
 interface TxRun {
@@ -241,9 +305,21 @@ interface TxRun {
   noCodeKeys: string[];
   droppedAccrue: boolean;
   anchorRefused: boolean;
+  /** F1: liquidation-crank attempts of this tx. */
+  liq: LiqRecord[];
+}
+
+/** F1 settings of one planned tx. `candidates` are the Stage A candidates of the round (liquidation.ts). */
+export interface LiqTxOptions {
+  layout: MarketLayout;
+  slots: number;
+  candidates: ReadonlyMap<string, PositionedPortfolio>;
+  exactPadBps: number;
+  maxPerTx: number;
 }
 
 export interface RunTxOptions {
+  liq?: LiqTxOptions;
   oracleAccounts?: ReadonlyArray<PublicKey>;
   tail?: ReadonlyArray<TransactionInstruction>;
   /** Codes at the tail instruction that are expected (e.g. 38 for tag 78). */
@@ -268,7 +344,33 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
   let probed = false;
   /** Portfolios proven (by single-refresh probe simulation) to fail BY THEMSELVES without a program code. */
   const culprits = new Set<string>();
-  const budget = SWEEP_MAX_PRUNES + 3;
+  // F1: liquidation cranks (liquidation.ts). Decided per attempt from the simulation of the plain tx, never before it.
+  const liqCfg = o.liq;
+  const excluded = new Set<string>();
+  const liqLog: LiqRecord[] = [];
+  let chosen = new Map<string, FlaggedAccount>();
+  let activeSlots: SweepSlot[] = [];
+  const emit = deps.exec.log ?? ((l: string) => console.log(l));
+  const liqNote = (key: string, result: LiqRecord["result"], code: number | null, note: string) => {
+    liqLog.push({ key, result, code, note });
+    emit(`[liq] ${ctx.label} ${key} ${result}${code !== null ? ` code=${code}` : ""}: ${note}`);
+  };
+  const candidatesIn = (): PositionedPortfolio[] => {
+    if (!liqCfg) return [];
+    const out: PositionedPortfolio[] = [];
+    const seen = new Set<string>();
+    const add = (k: string) => {
+      const c = liqCfg.candidates.get(k);
+      if (c && !excluded.has(k) && !seen.has(k)) {
+        seen.add(k);
+        out.push(c);
+      }
+    };
+    if (accrue === "counterparty" && target) add(target.toBase58());
+    for (const p of refresh) add(p.pubkey.toBase58());
+    return out;
+  };
+  const budget = SWEEP_MAX_PRUNES + 3 + (liqCfg ? Math.min(candidatesIn().length, 16) + 1 : 0);
   const settledKeys = (): string[] => {
     // the first counterparty is settled by its own accrue crank when the accrue went through it
     const ks = refresh.map((p) => p.pubkey.toBase58());
@@ -283,12 +385,119 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     noCodeKeys: [...culprits],
     droppedAccrue,
     anchorRefused,
+    liq: liqLog,
   });
   for (let attempt = 0; attempt <= budget; attempt++) {
     const hasAccrue = accrue !== "none" && target !== null;
-    const ixs = buildSweepTxIxs(owner, ctx.market, { accrue, accrueTarget: target, refresh, oracleAccounts: o.oracleAccounts, tail: o.tail });
-    if (ixs.length === 0) return { outcome: { kind: "dry-run", unitsConsumed: null, logs: [], ixCount: 0 }, settled: [], pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused };
+    const plainArgs: BuildTxArgs = { accrue, accrueTarget: target, refresh, oracleAccounts: o.oracleAccounts, tail: o.tail };
+    activeSlots = buildSweepTxSlots(owner, ctx.market, plainArgs);
+    const ixs = activeSlots.map((sl) => sl.ix);
+    chosen = new Map();
+    if (ixs.length === 0) return { outcome: { kind: "dry-run", unitsConsumed: null, logs: [], ixCount: 0 }, settled: [], pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog };
+    const cands = candidatesIn();
+    /** Stage B: from the post-refresh state the plain simulation returned, the extended instruction list (or null: send the plain tx). */
+    const extendWithLiquidations = (post: ReadonlyArray<Uint8Array | null>, cs: ReadonlyArray<PositionedPortfolio>): TransactionInstruction[] | null => {
+      if (!liqCfg) return null;
+      const marketPost = post[0];
+      const params = marketPost ? readMarginParams(marketPost, liqCfg.layout, liqCfg.slots) : null;
+      if (!params) {
+        liqNote(cs[0].pubkey.toBase58(), "skipped", null, "post-refresh market state unavailable; no liquidation crank this tx");
+        pairingStats.liqSkipped++;
+        return null;
+      }
+      const flagged: FlaggedAccount[] = [];
+      cs.forEach((c, i) => {
+        const d = post[i + 1];
+        if (!d) return;
+        let parsed;
+        try {
+          parsed = parsePortfolioV17(d);
+        } catch {
+          return;
+        }
+        const m = marginOf(riskSnapOf(parsed), params);
+        if (m.ratioBps !== null && atOrBelowMaintenance(m, liqCfg.exactPadBps)) {
+          if (liquidationMadeNoProgress(c.pubkey.toBase58(), m)) {
+            liqNote(c.pubkey.toBase58(), "skipped", null, "state unchanged since the last landed liquidation crank (no progress); not cranked again until it changes");
+            pairingStats.liqSkipped++;
+            return;
+          }
+          flagged.push({ portfolio: c, ratioBps: m.ratioBps, margin: m });
+        }
+      });
+      if (flagged.length === 0) return null;
+      const fit = fitLiquidations({ flagged, baseCu: estimateBaseCu(accrue !== "none", refresh) + (accrue === "counterparty" ? 114_000 : 0), maxPerTx: liqCfg.maxPerTx });
+      for (const d of fit.deferred) {
+        pairingStats.liqDeferred++;
+        liqNote(d.account.portfolio.pubkey.toBase58(), "deferred", null, `at or below maintenance (${d.account.ratioBps} bps of notional) but not added to this tx: ${d.why}`);
+      }
+      const packed = fitToPacket(
+        fit.chosen,
+        (kept) => buildSweepTxSlots(owner, ctx.market, { ...plainArgs, liquidate: new Set(kept.map((f) => f.portfolio.pubkey.toBase58())) }).map((sl) => sl.ix),
+        owner,
+      );
+      for (const d of packed.dropped) {
+        pairingStats.liqDeferred++;
+        liqNote(d.portfolio.pubkey.toBase58(), "deferred", null, "at or below maintenance but the tx would exceed 1,232 bytes");
+      }
+      const take = packed.kept;
+      if (take.length === 0) return null;
+      activeSlots = buildSweepTxSlots(owner, ctx.market, { ...plainArgs, liquidate: new Set(take.map((f) => f.portfolio.pubkey.toBase58())) });
+      const list = activeSlots.map((sl) => sl.ix);
+      chosen = new Map(take.map((f) => [f.portfolio.pubkey.toBase58(), f]));
+      return list;
+    };
+    /**
+     * Stage B check on the EXTENDED simulation: a liquidation that does not move the position is not sent. An account the engine
+     * keeps leaving a hair under its requirement (funding / fee drag between rounds) makes each crank a dust action (measured on
+     * PENGU 7Jbxvq 2026-10-14: -3,237,984 atoms for the real liquidation, then 13 cranks of -60..-83 atoms each). Progress =
+     * the account's notional falls by at least MIN_PROGRESS_BPS of its pre-liquidation notional; else the plain tx goes out and the
+     * state is remembered (liquidationMadeNoProgress) until it changes.
+     */
+    const verifyLiquidations = (post: ReadonlyArray<Uint8Array | null>): string | null => {
+      if (!liqCfg || chosen.size === 0) return null;
+      const marketPost = post[0];
+      const params = marketPost ? readMarginParams(marketPost, liqCfg.layout, liqCfg.slots) : null;
+      if (!params) return null;
+      const noProgress: string[] = [];
+      cands.forEach((c, i) => {
+        const k = c.pubkey.toBase58();
+        const f = chosen.get(k);
+        const d = post[i + 1];
+        if (!f || !f.margin || !d) return;
+        let parsed;
+        try {
+          parsed = parsePortfolioV17(d);
+        } catch {
+          return;
+        }
+        const after = marginOf(riskSnapOf(parsed), params);
+        const dropped = f.margin.notional - after.notional;
+        if (dropped * 10_000n < f.margin.notional * BigInt(MIN_PROGRESS_BPS)) {
+          noProgress.push(k);
+          noteLiquidationLanded(k, f.margin);
+          pairingStats.liqSkipped++;
+          liqNote(k, "skipped", null, `the liquidation crank would not reduce the position (notional ${f.margin.notional} -> ${after.notional}): a dust action, not sent; plain refresh sent`);
+        }
+      });
+      if (noProgress.length === 0) return null;
+      // all-or-nothing keeps the tx simple: the plain tx (already simulated clean) is sent, the others are retried next round
+      chosen = new Map();
+      return `no progress on ${noProgress.length} account(s)`;
+    };
+    const liqOpts: Pick<ExecOptions, "accounts" | "extend" | "verifyExtended"> =
+      liqCfg && cands.length > 0
+        ? {
+            accounts: [ctx.market.toBase58(), ...cands.map((c) => c.pubkey.toBase58())],
+            extend: (post) => {
+              const ext = extendWithLiquidations(post, cands);
+              return ext;
+            },
+            verifyExtended: verifyLiquidations,
+          }
+        : {};
     const outcome = await simulateAndSend(deps.exec, ixs, {
+      ...liqOpts,
       job: o.job ?? "sweep",
       label: ctx.label,
       units: SWEEP_TX_UNITS,
@@ -296,7 +505,27 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
       beforeSend: () => (t.settlesLp && o.lpGate ? o.lpGate(pruned.filter((p) => p.reason !== "current")) : null),
     });
     const landed = outcome.kind === "sent" && outcome.landed === "landed";
-    if (landed || outcome.kind === "dry-run") return { outcome, settled: settledKeys(), pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused };
+    if (landed || outcome.kind === "dry-run") {
+      for (const [k, f] of chosen) {
+        pairingStats.liqIncluded++;
+        if (landed) {
+          pairingStats.liqLanded++;
+          if (f.margin) noteLiquidationLanded(k, f.margin);
+        }
+        liqNote(k, landed ? "landed" : "simulated", null, `${landed ? "liquidation crank landed" : "liquidation crank simulated OK (dry-run: not sent)"} with the refresh in one tx; margin ${f.ratioBps} bps of notional after the refresh`);
+      }
+      return { outcome, settled: settledKeys(), pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog };
+    }
+    // F1: a tx WITH liquidation cranks landed but failed. The code cannot say which crank failed, so never reason about it:
+    // drop every liquidation crank and re-send the plain refresh (the price push and the refresh must never wait on a liquidation).
+    if (chosen.size > 0 && outcome.kind === "sent" && outcome.landed === "failed") {
+      for (const k of chosen.keys()) {
+        excluded.add(k);
+        pairingStats.liqSkipped++;
+        liqNote(k, "skipped", outcome.failCode, "the tx with the liquidation crank landed but failed; re-sending the plain refresh");
+      }
+      continue;
+    }
     // A landed tx that failed on its accrue crank with Custom(22): another tx accrued this slot. Continue refresh-only.
     if (outcome.kind === "sent" && outcome.landed === "failed" && outcome.failCode === NON_PROGRESS && hasAccrue && !droppedAccrue) {
       pairingStats.accrueAlreadyDone++;
@@ -307,6 +536,32 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     if (outcome.kind === "sent" || outcome.kind === "held" || outcome.kind === "failed") return fail(outcome);
     // refused in simulation
     const refused = outcome as Extract<ExecOutcome, { kind: "refused" }>;
+    // F1: the refusal came from the EXTENDED simulation (the plain one was clean). A liquidation crank the engine refuses is
+    // dropped on its own: Custom(22) = nothing to liquidate (healthy, or already liquidated: the program-side fix makes the
+    // refresh itself liquidate, so the second crank has nothing left), any other code = refused. A refusal anywhere else, or
+    // one without a program code (compute exhaustion), drops every liquidation crank of the tx. The plain tx is then simulated
+    // again and goes out: a liquidation never blocks the refresh.
+    if (chosen.size > 0) {
+      const sl = refused.index !== null ? activeSlots[refused.index] : undefined;
+      if (sl && sl.kind === "liq" && sl.key && refused.code !== null) {
+        excluded.add(sl.key);
+        pairingStats.liqIncluded++;
+        if (refused.code === NON_PROGRESS) {
+          pairingStats.liqNothingToDo++;
+          liqNote(sl.key, "nothing-to-do", refused.code, "the engine had nothing to liquidate (healthy, or already liquidated); plain refresh sent");
+        } else {
+          pairingStats.liqRefused++;
+          liqNote(sl.key, "refused", refused.code, `${refused.name}; plain refresh sent`);
+        }
+      } else {
+        for (const k of chosen.keys()) {
+          excluded.add(k);
+          pairingStats.liqSkipped++;
+          liqNote(k, "skipped", refused.code, `the tx with liquidation cranks was refused at ${sl?.kind ?? "an unknown instruction"} (${refused.name}); plain refresh sent`);
+        }
+      }
+      continue;
+    }
     // NOT a program refusal (no Custom code): compute exhaustion, account in use, blockhash, RPC. Nobody is blamed and nothing
     // is quarantined: shrink the tx (cut the TAIL), the cut refreshes are "deferred" = unsettled, which holds the LP in both modes.
     if (refused.code === null) {
@@ -412,7 +667,7 @@ export async function runSettleRound(
   const history = input.quarantineHistory ?? new Map<string, { code: number; level: number }>();
   const backoff = input.gapBackoff;
   const protective = input.protective === true;
-  const emptyRes = (plan: RoundPlan, abandoned: string | null, backedOff: boolean): RoundResult => ({ plan, txsSent: 0, settled: [], missing: [], rentSettled: [], backedOff, anchorRefused: false, escalated: [], pruned: 0, lpSettled: false, gapSlots: null, abandoned, outcomes: [] });
+  const emptyRes = (plan: RoundPlan, abandoned: string | null, backedOff: boolean): RoundResult => ({ plan, txsSent: 0, settled: [], missing: [], rentSettled: [], backedOff, anchorRefused: false, escalated: [], pruned: 0, lpSettled: false, gapSlots: null, abandoned, outcomes: [], liq: [] });
 
   // Gap backoff: after a round abandoned for a gap > maxGapSlots, skip a few rounds instead of re-sending phase 1 every tick.
   if (backoff && backoff.skipRounds > 0 && !protective) {
@@ -435,8 +690,10 @@ export async function runSettleRound(
   }
   pairingStats.quarantinedNow = [...quarantine.values()].filter((u) => u > nowSlot).length;
 
-  const plan = planSettleRound({ mode: cfg.pairing, lp: input.lp, lpWeight: input.lpWeight, counterparties: planned, anchor: input.anchor ?? null, weightBudget: cfg.weightBudget, maxTxsPerRound: cfg.maxTxsPerRound });
-  const res: RoundResult = { plan, txsSent: 0, settled: [], missing, rentSettled: [], backedOff: false, anchorRefused: false, escalated: [], pruned: 0, lpSettled: false, gapSlots: null, abandoned: null, outcomes: [] };
+  // F1 stage A: counterparties within the pad of maintenance weigh more (their liquidation crank), so the planner makes room.
+  const stageA = markLiquidationCandidates(planned, input.liq?.params ? { params: input.liq.params, padBps: input.liq.padBps ?? DEFAULT_LIQ_PAD_BPS } : null);
+  const plan = planSettleRound({ mode: cfg.pairing, lp: input.lp, lpWeight: input.lpWeight, counterparties: stageA.marked, anchor: input.anchor ?? null, weightBudget: cfg.weightBudget, maxTxsPerRound: cfg.maxTxsPerRound });
+  const res: RoundResult = { plan, txsSent: 0, settled: [], missing, rentSettled: [], backedOff: false, anchorRefused: false, escalated: [], pruned: 0, lpSettled: false, gapSlots: null, abandoned: null, outcomes: [], liq: [] };
   pairingStats.rounds++;
   if (protective) pairingStats.protectiveRounds++;
   if (plan.txs.length <= 1) pairingStats.singleTxRounds++;
@@ -470,7 +727,12 @@ export async function runSettleRound(
   };
   try {
     const [phase1, phase2] = plan.phases.length > 1 ? [plan.phases[0], plan.phases[1]] : [plan.phases[0] ?? [], [] as number[]];
+    const liqTx: LiqTxOptions | undefined =
+      input.liq && stageA.candidates.size > 0
+        ? { layout: input.liq.layout, slots: input.liq.slots, candidates: stageA.candidates, exactPadBps: input.liq.exactPadBps ?? DEFAULT_LIQ_EXACT_PAD_BPS, maxPerTx: input.liq.maxPerTx ?? DEFAULT_LIQ_MAX_PER_TX }
+        : undefined;
     const runOpts = (isLp: boolean): RunTxOptions => ({
+      liq: liqTx,
       oracleAccounts: input.oracleAccounts,
       lpGate: isLp
         ? (prunedNotSettled) =>
@@ -493,6 +755,7 @@ export async function runSettleRound(
     };
     const record = (r: TxRun) => {
       res.outcomes.push(r.outcome);
+      res.liq.push(...r.liq);
       res.pruned += r.pruned.length;
       if (r.outcome.kind === "sent") res.txsSent++;
       if (r.anchorRefused) res.anchorRefused = true;

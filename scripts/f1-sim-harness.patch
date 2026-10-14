@@ -1,0 +1,119 @@
+--- a/ops/relaunch/v22/sim/chain.ts
++++ b/ops/relaunch/v22/sim/chain.ts
+@@ -29,6 +29,8 @@
+   raw(pk: PublicKey): Promise<Uint8Array | null>;
+   send(ixs: TransactionInstruction[], signers: Keypair[], cu?: number): Promise<SendResult>;
+   simulate(ixs: TransactionInstruction[], signers: Keypair[], cu?: number): Promise<SendResult>;
++  /** simulate and return the post-simulation account data of `addrs` (F1 keeper policy) */
++  simulatePost?(ixs: TransactionInstruction[], signers: Keypair[], cu: number, addrs: PublicKey[]): Promise<{ res: SendResult; post: Map<string, Uint8Array> }>;
+   /** Advance the chain by `n` slots (fork: warp; devnet: wait). */
+   advance(n: number): Promise<void>;
+   /** Classic-SPL token amount of a token account (0 when missing). */
+@@ -109,6 +111,15 @@
+     if (typeof r.err === "function") { const s = r.toString(); return { ok: false, err: s, code: codeOf(s), cu: Number(m.computeUnitsConsumed()), logs: m.logs() }; }
+     return { ok: true, err: null, code: null, cu: Number(m.computeUnitsConsumed()), logs: m.logs() };
+   }
++  async simulatePost(ixs: TransactionInstruction[], signers: Keypair[], cu: number, addrs: PublicKey[]): Promise<{ res: SendResult; post: Map<string, Uint8Array> }> {
++    const r = this.svm.simulateTransaction(this.tx(ixs, signers, cu)) as unknown as { err?: () => unknown; meta(): { logs(): string[]; computeUnitsConsumed(): bigint }; postAccounts(): Array<[PublicKey, { data(): Uint8Array }]>; toString(): string };
++    const m = r.meta();
++    const post = new Map<string, Uint8Array>();
++    const want = new Set(addrs.map((a) => a.toBase58()));
++    if (typeof r.err !== "function") for (const [k, a] of r.postAccounts()) if (want.has(k.toBase58())) post.set(k.toBase58(), new Uint8Array(a.data()));
++    if (typeof r.err === "function") { const s = r.toString(); return { res: { ok: false, err: s, code: codeOf(s), cu: Number(m.computeUnitsConsumed()), logs: m.logs() }, post }; }
++    return { res: { ok: true, err: null, code: null, cu: Number(m.computeUnitsConsumed()), logs: m.logs() }, post };
++  }
+   async advance(n: number): Promise<void> {
+     const c = this.svm.getClock();
+     const to = c.slot + BigInt(n);
+--- a/ops/relaunch/v22/sim/engine.ts
++++ b/ops/relaunch/v22/sim/engine.ts
+@@ -90,7 +90,7 @@
+   resolver?: boolean;
+   /** keeper liquidation policy: "live" = the deployed v2.2 sweep (one crank per account: never liquidates a solvent account below
+    *  maintenance), "liq2" = a second crank on accounts at or below maintenance (the engine's Liquidate step). Default liq2. */
+-  keeperPolicy?: "live" | "liq2";
++  keeperPolicy?: "live" | "liq2" | "f1";
+   /** maintenance margin (bps) used by the liq2 screen */
+   mmrBps?: number;
+   /** keeper sweep cadence in steps (1 = every step) */
+--- a/ops/relaunch/v22/sim/run.ts
++++ b/ops/relaunch/v22/sim/run.ts
+@@ -14,6 +14,7 @@
+ const outDir = (() => { const i = args.indexOf("--out"); return i >= 0 ? args[i + 1]! : path.join(process.env.HOME!, "wt-v22-sim/out"); })();
+ const allocOff = args.includes("--alloc-off");
+ const livePolicy = args.includes("--keeper-live");
++const f1Policy = args.includes("--keeper-f1");
+ const MMR: Record<string, number> = { SMAJ: 600, SMID: 600, SMFL: 1000, SMBR: 1000, SMC1: 1000, SIMMAJ: 600, SIMMFL: 1000, SIMMBR: 1000 };
+ const onlyMarket = (() => { const i = args.indexOf("--only-market"); return i >= 0 ? args[i + 1]! : null; })();
+ fs.mkdirSync(outDir, { recursive: true });
+@@ -26,7 +27,7 @@
+   for (const spec of matches) {
+     if (onlyMarket && spec.market !== onlyMarket) continue;
+     if (allocOff) { spec.allocEverySlots = 0; spec.name = `${spec.name}-noalloc`; }
+-    spec.mmrBps = MMR[spec.market]; spec.keeperPolicy = livePolicy ? "live" : "liq2"; if (livePolicy) spec.name = `${spec.name}-livekeeper`;
++    spec.mmrBps = MMR[spec.market]; spec.keeperPolicy = livePolicy ? "live" : f1Policy ? "f1" : "liq2"; if (livePolicy) spec.name = `${spec.name}-livekeeper`; if (f1Policy) spec.name = `${spec.name}-f1keeper`;
+     const w = forkWorld();
+     const m = w.markets[spec.market]; if (!m) { console.error(`no market ${spec.market}`); fails++; continue; }
+     process.stdout.write(`${spec.name} (${spec.market}) ... `);
+--- a/ops/relaunch/v22/sim/market.ts
++++ b/ops/relaunch/v22/sim/market.ts
+@@ -21,6 +21,10 @@
+   withBoundVaultLpTailP3, withBondTailV22, deriveVaultAuthority, buildVaultLpAllocateIxP2b,
+ } from "@percolatorct/sdk";
+ import fs from "node:fs";
++// F1: the KEEPER's own pure margin functions (read from the fix branch) decide who gets a second crank
++import { atOrBelowMaintenance, fitLiquidations, marginOf, readMarginParams } from "/Users/khubair/wt-v22-f1-keeper/src/cross-cluster/v22/liquidation.ts";
++import { layoutById } from "/Users/khubair/wt-v22-f1-keeper/src/cross-cluster/market-layout.ts";
++import { riskSnapOf } from "/Users/khubair/wt-v22-f1-keeper/src/cross-cluster/positioned-refresh.ts";
+ import type { Chain, SendResult } from "./chain.ts";
+ import { codeOf } from "./chain.ts";
+ import { LAYOUT, PORTFOLIO_ACCOUNT_LEN, readU64, readU128, readI128, slotBase, createPortfolioIx } from "../lib22.ts";
+@@ -152,7 +156,7 @@
+    * maintenance liquidates it). Batched `batch` per tx; a batch that fails is retried one by one so one refusal does not hide others.
+    * Returns the traders whose legs went to zero during the sweep (liquidated).
+    */
+-  async keeperSweep(batch = 6, policy: "live" | "liq2" = "liq2", mmrBps = 600): Promise<{ liquidated: Trader[]; reduced: Trader[]; codes: Record<string, number> }> {
++  async keeperSweep(batch = 6, policy: "live" | "liq2" | "f1" = "liq2", mmrBps = 600): Promise<{ liquidated: Trader[]; reduced: Trader[]; codes: Record<string, number> }> {
+     const pos = await this.positioned();
+     const codes: Record<string, number> = {};
+     const before = new Map<string, bigint>();
+@@ -162,7 +166,38 @@
+     // same tx as the refresh; a second crank in a later tx returns 22), falling back to a plain refresh when there is nothing to liquidate.
+     const d0 = await this.slabData(); const eff0 = readU64(d0, slotBase(0) + LAYOUT.wrapperSlotLen + OFF.asset.effective_price!);
+     const near = (t: Trader): boolean => policy === "liq2" && (this.lastRatio.get(t.port.toBase58()) ?? 0) * 10_000 <= mmrBps * 1.6;
+-    const plain = pos.filter((t) => !near(t)), close = pos.filter((t) => near(t));
++    if (policy === "f1" && this.chain.simulatePost) {
++      // the keeper fix: plain batches of refresh cranks; a CLEAN simulation returns the post-refresh state; accounts at or below
++      // maintenance THERE get a second crank right after their refresh; the extended tx is simulated again; any error -> the plain tx
++      const layout = layoutById("v2.2-b");
++      for (let i = 0; i < pos.length; i += batch) {
++        const chunk = pos.slice(i, i + batch);
++        const plainIxs = chunk.map((t) => this.crankIx(t.port, false));
++        let sendIxs = plainIxs;
++        const sim = await this.chain.simulatePost(plainIxs, [this.admin], 1_400_000, [this.slab, ...chunk.map((t) => t.port)]);
++        if (sim.res.ok) {
++          const params = readMarginParams(sim.post.get(this.slab.toBase58())!, layout, 1);
++          const flagged = [] as Array<{ portfolio: { pubkey: PublicKey; longLegs: number; shortLegs: number; isLp: boolean }; ratioBps: bigint; t: Trader }>;
++          if (params) for (const t of chunk) {
++            const d = sim.post.get(t.port.toBase58()); if (!d) continue;
++            const mg = marginOf(riskSnapOf(parsePortfolioV17(d)), params);
++            if (mg.ratioBps !== null && atOrBelowMaintenance(mg, 0)) flagged.push({ portfolio: { pubkey: t.port, longLegs: 1, shortLegs: 0, isLp: false }, ratioBps: mg.ratioBps, t });
++          }
++            if (flagged.length > 0) {
++            const fit = fitLiquidations({ flagged, baseCu: 200_000 + 145_000 * chunk.length, maxPerTx: 4 });
++            const keys = new Set(fit.chosen.map((f) => f.portfolio.pubkey.toBase58()));
++            const ext = chunk.flatMap((t) => (keys.has(t.port.toBase58()) ? [this.crankIx(t.port, false), this.crankIx(t.port, false)] : [this.crankIx(t.port, false)]));
++            const s2 = await this.chain.simulate(ext, [this.admin], 1_400_000);
++            if (s2.ok) { sendIxs = ext; codes["f1:liq-crank"] = (codes["f1:liq-crank"] ?? 0) + keys.size; }
++            else codes[`f1:fallback-${s2.code ?? -1}`] = (codes[`f1:fallback-${s2.code ?? -1}`] ?? 0) + 1;
++          }
++        }
++        const r = await this.chain.send(sendIxs, [this.admin], 1_400_000);
++        if (!r.ok) for (const t of chunk) { const r1 = await this.chain.send([this.crankIx(t.port, false)], [this.admin], 1_400_000); if (!r1.ok) codes[String(r1.code ?? -1)] = (codes[String(r1.code ?? -1)] ?? 0) + 1; }
++      }
++    }
++    const f1Handled = policy === "f1" && !!this.chain.simulatePost;
++    const plain = f1Handled ? [] : pos.filter((t) => !near(t)), close = f1Handled ? [] : pos.filter((t) => near(t));
+     for (let i = 0; i < plain.length; i += batch) {
+       const chunk = plain.slice(i, i + batch);
+       const r = await this.chain.send(chunk.map((t) => this.crankIx(t.port, false)), [this.admin], 1_400_000);

@@ -163,6 +163,9 @@ The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist acco
 | `KEEPER_V22_TICK_MS` | 20000 | loop tick |
 | `KEEPER_V22_FEE_CRANK_BOND` | off | tag 78 on bond markets: LP crank (tag 5) first, then 78 with ext + writable LP + tranche |
 | `KEEPER_V22_SWEEP` | off | positioned-refresh sweep for variant-B markets, leg-weight budget (3 + legs), heaviest first |
+| `KEEPER_V22_LIQUIDATE` | off | F1: a liquidation crank (second no-observation crank) in the same sweep tx as the refresh of every account measured at or below maintenance after the simulated refresh. Simulates first; a crank the engine refuses (22 = nothing to liquidate) is dropped and the plain refresh goes out. Needs `KEEPER_V22_SWEEP`. Log lines start `[liq]` |
+| `KEEPER_V22_LIQUIDATE_PAD_BPS` | 500 | plan-time pad over maintenance (bps of notional): accounts within it weigh more in the round plan |
+| `KEEPER_V22_LIQUIDATE_MAX_PER_TX` | 4 | most liquidation cranks per sweep tx |
 | `KEEPER_V22_SETTLE_PAIRING` | prefer | `off` / `prefer` / `strict`; acts only with the sweep on. See `v22/settle-pairing.ts` |
 | `KEEPER_V22_ACCRUE_ANCHORS` | none | `market:flatPortfolio,...` accrue-only crank targets (else discovered) |
 | `KEEPER_V22_HOLDING_RENT` / `_RENT_CADENCE_SLOTS` | off / 9000 | tag 106 on rent markets |

@@ -9,6 +9,7 @@ import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
 import { parsePortfolioV17 } from "@percolatorct/sdk";
 import { fetchMarketPortfolios } from "../recovery-cranker.ts";
+import { riskSnapOf } from "../positioned-refresh.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { V22MarketCtx } from "./market.ts";
 
@@ -92,7 +93,7 @@ export function analysePortfolios(
       else overrideWhy = `override ${pubkey.toBase58()} is ${isLp ? "the vault LP" : anyActive ? "not flat" : parsed.matcherEnabled ? "a matcher portfolio" : "not owned by the keeper"}`;
     }
     if (longLegs + shortLegs === 0) continue;
-    all.push({ pubkey, longLegs, shortLegs, isLp, activeLegs, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort });
+    all.push({ pubkey, longLegs, shortLegs, isLp, activeLegs, lossWeight, kfEpochSnapLong: kfLong, kfEpochSnapShort: kfShort, risk: riskSnapOf(parsed) });
     if (minAbs !== null) minLegAbs.set(pubkey.toBase58(), minAbs);
   }
   let lp: PositionedPortfolio | null = all.find((x) => x.isLp) ?? null;
