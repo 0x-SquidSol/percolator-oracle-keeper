@@ -63,6 +63,8 @@ export KEEPER_V22_SETTLE_PAIRING="${KEEPER_V22_SETTLE_PAIRING:-prefer}"
 export KEEPER_V22_FEE_CRANK_BOND="${KEEPER_V22_FEE_CRANK_BOND:-on}"
 export KEEPER_V22_STAKE_SYNC="${KEEPER_V22_STAKE_SYNC:-on}"
 export KEEPER_V22_TICK_MS="${KEEPER_V22_TICK_MS:-20000}"
+# G8 depth push (44-byte PushAuthMark). ON 2026-10-14 after post-upgrade checks passed; set KEEPER_PUSH_DEPTH=off to revert.
+export KEEPER_PUSH_DEPTH="${KEEPER_PUSH_DEPTH:-on}"
 # off by default: rent, dust, G9, earn-exit (not part of a first bring-up)
 
 if [[ "$MODE" == "dry" ]]; then
