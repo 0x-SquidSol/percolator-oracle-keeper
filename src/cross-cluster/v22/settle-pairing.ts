@@ -82,8 +82,8 @@ export const SOLO_WEIGHT = 1_000;
  * account at or above V22_SOLO_MIN_LEGS legs weighs SOLO_WEIGHT: its worst settle measured 1,013,864 CU at the 4-leg
  * cap, which leaves no room for another account beside it (positioned-refresh.ts has the numbers).
  */
-export function portfolioWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs">): number {
-  return V22_LEG_COST.isSolo(p) ? SOLO_WEIGHT : 3 + V22_LEG_COST.legs(p);
+export function portfolioWeight(p: Pick<PositionedPortfolio, "longLegs" | "shortLegs" | "activeLegs" | "liqWeight">): number {
+  return V22_LEG_COST.isSolo(p) ? SOLO_WEIGHT : 3 + V22_LEG_COST.legs(p) + (p.liqWeight ?? 0);
 }
 
 /** The weight budget a tx of `maxCu` compute units supports once the accrue crank and headroom are paid. */

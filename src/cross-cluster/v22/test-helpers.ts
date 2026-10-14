@@ -28,6 +28,11 @@ export interface SentTx {
 export interface FakeConnOptions {
   /** Return an `err` for a simulation given the decoded instructions (tags/keys), or null for success. */
   simErr?: (ixs: SentTx, callIndex: number) => unknown;
+  /**
+   * F1: the post-simulation account data a simulation returns when the caller asked for accounts (index-aligned with the requested
+   * addresses; null = account missing). Absent: the simulation returns no accounts.
+   */
+  simAccounts?: (ixs: SentTx, callIndex: number, addresses: string[]) => Array<Uint8Array | null> | undefined;
   /** Program logs a simulation returns (by decoded tx and call index). */
   simLogs?: (ixs: SentTx, callIndex: number) => string[];
   slot?: () => number;
@@ -42,6 +47,8 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
   /** compute-unit limit of each simulated tx (parallel to `sims`). */
   const simUnits: number[] = [];
   const sent: Array<SentTx & { order: number }> = [];
+  /** serialized byte length of each tx sent (parallel to `sent`). */
+  const rawSizes: number[] = [];
   let order = 0;
   let sim = 0;
   let slot = 1000;
@@ -53,17 +60,21 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
     async getLatestBlockhash() {
       return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1_000_000 };
     },
-    async simulateTransaction(tx: { message: Parameters<typeof decode>[0] }) {
+    async simulateTransaction(tx: { message: Parameters<typeof decode>[0] }, cfg?: { accounts?: { addresses: string[] } }) {
       const d = decode(tx.message);
       sims.push(d);
       const lim = tx.message.compiledInstructions.find((i) => i.data[0] === 2 && i.data.length === 5);
       simUnits.push(lim ? Buffer.from(lim.data).readUInt32LE(1) : -1);
       const callIndex = sim++;
       const err = o.simErr ? o.simErr(d, callIndex) : null;
-      return { context: { slot: 1 }, value: { err: err ?? null, logs: o.simLogs ? o.simLogs(d, callIndex) : [], unitsConsumed: 123_456 } };
+      const want = cfg?.accounts?.addresses;
+      const post = want && o.simAccounts ? o.simAccounts(d, callIndex, want) : undefined;
+      const accounts = post ? post.map((a) => (a ? { data: [Buffer.from(a).toString("base64"), "base64"], executable: false, lamports: 1, owner: "", rentEpoch: 0 } : null)) : undefined;
+      return { context: { slot: 1 }, value: { err: err ?? null, logs: o.simLogs ? o.simLogs(d, callIndex) : [], unitsConsumed: 123_456, ...(accounts ? { accounts } : {}) } };
     },
     async sendRawTransaction(raw: Uint8Array) {
       // decode the transaction actually being sent (phase-1 txs are simulated and sent concurrently)
+      rawSizes.push(raw.length);
       const t = Transaction.from(Buffer.from(raw));
       const ixs = t.instructions.slice(COMPUTE_IX_COUNT);
       const d: SentTx = { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.keys.map((k) => k.pubkey.toBase58())) };
@@ -85,7 +96,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       return len * 7_000;
     },
   };
-  return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, simUnits, sent };
+  return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, simUnits, sent, rawSizes };
 }
 
 export function execCtx(conn: ExecConnection, dryRun = false): ExecContext {
