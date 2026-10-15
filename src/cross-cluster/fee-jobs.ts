@@ -15,17 +15,22 @@
  *   nothing  healthy no-op, e.g. "no new fees" (counted, silent)
  *   skipped  a precondition that is normal (no vault, no real stakers yet)
  *   blocked  needs operator action (e.g. stake pool not bound) -> alert
+ *   waiting  a refusal the keeper itself is about to clear (R3.20: OracleStale on a market whose stale-resolve
+ *            window matured, cleared by the next mark push). Retried next cycle; warns only if it persists
+ *            FEE_JOB_WAITING_ALERT_AFTER cycles (pushes not landing)
  *   failed   unexpected error -> alert after it repeats
  */
 import type { Connection, Keypair } from "@solana/web3.js";
 import type { MarketEntry, Registry } from "./registry.ts";
 import type { Alert, AlertKind, AlertSeverity, AlertSink } from "./alerting.ts";
+import { clipKeepingCode } from "./fee-error.ts";
 
 export type FeeJobOutcome = (
   | { kind: "done"; detail: string; signature?: string }
   | { kind: "nothing"; detail?: string }
   | { kind: "skipped"; reason: string }
   | { kind: "blocked"; reason: string; alertKind?: AlertKind; severity?: AlertSeverity }
+  | { kind: "waiting"; reason: string }
   | { kind: "failed"; error: string }
 ) & {
   /** One-shot events worth an alert whatever the outcome (e.g. a PDA-owned portfolio was closed). */
@@ -50,6 +55,8 @@ export interface FeeJobSweepResult {
   nothing: number;
   skipped: Array<{ market: string; label: string; reason: string }>;
   blocked: Array<{ market: string; label: string; reason: string; alertKind?: AlertKind; severity?: AlertSeverity }>;
+  /** Optional so sweep results built elsewhere (tests, older callers) stay valid; `runFeeJobSweep` always sets it. */
+  waiting?: Array<{ market: string; label: string; reason: string }>;
   failed: Array<{ market: string; label: string; error: string }>;
   /** One-shot event alerts raised by the job this sweep. */
   events: Alert[];
@@ -60,6 +67,12 @@ export const FEE_JOB_CONCURRENCY = 4;
 
 /** Consecutive failures of one (job, market) before alerting. */
 export const FEE_JOB_FAILURE_ALERT_AFTER = 3;
+
+/**
+ * Consecutive "waiting" sweeps of one (job, market) before a warn. A boot after an outage waits ONE cycle (the first
+ * push lands within seconds); this many in a row means the mark pushes are not landing, which must not stay silent.
+ */
+export const FEE_JOB_WAITING_ALERT_AFTER = 6;
 
 async function mapLimited<T>(items: readonly T[], limit: number, fn: (t: T) => Promise<void>): Promise<void> {
   let i = 0;
@@ -80,7 +93,7 @@ export async function runFeeJobSweep(
   markets: ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label">>,
   concurrency = FEE_JOB_CONCURRENCY,
 ): Promise<FeeJobSweepResult> {
-  const r: FeeJobSweepResult = { job: job.name, done: [], nothing: 0, skipped: [], blocked: [], failed: [], events: [] };
+  const r: FeeJobSweepResult = { job: job.name, done: [], nothing: 0, skipped: [], blocked: [], waiting: [], failed: [], events: [] };
   await mapLimited(markets, concurrency, async (m) => {
     let o: FeeJobOutcome;
     try {
@@ -95,6 +108,7 @@ export async function runFeeJobSweep(
       case "nothing": r.nothing++; break;
       case "skipped": r.skipped.push({ ...base, reason: o.reason }); break;
       case "blocked": r.blocked.push({ ...base, reason: o.reason, alertKind: o.alertKind, severity: o.severity }); break;
+      case "waiting": (r.waiting ??= []).push({ ...base, reason: o.reason }); break;
       case "failed": r.failed.push({ ...base, error: o.error }); break;
     }
   });
@@ -104,6 +118,7 @@ export async function runFeeJobSweep(
 /** Per-(job, market) failure streaks, so one transient RPC error does not page. */
 export class FeeJobFailureTracker {
   private readonly streaks = new Map<string, number>();
+  private readonly waitStreaks = new Map<string, number>();
 
   /** Update from a sweep; returns the alerts active after it. */
   alertsFor(r: FeeJobSweepResult): Alert[] {
@@ -112,7 +127,26 @@ export class FeeJobFailureTracker {
       const [job, market] = key.split("|");
       if (job === r.job && !failedNow.has(market)) this.streaks.delete(key);
     }
+    const waitingNow = new Set((r.waiting ?? []).map((w) => w.market));
+    for (const key of [...this.waitStreaks.keys()]) {
+      const [job, market] = key.split("|");
+      if (job === r.job && !waitingNow.has(market)) this.waitStreaks.delete(key);
+    }
     const alerts: Alert[] = [];
+    for (const w of r.waiting ?? []) {
+      const key = `${r.job}|${w.market}`;
+      const n = (this.waitStreaks.get(key) ?? 0) + 1;
+      this.waitStreaks.set(key, n);
+      if (n >= FEE_JOB_WAITING_ALERT_AFTER) {
+        alerts.push({
+          kind: "fee-job-failed",
+          severity: "warn",
+          subject: w.label,
+          message: `${r.job} still waiting after ${n} consecutive cycles (the refusal the keeper should clear is not clearing): ${clipKeepingCode(w.reason, 200)}`,
+          data: { job: r.job, market: w.market, waitingStreak: n },
+        });
+      }
+    }
     for (const f of r.failed) {
       const key = `${r.job}|${f.market}`;
       const n = (this.streaks.get(key) ?? 0) + 1;
@@ -122,7 +156,7 @@ export class FeeJobFailureTracker {
           kind: "fee-job-failed",
           severity: "warn",
           subject: f.label,
-          message: `${r.job} failed ${n}x consecutively: ${f.error.slice(0, 160)}`,
+          message: `${r.job} failed ${n}x consecutively: ${clipKeepingCode(f.error, 160)}`,
           data: { job: r.job, market: f.market, streak: n },
         });
       }
@@ -146,6 +180,7 @@ export function summarizeSweep(r: FeeJobSweepResult): Record<string, number> {
     nothing: r.nothing,
     skipped: r.skipped.length,
     blocked: r.blocked.length,
+    waiting: (r.waiting ?? []).length,
     failed: r.failed.length,
   };
 }
@@ -187,17 +222,20 @@ export async function startFeeJobLoop(
         const r = await runFeeJobSweep(job, ctx, registry.markets);
         for (const d of r.done) console.log(`[${job.name}] ${d.label}: ${d.detail}`);
         const summary = summarizeSweep(r);
-        if (r.done.length > 0 || r.failed.length > 0 || cycle % every === 0) {
+        const waiting = r.waiting ?? [];
+        if (r.done.length > 0 || r.failed.length > 0 || waiting.length > 0 || cycle % every === 0) {
           console.log(
             `[${job.name}] cycle ${cycle}: ${summary.done} moved, ${summary.nothing} nothing-to-do, ` +
-              `${summary.skipped} skipped, ${summary.blocked} blocked, ${summary.failed} failed` +
-              (r.failed.length ? ` — ${r.failed.map((f) => `${f.label}: ${f.error.slice(0, 100)}`).join(" | ")}` : ""),
+              `${summary.skipped} skipped, ${summary.blocked} blocked, ${summary.waiting} waiting, ${summary.failed} failed` +
+              (r.failed.length ? ` — ${r.failed.map((f) => `${f.label}: ${clipKeepingCode(f.error, 100)}`).join(" | ")}` : "") +
+              (waiting.length ? ` — waiting: ${waiting.map((w) => `${w.label}: ${clipKeepingCode(w.reason, 100)}`).join(" | ")}` : ""),
           );
         }
         sink.health(`fee-jobs:${job.name}`, {
           cycle,
           ...summary,
           blockedMarkets: r.blocked.map((b) => b.label),
+          waitingMarkets: waiting.map((w) => w.label),
           failedMarkets: r.failed.map((f) => f.label),
         });
         await sink.reconcile(`fee-jobs:${job.name}`, trackers.get(job.name)!.alertsFor(r));

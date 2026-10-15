@@ -27,7 +27,7 @@ const job: FeeJob = {
 describe("runFeeJobSweep", () => {
   it("buckets every outcome; a throwing job is a failure, not a crash", async () => {
     const r = await runFeeJobSweep(job, ctx, markets, 2);
-    assert.deepEqual(summarizeSweep(r), { done: 1, nothing: 1, skipped: 1, blocked: 1, failed: 2 });
+    assert.deepEqual(summarizeSweep(r), { done: 1, nothing: 1, skipped: 1, blocked: 1, waiting: 0, failed: 2 });
     assert.ok(r.failed.some((f) => f.market === "F" && /kaboom/.test(f.error)));
   });
   it("bounds concurrency", async () => {

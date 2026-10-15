@@ -66,6 +66,7 @@ import { SystemProgram } from "@solana/web3.js";
 import type { Registry } from "./registry.ts";
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { confirmBySignature, customCodeOf } from "./tx-confirm.ts";
+import { chainSlotOrNull, describeProgramError, formatWrapperCode, ORACLE_STALE, staleResolveWait } from "./fee-error.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { decodeTerminalState, isTerminalFlat, marketMode } from "./market-state.ts";
@@ -102,9 +103,18 @@ export interface LpFeeCrankResult {
   noFees: string[];
   /** Markets with no LP vault or no ledger yet — nothing to do. */
   skipped: string[];
+  /** Markets refused with a code the keeper itself is about to clear (R3.20: OracleStale before the first push). */
+  waiting: Array<{ market: string; reason: string }>;
   /** Markets that failed for a reason worth looking at. */
   failed: Array<{ market: string; error: string }>;
 }
+
+/**
+ * Outcome of one market's tag 78. `{ error, waiting: true }` = a refusal the keeper itself is about to clear (see
+ * fee-error.ts `staleResolveWait`): the fee job reports it as "waiting" (retry next cycle), and callers that only know
+ * `{ error }` still see the reason, code first.
+ */
+export type LpFeeOutcome = "cranked" | "no-fees" | "skipped" | { error: string; waiting?: true };
 
 function extractErrorCode(err: unknown): number | null {
   return customCodeOf(err instanceof Error ? err.message : err);
@@ -114,7 +124,9 @@ function extractErrorCode(err: unknown): number | null {
 export type LpFeeConnection = Pick<
   Connection,
   "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses" | "simulateTransaction"
->;
+> &
+  /** Read only when tag 78 answers OracleStale, to confirm the stale-resolve wait (R3.20). */
+  Partial<Pick<Connection, "getSlot">>;
 
 /**
  * Crank one market's LP fees. Never throws — every outcome is reported.
@@ -127,7 +139,7 @@ export async function crankLpFeesOnce(
   confirmOpts?: ConfirmOptions,
   /** Receives the `p3_senior_draw*` log lines of the simulated send (bound vaults only). */
   observe?: { seniorDrawLogs: string[] },
-): Promise<"cranked" | "no-fees" | "skipped" | { error: string }> {
+): Promise<LpFeeOutcome> {
   let market: PublicKey;
   try {
     market = new PublicKey(marketAddress);
@@ -217,13 +229,13 @@ export async function crankLpFeesOnce(
   }
 
   const attempt = (tail: BoundExtTail | null) =>
-    sendCrankFeesOnce(devnetConn, keeper, { market, registry, ledger, siblingLedger, domainIdx, bound, resolvedHarvest, tail }, marketAddress, confirmOpts, observe);
+    sendCrankFeesOnce(devnetConn, keeper, { market, registry, ledger, siblingLedger, domainIdx, bound, resolvedHarvest, tail, marketData: marketInfo ? new Uint8Array(marketInfo.data) : null }, marketAddress, confirmOpts, observe);
   let out = await attempt(ext);
   // Race: a tag 103 (this keeper's, or anyone's: it is permissionless) can create the ext and raise
   // the flag between our registry read and our send. The program then refuses the old 7-account
   // shape. Only on a failure, and only where the P2b program is known (the gate), re-read the
   // registry fresh and retry once with the tail. On today's programs this branch never runs.
-  if (typeof out === "object" && bound && ext === null && isP2bSupported()) {
+  if (typeof out === "object" && !out.waiting && bound && ext === null && isP2bSupported()) {
     try {
       const [fresh] = (await devnetConn.getMultipleAccountsInfo([registry], "confirmed")) as Array<{ data: Buffer } | null>;
       if (fresh && lpVaultRegistryExtFlag(new Uint8Array(fresh.data))) {
@@ -316,12 +328,22 @@ async function sendCrankFeesOnce(
     bound: boolean;
     resolvedHarvest: boolean;
     tail: BoundExtTail | null;
+    /** The market bytes read this cycle (for the stale-resolve wait check). */
+    marketData?: Uint8Array | null;
   },
   marketAddress: string,
   confirmOpts?: ConfirmOptions,
   observe?: { seniorDrawLogs: string[] },
-): Promise<"cranked" | "no-fees" | "skipped" | { error: string }> {
+): Promise<LpFeeOutcome> {
   const { market, ledger, bound, resolvedHarvest } = p;
+  // R3.20: OracleStale (27) on a LIVE market whose stale-resolve window has matured is the wait for this keeper's
+  // own next mark push (boot after an outage, or a market just added to the registry), not a failure. Confirmed from
+  // the market bytes + cluster slot; any other 27, or no slot, stays a failure.
+  const waitFor = async (code: number | null): Promise<{ error: string; waiting: true } | null> => {
+    if (resolvedHarvest || code !== ORACLE_STALE) return null;
+    const reason = staleResolveWait(code, p.marketData ?? null, await chainSlotOrNull(devnetConn));
+    return reason ? { error: `tag 78 ${reason}`, waiting: true } : null;
+  };
   const tx = new Transaction();
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNIT_LIMIT }));
   tx.add(buildCrankFeesIx({ keeper: keeper.publicKey, market, registry: p.registry, ledger, siblingLedger: p.siblingLedger, domainIdx: p.domainIdx, bound, tail: p.tail }));
@@ -347,6 +369,10 @@ async function sendCrankFeesOnce(
       const sim = await devnetConn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
       for (const l of sim.value.logs ?? []) if (l.includes("p3_senior_draw")) observe.seniorDrawLogs.push(l);
       if (sim.value.err && extractErrorCode(JSON.stringify(sim.value.err)) === NO_FEES_TO_CRANK) return "no-fees";
+      if (sim.value.err) {
+        const w = await waitFor(extractErrorCode(JSON.stringify(sim.value.err)));
+        if (w) return w;
+      }
     }
     const sig = await devnetConn.sendRawTransaction(tx.serialize(), { maxRetries: 2, skipPreflight: resolvedHarvest });
     // F6 (fee-flow audit 2026-09-29): the signature STATUS decides, not whether
@@ -357,7 +383,9 @@ async function sendCrankFeesOnce(
     const c = await confirmBySignature(devnetConn, sig, blockhash, lastValidBlockHeight, confirmOpts);
     if (c.status === "failed") {
       if (c.code === NO_FEES_TO_CRANK) return "no-fees";
-      return { error: `landed but failed on chain: ${JSON.stringify(c.err).slice(0, 100)} sig=${sig.slice(0, 16)}…` };
+      const w = await waitFor(c.code);
+      if (w) return w;
+      return { error: `${describeProgramError("tag 78 landed but failed on chain:", c.err)} sig=${sig.slice(0, 16)}…` };
     }
     if (c.status === "not-landed") {
       return { error: `not landed (retry next cycle): ${c.reason} sig=${sig.slice(0, 16)}…` };
@@ -369,7 +397,10 @@ async function sendCrankFeesOnce(
     // Version gate: a wrapper before P3 07a1d0eb refuses tag 78 on a Resolved
     // market with EngineLockActive (21) — in preflight, so nothing is spent.
     if (resolvedHarvest && extractErrorCode(err) === RESOLVED_HARVEST_UNSUPPORTED) return "skipped";
-    return { error: (err instanceof Error ? err.message : String(err)).slice(0, 140) };
+    const w = await waitFor(extractErrorCode(err));
+    if (w) return w;
+    // The code first and never clipped (R3.20: `.slice(0, 140)` cut "custom program error: 0x1b" to "custom p").
+    return { error: describeProgramError("tag 78", err, 120) };
   }
 }
 
@@ -380,7 +411,7 @@ export async function crankAllLpFeesOnce(
   registry: Registry,
   dryRun: boolean,
 ): Promise<LpFeeCrankResult> {
-  const result: LpFeeCrankResult = { cranked: [], noFees: [], skipped: [], failed: [] };
+  const result: LpFeeCrankResult = { cranked: [], noFees: [], skipped: [], waiting: [], failed: [] };
 
   await Promise.allSettled(
     registry.markets.map(async (m) => {
@@ -388,6 +419,7 @@ export async function crankAllLpFeesOnce(
       if (outcome === "cranked") result.cranked.push(m.marketAddress);
       else if (outcome === "no-fees") result.noFees.push(m.marketAddress);
       else if (outcome === "skipped") result.skipped.push(m.marketAddress);
+      else if (outcome.waiting) result.waiting.push({ market: m.marketAddress, reason: outcome.error });
       else result.failed.push({ market: m.marketAddress, error: outcome.error });
     }),
   );
@@ -424,7 +456,8 @@ export async function resolvedHarvestChangesState(
       const code = extractErrorCode(JSON.stringify(sim.value.err));
       if (code === RESOLVED_HARVEST_UNSUPPORTED) return "unsupported";
       if (code === NO_FEES_TO_CRANK) return "no-change";
-      return { error: `resolved harvest sim: ${JSON.stringify(sim.value.err).slice(0, 100)}` };
+      const c = extractErrorCode(JSON.stringify(sim.value.err));
+      return { error: `resolved harvest sim: ${c === null ? JSON.stringify(sim.value.err).slice(0, 100) : `${formatWrapperCode(c)} ${JSON.stringify(sim.value.err)}`}` };
     }
     const post = sim.value.accounts ?? [];
     const same = (i: number): boolean => {
@@ -454,6 +487,7 @@ export function makeLpFeeJob(confirmOpts?: ConfirmOptions): FeeJob {
       if (o === "cranked") return { kind: "done", detail: "LP fees distributed into the LP vault", ...(events.length ? { events } : {}) };
       if (o === "no-fees") return { kind: "nothing", detail: "no new LP fees (Custom(38))" };
       if (o === "skipped") return { kind: "skipped", reason: "no LP vault, or no depositors yet" };
+      if (o.waiting) return { kind: "waiting", reason: o.error };
       return { kind: "failed", error: o.error };
     },
   };

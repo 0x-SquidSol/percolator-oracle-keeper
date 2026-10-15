@@ -80,6 +80,7 @@ import { decodeStakePoolAnyVersion } from "./stake-pool-decode.ts";
 import { STAKE_PROGRAM_ID, WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
+import { chainSlotOrNull, describeProgramError, formatWrapperCode, ORACLE_STALE, staleResolveWait } from "./fee-error.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { isLiveMarket } from "./market-state.ts";
@@ -267,11 +268,16 @@ export function buildStakeAccrueFeesIx(p: {
   });
 }
 
-/** Classify a failed simulation of [CU, 87, 12]. */
-export function classifyStakeFeeError(err: unknown, logs: string[] | null): FeeJobOutcome {
+/**
+ * Classify a failed simulation of [CU, 87, 12]. `staleWait` is the reason from `staleResolveWait` when the market's
+ * stale-resolve window is confirmed matured: tag 87 calls the same `reject_permissionless_resolve_matured_live_view`
+ * as tag 78, so OracleStale (27) there is the wait for the next mark push (R3.20), never otherwise.
+ */
+export function classifyStakeFeeError(err: unknown, logs: string[] | null, staleWait: string | null = null): FeeJobOutcome {
   const ie = parseInstructionError(err);
   const code = ie?.custom ?? null;
   if (ie && ie.index === 1 && code !== null) {
+    if (code === ORACLE_STALE && staleWait) return { kind: "waiting", reason: `tag 87 ${staleWait}` };
     if (code === TAG87_NO_RESERVE) return { kind: "nothing", detail: "no insurance reserve available (Custom(53))" };
     if (code === TAG87_NOT_LIVE) return { kind: "skipped", reason: "market not Live (Custom(21)) — tag 87 is Live-only" };
     const blocked = TAG87_BLOCKED[code];
@@ -279,7 +285,8 @@ export function classifyStakeFeeError(err: unknown, logs: string[] | null): FeeJ
   }
   const where = ie ? (ie.index === 1 ? "tag 87" : ie.index === 2 ? "stake AccrueFees" : `ix ${ie.index}`) : "tx";
   const tail = logs?.filter((l) => /Error|failed|#290|AccrueFees/i.test(l)).slice(-2).join(" / ") ?? "";
-  return { kind: "failed", error: `${where} ${code !== null ? `Custom(${code})` : JSON.stringify(err)}${tail ? ` — ${tail}` : ""}` };
+  const codeText = code === null ? JSON.stringify(err) : ie?.index === 2 ? `Custom(${code})` : formatWrapperCode(code);
+  return { kind: "failed", error: `${where} ${codeText}${tail ? ` — ${tail}` : ""}` };
 }
 
 /** Parse "AccrueFees: accrued N fees" out of simulation/transaction logs. */
@@ -295,7 +302,9 @@ export function accruedFromLogs(logs: string[] | null): bigint | null {
 export type StakeFeeConnection = Pick<
   Connection,
   "getMultipleAccountsInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
->;
+> &
+  /** Read only when tag 87 answers OracleStale, to confirm the stale-resolve wait (R3.20). */
+  Partial<Pick<Connection, "getSlot">>;
 
 /** One market. Never throws. */
 export async function pushStakeFeesOnce(
@@ -388,7 +397,9 @@ export async function pushStakeFeesOnce(
       sigVerify: false,
       commitment: "confirmed",
     });
-    if (sim.value.err) return classifyStakeFeeError(sim.value.err, sim.value.logs ?? null);
+    if (sim.value.err) {
+      return classifyStakeFeeError(sim.value.err, sim.value.logs ?? null, await staleWaitFor(conn, sim.value.err, marketData));
+    }
     const simAccrued = accruedFromLogs(sim.value.logs ?? null);
 
     if (dryRun) {
@@ -405,14 +416,21 @@ export async function pushStakeFeesOnce(
       };
     }
     if (c.status === "failed") {
-      return classifyStakeFeeError(c.err, null);
+      return classifyStakeFeeError(c.err, null, await staleWaitFor(conn, c.err, marketData));
     }
     // Not landed: blockhash expired without a status. Retried next cycle; the
     // counters make a double push impossible (Custom(53) once drained).
     return { kind: "failed", error: `not landed: ${c.reason}` };
   } catch (err) {
-    return { kind: "failed", error: (err instanceof Error ? err.message : String(err)).slice(0, 160) };
+    return { kind: "failed", error: describeProgramError("stake-fee", err, 140) };
   }
+}
+
+/** `staleResolveWait` for a tag 87 refusal at instruction 1 (the slot is read only for a 27). */
+async function staleWaitFor(conn: StakeFeeConnection, err: unknown, marketData: Uint8Array): Promise<string | null> {
+  const ie = parseInstructionError(err);
+  if (!ie || ie.index !== 1 || ie.custom !== ORACLE_STALE) return null;
+  return staleResolveWait(ie.custom, marketData, await chainSlotOrNull(conn));
 }
 
 export function makeStakeFeeJob(cfg: StakeFeeConfig): FeeJob {
