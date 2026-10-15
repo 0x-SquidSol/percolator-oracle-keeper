@@ -446,6 +446,22 @@ export function pricingHealthStatus(
 
 // ── Health server ─────────────────────────────────────────────────────────────
 
+/**
+ * Labels of markets whose last crank-refresh health is "loss-stale", excluding terminal (Resolved / closed)
+ * markets: the cranker stops at a terminal market and never refreshes its cached health, so without this a
+ * market resolved while loss-stale stays listed (and /health stays degraded) forever (2026-10-15: swordcat,
+ * swordcat-c4 resolved by BandPinExpired during a keeper outage).
+ */
+export function lossStaleMarketLabels(
+  stats: ReadonlyMap<string, { label: string }>,
+  terminal: ReadonlySet<string> | undefined,
+  healthOf: (addr: string) => { status: string } | undefined,
+): string[] {
+  return [...stats.entries()]
+    .filter(([addr]) => !(terminal?.has(addr) ?? false) && healthOf(addr)?.status === "loss-stale")
+    .map(([addr, stat]) => stat.label || addr);
+}
+
 export function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
   return (req: http.IncomingMessage, res: http.ServerResponse): void => {
     if (req.url !== "/health" && req.url !== "/") {
@@ -490,9 +506,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
     }
-    const lossStaleMarkets = [...state.stats.entries()]
-      .filter(([addr]) => getCrankRefreshHealth(addr)?.status === "loss-stale")
-      .map(([addr, stat]) => stat.label || addr);
+    const lossStaleMarkets = lossStaleMarketLabels(state.stats, state.terminalMarkets, getCrankRefreshHealth);
     // Markets whose account the keeper cannot read (unknown stride / unsupported portfolio layout):
     // their portfolios are not being refreshed. Reported, never silently treated as a legacy market.
     const layoutProblemMarkets = [...state.stats.entries()]
