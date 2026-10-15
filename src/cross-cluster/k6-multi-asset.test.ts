@@ -551,13 +551,15 @@ describe("K-6 v2.2 delegate: a multi-asset market a window or more behind gets c
     assert.ok(r.logs.some((l) => /\[v22\]\[catchup\].*5 assets.*5 catch-up crank\(s\)/.test(l)), r.logs.join("\n"));
   });
 
-  it("inside one window: no catch-up, the paired round runs (counterparty accrue first, LP last)", async () => {
+  it("inside one window: no catch-up, the paired round is ONE atomic tx (counterparty observes all 5 assets, LP refreshed last)", async () => {
     const r = await delegate(row2xhs(), 120n);
     assert.equal(r.handled, true);
     assert.ok(!r.logs.some((l) => /\[v22\]\[catchup\]/.test(l)));
-    assert.ok(r.sims.length >= 2, r.logs.join("\n"));
-    assert.equal(r.sims[0].keys[0][2], TAKER, "phase 1: the counterparty's own observation crank");
-    assert.equal(r.sims[r.sims.length - 1].keys[0][2], LP, "the LP settles last");
+    assert.ok(r.sims.length >= 1, r.logs.join("\n"));
+    assert.equal(r.sent.length, 1, "MERGED_ROUND: one transaction");
+    assert.deepEqual(r.sent[0].tags, [CRANK_TAG, CRANK_TAG]);
+    assert.equal(r.sent[0].keys[0][2], TAKER, "the counterparty's observation crank first");
+    assert.equal(r.sent[0].keys[1][2], LP, "the LP settles last");
   });
 
   it("a single-asset row on the same lagged account keeps today's behaviour (no K-6 catch-up)", async () => {

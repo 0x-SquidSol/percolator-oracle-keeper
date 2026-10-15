@@ -35,6 +35,8 @@ export interface FakeConnOptions {
   simAccounts?: (ixs: SentTx, callIndex: number, addresses: string[]) => Array<Uint8Array | null> | undefined;
   /** Program logs a simulation returns (by decoded tx and call index). */
   simLogs?: (ixs: SentTx, callIndex: number) => string[];
+  /** Compute units a simulation reports (default 123,456). */
+  simUnitsConsumed?: (ixs: SentTx, callIndex: number) => number;
   slot?: () => number;
   landedSlot?: () => number;
   confirmStatus?: "ok" | "err";
@@ -49,6 +51,8 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
   const sent: Array<SentTx & { order: number }> = [];
   /** serialized byte length of each tx sent (parallel to `sent`). */
   const rawSizes: number[] = [];
+  /** instruction data of each tx sent (parallel to `sent`), compute-budget prelude excluded. */
+  const sentData: Uint8Array[][] = [];
   let order = 0;
   let sim = 0;
   let slot = 1000;
@@ -70,7 +74,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       const want = cfg?.accounts?.addresses;
       const post = want && o.simAccounts ? o.simAccounts(d, callIndex, want) : undefined;
       const accounts = post ? post.map((a) => (a ? { data: [Buffer.from(a).toString("base64"), "base64"], executable: false, lamports: 1, owner: "", rentEpoch: 0 } : null)) : undefined;
-      return { context: { slot: 1 }, value: { err: err ?? null, logs: o.simLogs ? o.simLogs(d, callIndex) : [], unitsConsumed: 123_456, ...(accounts ? { accounts } : {}) } };
+      return { context: { slot: 1 }, value: { err: err ?? null, logs: o.simLogs ? o.simLogs(d, callIndex) : [], unitsConsumed: o.simUnitsConsumed ? o.simUnitsConsumed(d, callIndex) : 123_456, ...(accounts ? { accounts } : {}) } };
     },
     async sendRawTransaction(raw: Uint8Array) {
       // decode the transaction actually being sent (phase-1 txs are simulated and sent concurrently)
@@ -78,6 +82,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       const t = Transaction.from(Buffer.from(raw));
       const ixs = t.instructions.slice(COMPUTE_IX_COUNT);
       const d: SentTx = { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.keys.map((k) => k.pubkey.toBase58())) };
+      sentData.push(ixs.map((i) => new Uint8Array(i.data)));
       sent.push({ ...d, order: order++ });
       return `sig${sent.length}`;
     },
@@ -96,7 +101,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       return len * 7_000;
     },
   };
-  return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, simUnits, sent, rawSizes };
+  return { conn: conn as unknown as ExecConnection & { getSlot(): Promise<number> }, sims, simUnits, sent, rawSizes, sentData };
 }
 
 export function execCtx(conn: ExecConnection, dryRun = false): ExecContext {

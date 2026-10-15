@@ -25,9 +25,11 @@
  * failed with Custom(22) on its accrue crank (a parallel tx accrued the same slot) is treated as "already
  * accrued" and re-sent refresh-only.
  */
+import { ComputeBudgetProgram, Transaction } from "@solana/web3.js";
 import type { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { parsePortfolioV17 } from "@percolatorct/sdk";
-import { buildObservationCrankIx, buildRefreshCrankIx, riskSnapOf } from "../positioned-refresh.ts";
+import { buildObservationCrankIx, buildRefreshCrankIx, parseInstructionError, riskSnapOf } from "../positioned-refresh.ts";
+import { isMultiAssetMarket } from "../multi-asset.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { MarketLayout } from "../market-layout.ts";
 import {
@@ -37,7 +39,7 @@ import {
 import type { FlaggedAccount, MarginParams } from "./liquidation.ts";
 import { holdPushes as realHold, releasePushes as realRelease } from "../refresh-coordination.ts";
 import { BAND_EXPECTED_CODES } from "./errors.ts";
-import { simulateAndSend, simulateOnly } from "./exec.ts";
+import { COMPUTE_IX_COUNT, simulateAndSend, simulateOnly } from "./exec.ts";
 import type { ExecContext, ExecOptions, ExecOutcome } from "./exec.ts";
 import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, legAwareTxUnits, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
@@ -146,6 +148,10 @@ export interface PairingStats {
   liqDeferred: number;
   /** F1: the extended tx failed as a whole (compute, an unrelated refusal, a landed failure): liquidation was skipped and the plain refresh went out. */
   liqSkipped: number;
+  /** MERGED_ROUND: multi-asset rounds sent as ONE atomic tx; rounds that fell back to the phased plan; cranks dropped as already current (22). */
+  mergedRounds: number;
+  mergedFallbacks: number;
+  mergedDroppedCurrent: number;
 }
 
 const zeroStats = (): PairingStats => ({
@@ -154,6 +160,7 @@ const zeroStats = (): PairingStats => ({
   lastGapSlots: null, maxGapSlots: 0, bandExpected: 0, prunedCurrent: 0, hardRefusals: 0, quarantinedNow: 0,
   anchorAccrues: 0, anchorFallbacks: 0, quarantineCapped: 0, deferralEscalations: 0, lpTimeBoundRounds: 0, counterpartyAccrues: 0, accrueAlreadyDone: 0, protectiveRounds: 0, rentSettlesInRound: 0, shrinkDeferrals: 0,
   feeAfterRound: 0, feeUnpairedLpSettles: 0, liqIncluded: 0, liqLanded: 0, liqNothingToDo: 0, liqRefused: 0, liqDeferred: 0, liqSkipped: 0,
+  mergedRounds: 0, mergedFallbacks: 0, mergedDroppedCurrent: 0,
 });
 
 export const pairingStats: PairingStats = zeroStats();
@@ -280,9 +287,17 @@ export function buildSweepTxSlots(owner: PublicKey, market: PublicKey, tx: Build
     slots.push({ ix: buildObservationCrankIx(owner, market, tx.accrueTarget, tx.oracleAccounts ?? []), kind: "accrue", key: k });
     if (tx.accrue === "counterparty" && liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, tx.accrueTarget), kind: "liq", key: k });
   }
+  // MULTI-ASSET: a hint-less crank is valid ONLY in the same tx/slot as an observing crank. In a LATER slot it accrues just the
+  // portfolio's first leg's asset and advances the market clock, which makes every other exposed asset loss-stale. So an
+  // `accrue: "none"` tx (the "accrue answered 22, re-send refresh-only" path) never starts with a hint-less crank on a multi-asset
+  // market: its FIRST crank is an observing one carrying a hint for every listed asset. Single-asset markets are unchanged.
+  const firstObserves = tx.accrue === "none" && isMultiAssetMarket(market.toBase58());
+  let first = true;
   for (const p of tx.refresh) {
     const k = p.pubkey.toBase58();
-    slots.push({ ix: buildRefreshCrankIx(owner, market, p.pubkey), kind: "refresh", key: k });
+    const observe = firstObserves && first;
+    first = false;
+    slots.push({ ix: observe ? buildObservationCrankIx(owner, market, p.pubkey, tx.oracleAccounts ?? []) : buildRefreshCrankIx(owner, market, p.pubkey), kind: "refresh", key: k });
     if (liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, p.pubkey), kind: "liq", key: k });
   }
   for (const t of tx.tail ?? []) slots.push({ ix: t, kind: "tail", key: null });
@@ -630,6 +645,9 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
       }
       return fail(outcome);
     }
+    // Multi-asset refresh-only tx: its first crank observes (see buildSweepTxSlots). Custom(22) there means the market clock is
+    // already current in this slot, NOT that the portfolio is current: nothing is pruned or counted settled; try next tick.
+    if (!hasAccrue && idx === 0 && refused.code === NON_PROGRESS && isMultiAssetMarket(ctx.market.toBase58())) return fail(outcome);
     const refreshIdx = hasAccrue ? idx - 1 : idx;
     const victim = refresh[refreshIdx];
     if (!victim) return fail(outcome); // a refusal on the tail instruction (e.g. 78): the caller classifies it
@@ -649,6 +667,90 @@ function dropAccrue(t: PlannedTx, accrue: PlannedTx["accrue"], target: PublicKey
   if (target && (accrue === "lp" || accrue === "counterparty")) r = [{ pubkey: target, longLegs: 0, shortLegs: 0, isLp: accrue === "lp" }, ...refresh];
   void t;
   return { accrue: "none" as PlannedTx["accrue"], target: null as PublicKey | null, refresh: r };
+}
+
+// ── MERGED_ROUND (multi-asset markets) ─────────────────────────────────────────────────────────────────────────────
+/**
+ * On a multi-asset market every observing crank accrues EVERY listed asset; when a mark moved, the accrual re-stales every
+ * positioned portfolio. Two txs a few slots apart (counterparty obs, then LP obs) therefore leave the market almost never
+ * all-settled: tx B's accrual re-stales what tx A settled, and a fresh open is refused Custom(121) EngineLossStale. The paired
+ * round is thus sent as ONE atomic tx when it fits:
+ *   [ObsCrank(first counterparty, hints = every listed asset), refresh-only crank(each other counterparty), refresh-only crank(LP) LAST]
+ * Refresh-only is valid because it shares the tx/slot with the observing crank. The LP (>= 3 legs needs a health cert at the
+ * current risk epoch) is refreshed last. Accepted only if the simulation is clean and <= MERGED_MAX_CU (the F1 10% line below
+ * the 1.4M limit); a crank refused Custom(22) (already current) is dropped and the tx re-simulated; anything else falls back to the
+ * unchanged phased plan. Measured on a LiteSVM clone of 2xhs: [GV86 obs all 385,907 + LP refresh-only 549,894] = 936,149 CU.
+ */
+export const MERGED_MAX_CU = 1_260_000;
+const PACKET_LIMIT = 1_232;
+
+export interface MergedSlot {
+  ix: TransactionInstruction;
+  key: string;
+  role: "observe" | "refresh" | "lp";
+}
+
+/** [observing crank on cps[0], hint-less refresh of cps[1..], hint-less refresh of the LP LAST]. `cps` must not be empty. */
+export function buildMergedRoundSlots(owner: PublicKey, market: PublicKey, cps: ReadonlyArray<PublicKey>, lp: PublicKey, oracleAccounts: ReadonlyArray<PublicKey> = []): MergedSlot[] {
+  const slots: MergedSlot[] = [];
+  cps.forEach((c, i) => {
+    slots.push(i === 0 ? { ix: buildObservationCrankIx(owner, market, c, oracleAccounts), key: c.toBase58(), role: "observe" } : { ix: buildRefreshCrankIx(owner, market, c), key: c.toBase58(), role: "refresh" });
+  });
+  slots.push({ ix: buildRefreshCrankIx(owner, market, lp), key: lp.toBase58(), role: "lp" });
+  return slots;
+}
+
+type MergedResult =
+  | { kind: "done"; outcome: ExecOutcome; settled: string[]; lpSettled: boolean }
+  | { kind: "unlanded"; outcome: ExecOutcome }
+  | { kind: "fallback"; why: string };
+
+function packetFits(owner: PublicKey, ixs: ReadonlyArray<TransactionInstruction>): boolean {
+  try {
+    const t = new Transaction({ feePayer: owner, recentBlockhash: "11111111111111111111111111111111" });
+    t.add(ComputeBudgetProgram.requestHeapFrame({ bytes: 131_072 }), ComputeBudgetProgram.setComputeUnitLimit({ units: SWEEP_TX_UNITS }));
+    for (const i of ixs) t.add(i);
+    return t.serialize({ requireAllSignatures: false, verifySignatures: false }).length + 64 <= PACKET_LIMIT;
+  } catch {
+    return false;
+  }
+}
+
+/** Simulate (dropping Custom(22) cranks), gate on CU and size, then send. Never throws. Nothing is sent unless it returns `done` / `unlanded`. */
+async function runMergedRound(deps: SweepDeps, ctx: { market: PublicKey; label: string }, cps: ReadonlyArray<PublicKey>, lp: PublicKey, oracleAccounts: ReadonlyArray<PublicKey> | undefined): Promise<MergedResult> {
+  const owner = deps.exec.keeper.publicKey;
+  try {
+    let slots = buildMergedRoundSlots(owner, ctx.market, cps, lp, oracleAccounts ?? []);
+    const dropped: string[] = [];
+    for (let attempt = 0; attempt <= SWEEP_MAX_PRUNES; attempt++) {
+      const ixs = slots.map((s) => s.ix);
+      if (!packetFits(owner, ixs)) return { kind: "fallback", why: `${ixs.length} cranks do not fit one packet` };
+      const sim = await simulateOnly(deps.exec, ixs, { units: SWEEP_TX_UNITS });
+      if (sim.err) {
+        const ie = parseInstructionError(sim.err);
+        const idx = ie ? ie.index - COMPUTE_IX_COUNT : -1;
+        // Custom(22) on a non-observing crank = that portfolio is already current: drop it, re-simulate. On the observing crank
+        // (idx 0) it means the clock is already current this slot: the phased plan handles that (never a hint-less lone crank).
+        if (sim.code === NON_PROGRESS && idx > 0 && idx < slots.length) {
+          dropped.push(slots[idx].key);
+          pairingStats.mergedDroppedCurrent++;
+          slots = slots.filter((_, i) => i !== idx);
+          continue;
+        }
+        return { kind: "fallback", why: `simulation refused (${sim.code !== null ? `Custom(${sim.code})` : "no program code"}) at crank ${idx}` };
+      }
+      if (sim.unitsConsumed === null || sim.unitsConsumed > MERGED_MAX_CU) return { kind: "fallback", why: `simulated ${sim.unitsConsumed ?? "n/a"} CU > ${MERGED_MAX_CU}` };
+      const out = await simulateAndSend(deps.exec, ixs, { job: "sweep", label: ctx.label, units: SWEEP_TX_UNITS, expected: BAND_EXPECTED_CODES });
+      if (out.kind === "refused" || out.kind === "failed" || out.kind === "held") return { kind: "fallback", why: `send-time simulation: ${out.kind}` };
+      if ((out.kind === "sent" && out.landed === "landed") || out.kind === "dry-run") {
+        return { kind: "done", outcome: out, settled: [...slots.map((s) => s.key), ...dropped], lpSettled: slots.some((s) => s.role === "lp") || dropped.includes(lp.toBase58()) };
+      }
+      return { kind: "unlanded", outcome: out };
+    }
+    return { kind: "fallback", why: "prune budget exhausted" };
+  } catch (err) {
+    return { kind: "fallback", why: `error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 120) };
+  }
 }
 
 /**
@@ -789,6 +891,66 @@ export async function runSettleRound(
         else res.missing.push({ key: k, why: "unlanded" });
       }
     };
+    const runRent = async (): Promise<void> => {
+      // Phase 3: rent. Only after the LP settled, only for portfolios this round already refreshed with the PLAIN crank
+      // (so a liquidatable / B-stale counterparty was handled by the engine's own action choice), one tx each, sequentially
+      // (tag 106 write-locks the LP, so these must not run in parallel with anything else).
+      if (res.lpSettled && input.rent && input.rent.due.size > 0) {
+        const settled = new Set(res.settled);
+        let n = 0;
+        for (const c of input.counterparties) {
+          const k = c.pubkey.toBase58();
+          if (n >= (input.rent.max ?? RENT_SETTLES_PER_ROUND)) break;
+          if (!input.rent.due.has(k) || !settled.has(k)) continue;
+          n++;
+          const out = await simulateAndSend(deps.exec, [input.rent.build(c)], { job: "rent-106", label: ctx.label, units: legAwareTxUnits(c, 600_000), expected: BAND_EXPECTED_CODES });
+          res.outcomes.push(out);
+          if ((out.kind === "sent" && out.landed === "landed") || out.kind === "dry-run") {
+            res.rentSettled.push(k);
+            pairingStats.rentSettlesInRound++;
+          }
+        }
+      }
+    };
+    // MERGED_ROUND: a multi-asset paired round goes out as ONE atomic tx when it fits (see runMergedRound); else the phased plan below.
+    const lpTxFinal = plan.lpTxIndex !== null ? plan.txs[plan.lpTxIndex] : null;
+    if (
+      plan.txs.length > 1 && plan.paired && !plan.lpDeferred && plan.unvisited.length === 0 && !protective && cfg.pairing !== "off" &&
+      lpTxFinal !== null && plan.lpTxIndex === plan.txs.length - 1 && stageA.candidates.size === 0 && isMultiAssetMarket(marketKey) && lpHold([]) === null
+    ) {
+      const cpKeys: PublicKey[] = [];
+      for (const t of plan.txs) {
+        if (t.accrue === "counterparty" && t.accrueTarget) cpKeys.push(t.accrueTarget);
+        for (const r of t.refresh) cpKeys.push(r.pubkey);
+      }
+      if (cpKeys.length > 0) {
+        const m = await runMergedRound(deps, ctx, cpKeys, input.lp, input.oracleAccounts);
+        if (m.kind === "done") {
+          res.outcomes.push(m.outcome);
+          if (m.outcome.kind === "sent") res.txsSent++;
+          res.settled.push(...m.settled);
+          for (const k of m.settled) deferrals.delete(k);
+          res.lpSettled = m.lpSettled;
+          pairingStats.mergedRounds++;
+          if (m.lpSettled) {
+            pairingStats.pairedLpSettles++;
+            pairingStats.consecutiveGapExceeded = 0;
+            if (backoff) backoff.level = 0;
+          }
+          await runRent();
+          return res;
+        }
+        if (m.kind === "unlanded") {
+          // sent but not confirmed landed: it may still land, so the phased plan is NOT also sent
+          res.outcomes.push(m.outcome);
+          res.txsSent++;
+          res.abandoned = "merged round tx did not land";
+          return res;
+        }
+        pairingStats.mergedFallbacks++;
+        (deps.exec.log ?? ((l: string) => console.log(l)))(`[v22][merged] ${ctx.label}: ${m.why}; phased plan`);
+      }
+    }
     const lpIsInPhase1 = plan.lpTxIndex !== null && phase1.includes(plan.lpTxIndex);
     const run = (i: number) => runPlannedTx(deps, ctx, plan.txs[i], runOpts(plan.txs[i].settlesLp));
 
@@ -860,25 +1022,7 @@ export async function runSettleRound(
       backoff.level = 0;
     }
 
-    // Phase 3: rent. Only after the LP settled, only for portfolios this round already refreshed with the PLAIN crank
-    // (so a liquidatable / B-stale counterparty was handled by the engine's own action choice), one tx each, sequentially
-    // (tag 106 write-locks the LP, so these must not run in parallel with anything else).
-    if (res.lpSettled && input.rent && input.rent.due.size > 0) {
-      const settled = new Set(res.settled);
-      let n = 0;
-      for (const c of input.counterparties) {
-        const k = c.pubkey.toBase58();
-        if (n >= (input.rent.max ?? RENT_SETTLES_PER_ROUND)) break;
-        if (!input.rent.due.has(k) || !settled.has(k)) continue;
-        n++;
-        const out = await simulateAndSend(deps.exec, [input.rent.build(c)], { job: "rent-106", label: ctx.label, units: legAwareTxUnits(c, 600_000), expected: BAND_EXPECTED_CODES });
-        res.outcomes.push(out);
-        if ((out.kind === "sent" && out.landed === "landed") || out.kind === "dry-run") {
-          res.rentSettled.push(k);
-          pairingStats.rentSettlesInRound++;
-        }
-      }
-    }
+    await runRent();
     return res;
   } catch (err) {
     res.abandoned = `round failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 160);
