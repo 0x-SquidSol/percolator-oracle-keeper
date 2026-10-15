@@ -397,7 +397,7 @@ export class V22Loop {
   private recordRound(ctx: V22MarketCtx, r: MarketRuntime, res: RoundResult, positioned: V22Positioned, protective: boolean): void {
     const misses = res.missing.filter((m) => m.why !== "current");
     r.lastRound = { paired: res.plan.paired && misses.length === 0, txs: res.plan.txs.length, lpSettled: res.lpSettled, gapSlots: res.gapSlots, abandoned: res.abandoned, settled: res.settled.length, missing: misses.length, protective, at: this.now() };
-    const summary = `${r.lastRound.paired ? "PAIRED" : "UNPAIRED"}${protective ? " (protective)" : ""} ${res.plan.txs.length} tx(s), lp ${res.lpSettled ? "settled" : res.plan.lpDeferred ? "deferred (strict)" : "not settled"}, settled ${res.settled.length}/${positioned.counterparties.length} counterparties, missing ${misses.length}, pruned ${res.pruned}${res.gapSlots !== null ? `, gap ${res.gapSlots} slots` : ""}${res.abandoned ? `, ${res.abandoned}` : ""}${res.liq.length > 0 ? `, liq ${res.liq.map((l) => l.result).join("/")}` : ""}`;
+    const summary = `${r.lastRound.paired ? "PAIRED" : "UNPAIRED"}${protective ? " (protective)" : ""} ${res.merged ? `MERGED 1 tx (phased plan was ${res.plan.txs.length})` : `${res.plan.txs.length} tx(s)`}, lp ${res.lpSettled ? "settled" : res.plan.lpDeferred ? "deferred (strict)" : "not settled"}, settled ${res.settled.length}/${positioned.counterparties.length} counterparties, missing ${misses.length}, pruned ${res.pruned}${res.gapSlots !== null ? `, gap ${res.gapSlots} slots` : ""}${res.abandoned ? `, ${res.abandoned}` : ""}${res.liq.length > 0 ? `, liq ${res.liq.map((l) => l.result).join("/")}` : ""}`;
     this.log(`[v22][sweep] ${ctx.label}: ${summary}`);
   }
 

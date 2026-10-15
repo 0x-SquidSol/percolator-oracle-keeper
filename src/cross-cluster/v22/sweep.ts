@@ -252,6 +252,8 @@ export interface RoundResult {
   lpSettled: boolean;
   gapSlots: number | null;
   abandoned: string | null;
+  /** The round went out as ONE merged tx (MERGED_ROUND); `plan` still describes the phased plan it replaced. */
+  merged?: boolean;
   outcomes: ExecOutcome[];
   /** F1: every liquidation-crank attempt of the round. */
   liq: LiqRecord[];
@@ -753,6 +755,19 @@ async function runMergedRound(deps: SweepDeps, ctx: { market: PublicKey; label: 
   }
 }
 
+/** Debug line when a multi-asset market skips the merged path: at most one per market per 60 s (and again at once when the reason changes). */
+const mergedSkipLog = new Map<string, { at: number; why: string }>();
+export const MERGED_SKIP_LOG_MS = 60_000;
+export function resetMergedSkipLog(): void {
+  mergedSkipLog.clear();
+}
+function logMergedSkip(deps: SweepDeps, market: string, label: string, why: string, now: number = Date.now()): void {
+  const prev = mergedSkipLog.get(market);
+  if (prev && prev.why === why && now - prev.at < MERGED_SKIP_LOG_MS) return;
+  mergedSkipLog.set(market, { at: now, why });
+  (deps.exec.log ?? ((l: string) => console.log(l)))(`[v22][merged] ${label}: merged round skipped, phased plan: ${why}`);
+}
+
 /**
  * Plan and execute one round for one market. `counterparties` excludes the LP. Never throws.
  */
@@ -913,11 +928,21 @@ export async function runSettleRound(
       }
     };
     // MERGED_ROUND: a multi-asset paired round goes out as ONE atomic tx when it fits (see runMergedRound); else the phased plan below.
-    const lpTxFinal = plan.lpTxIndex !== null ? plan.txs[plan.lpTxIndex] : null;
-    if (
-      plan.txs.length > 1 && plan.paired && !plan.lpDeferred && plan.unvisited.length === 0 && !protective && cfg.pairing !== "off" &&
-      lpTxFinal !== null && plan.lpTxIndex === plan.txs.length - 1 && stageA.candidates.size === 0 && isMultiAssetMarket(marketKey) && lpHold([]) === null
-    ) {
+    const mergedSkip = (): string | null => {
+      if (!isMultiAssetMarket(marketKey)) return null; // single-asset: not a merge candidate, never logged
+      if (plan.txs.length <= 1) return null; // already one tx
+      if (cfg.pairing === "off") return "pairing off";
+      if (protective) return "protective round";
+      if (!plan.paired || plan.lpDeferred || plan.unvisited.length > 0) return `plan not fully paired (${plan.unvisited.length} unvisited${plan.lpDeferred ? ", LP deferred" : ""})`;
+      if (plan.lpTxIndex === null || plan.lpTxIndex !== plan.txs.length - 1) return "LP is not the last planned tx";
+      if (stageA.candidates.size > 0) return `${stageA.candidates.size} liquidation candidate(s) in the round`;
+      const h = lpHold([]);
+      if (h) return `LP hold: ${h}`;
+      return null;
+    };
+    const skip = mergedSkip();
+    if (skip !== null) logMergedSkip(deps, marketKey, ctx.label, skip);
+    if (isMultiAssetMarket(marketKey) && plan.txs.length > 1 && skip === null) {
       const cpKeys: PublicKey[] = [];
       for (const t of plan.txs) {
         if (t.accrue === "counterparty" && t.accrueTarget) cpKeys.push(t.accrueTarget);
@@ -931,6 +956,7 @@ export async function runSettleRound(
           res.settled.push(...m.settled);
           for (const k of m.settled) deferrals.delete(k);
           res.lpSettled = m.lpSettled;
+          res.merged = true;
           pairingStats.mergedRounds++;
           if (m.lpSettled) {
             pairingStats.pairedLpSettles++;
@@ -948,7 +974,7 @@ export async function runSettleRound(
           return res;
         }
         pairingStats.mergedFallbacks++;
-        (deps.exec.log ?? ((l: string) => console.log(l)))(`[v22][merged] ${ctx.label}: ${m.why}; phased plan`);
+        logMergedSkip(deps, marketKey, ctx.label, m.why);
       }
     }
     const lpIsInPhase1 = plan.lpTxIndex !== null && phase1.includes(plan.lpTxIndex);

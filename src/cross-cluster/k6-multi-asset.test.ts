@@ -560,6 +560,8 @@ describe("K-6 v2.2 delegate: a multi-asset market a window or more behind gets c
     assert.deepEqual(r.sent[0].tags, [CRANK_TAG, CRANK_TAG]);
     assert.equal(r.sent[0].keys[0][2], TAKER, "the counterparty's observation crank first");
     assert.equal(r.sent[0].keys[1][2], LP, "the LP settles last");
+    // the sweep summary says what was SENT (one merged tx), not only what the phased plan would have been
+    assert.ok(r.logs.some((l) => /\[v22\]\[sweep\].*PAIRED MERGED 1 tx \(phased plan was 2\)/.test(l)), r.logs.join("\n"));
   });
 
   it("a single-asset row on the same lagged account keeps today's behaviour (no K-6 catch-up)", async () => {

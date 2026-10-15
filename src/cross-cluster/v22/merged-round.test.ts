@@ -14,7 +14,7 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import { encodePermissionlessCrank } from "@percolatorct/sdk";
 import type { MarketEntry } from "../registry.ts";
 import { bindObservationRegistry, resetMultiAssetState } from "../multi-asset.ts";
-import { DEFAULT_SWEEP_ROUND_CONFIG, MERGED_MAX_CU, buildSweepTxIxs, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
+import { DEFAULT_SWEEP_ROUND_CONFIG, MERGED_MAX_CU, resetMergedSkipLog, buildSweepTxIxs, pairingStats, resetPairingStats, runSettleRound } from "./sweep.ts";
 import type { RoundInput } from "./sweep.ts";
 import { resetJobCounters } from "./exec.ts";
 import { customAt, execCtx, fakeExecConn, key } from "./test-helpers.ts";
@@ -46,6 +46,7 @@ const eq = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b
 beforeEach(() => {
   resetPairingStats();
   resetJobCounters();
+  resetMergedSkipLog();
   bindObservationRegistry(() => [row2xhs()]);
 });
 afterEach(() => resetMultiAssetState());
@@ -226,5 +227,44 @@ describe("MERGED_ROUND: single-asset markets are byte-identical", () => {
     const lp = buildSweepTxIxs(owner, MARKET, { accrue: "lp", accrueTarget: LP, refresh: [cp(GV86)] });
     assert.ok(eq(lp[0].data, HINT0));
     assert.ok(eq(lp[1].data, NO_HINT));
+  });
+});
+
+describe("MERGED_ROUND: a skip is never silent (rate-limited debug line with the reason)", () => {
+  const lines = (f: ReturnType<typeof fakeExecConn>, extra: Partial<RoundInput> = {}) => {
+    const out: string[] = [];
+    const d = deps(f.conn);
+    d.exec.log = (l) => out.push(l);
+    return { out, go: () => runSettleRound(d, { market: MARKET, label: "2xhs" }, { ...input([cp(GV86)]), ...extra }, DEFAULT_SWEEP_ROUND_CONFIG) };
+  };
+
+  it("protective round: reason logged ONCE across repeated cycles, not once per cycle", async () => {
+    const f = fakeExecConn();
+    const { out, go } = lines(f, { protective: true });
+    await go();
+    await go();
+    await go();
+    const merged = out.filter((l) => l.includes("[v22][merged]"));
+    assert.equal(merged.length, 1);
+    assert.match(merged[0], /protective round/);
+    assert.equal(pairingStats.mergedRounds, 0);
+  });
+
+  it("a CU fallback is logged with its reason", async () => {
+    const f = fakeExecConn({ simUnitsConsumed: () => 1_300_000 });
+    const { out, go } = lines(f);
+    await go();
+    assert.ok(out.some((l) => /\[v22\]\[merged\].*1300000 CU > 1260000/.test(l)), out.join("\n"));
+  });
+
+  it("a merged round logs nothing as skipped, and single-asset markets never log", async () => {
+    const f = fakeExecConn();
+    const a = lines(f);
+    await a.go();
+    assert.equal(a.out.filter((l) => l.includes("[v22][merged]")).length, 0);
+    bindObservationRegistry(() => [SINGLE_ROW]);
+    const b = lines(fakeExecConn());
+    await b.go();
+    assert.equal(b.out.filter((l) => l.includes("[v22][merged]")).length, 0);
   });
 });
