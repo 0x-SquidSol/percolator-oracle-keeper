@@ -583,3 +583,79 @@ describe("K-6 registry hot-reload", () => {
     assert.equal(registry.markets.length, 2);
   });
 });
+
+// ── R3.22b: the 2xhs flap (delegate backs off -> legacy layout alert, AlreadyProcessed counted as a revert) ──────────
+describe("R3.22b: a v2.2 market the v2.2 layer owns never reaches the legacy layout check", () => {
+  async function cycle(o: { delegate: boolean; simErrs: unknown[] }) {
+    const { crankOneMarket, freshCrankMarketState } = await import("./recovery-cranker.ts");
+    const { setSweepDelegate } = await import("./v22/delegation.ts");
+    const { getLayoutProblemCounts, getCrankRefreshHealth } = await import("./refresh-coordination.ts");
+    const { invalidateBlockhash } = await import("./blockhash-cache.ts");
+    bindObservationRegistry(() => [row2xhs()]);
+    const market = fx("k6-2xhs-market-v22");
+    const slot = Number(decodeMarketRefreshState(market).currentSlot) + 30; // inside one window
+    const sims: Array<{ hints: number[]; n: number }> = [];
+    let sent = 0;
+    let delegateCalls = 0;
+    const conn = {
+      async getLatestBlockhash() {
+        return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
+      },
+      async simulateTransaction(tx: { message: { compiledInstructions: Array<{ data: Uint8Array }> } }) {
+        const cranks = tx.message.compiledInstructions.filter((i) => i.data[0] === CRANK_TAG);
+        sims.push({ n: cranks.length, hints: cranks.map((i) => i.data[9]) });
+        const err = o.simErrs.length > 0 ? o.simErrs.shift() : null;
+        return { context: { slot }, value: { err, logs: [], accounts: [] } };
+      },
+      async sendRawTransaction() {
+        sent++;
+        return `sig${sent}`;
+      },
+    };
+    invalidateBlockhash(conn as never);
+    setSweepDelegate(o.delegate ? async () => { delegateCalls++; return false; } : null); // false = the round backed off
+    const state = freshCrankMarketState();
+    const before = getLayoutProblemCounts();
+    const prefetched = { value: { data: Buffer.from(market), owner: PublicKey.default, lamports: 1, executable: false }, context: { slot } };
+    const entry = { marketAddress: M2XHS, label: "2xhs", lpPortfolio: LP };
+    try {
+      await crankOneMarket(conn as never, Keypair.generate(), entry, state, false, prefetched as never);
+      const first = { totalReverts: state.totalReverts, sent };
+      state.lastCrankSlot = null;
+      await crankOneMarket(conn as never, Keypair.generate(), entry, state, false, { ...prefetched, context: { slot: slot + 1 } } as never);
+      const after = getLayoutProblemCounts();
+      return { state, first, sims, sent, delegateCalls, newLayoutProblems: after.unknown + after.unsupported - (before.unknown + before.unsupported), health: getCrankRefreshHealth(M2XHS) };
+    } finally {
+      setSweepDelegate(null);
+    }
+  }
+
+  it("backed-off round + a duplicate (AlreadyProcessed) crank: no layout alert, no revert, accrual crank observes all 5 assets", async () => {
+    const r = await cycle({ delegate: true, simErrs: ["AlreadyProcessed"] });
+    assert.equal(r.delegateCalls, 2);
+    assert.equal(r.newLayoutProblems, 0, "no variant-B-on-legacy verdict");
+    assert.equal(r.state.lastLayoutProblem, null);
+    assert.equal(r.first.totalReverts, 0, "AlreadyProcessed is a duplicate of a landed tx, not a revert");
+    assert.equal(r.first.sent, 0);
+    assert.equal(r.state.totalReverts, 0);
+    assert.equal(r.state.consecutiveReverts, 0);
+    assert.equal(r.sent, 1, "the second cycle's clean accrual crank is sent");
+    // accrual only: observation cranks with 5 hints, never a no-observation (legacy refresh) crank
+    for (const s of r.sims) for (const h of s.hints) assert.equal(h, 5);
+    assert.ok(r.state.obs?.layout?.problem == null);
+    assert.equal(r.health?.layout?.problem ?? null, null, "the legacy path publishes no crank-health record over the v2.2 layer's");
+  });
+
+  it("isDuplicateOfLandedTx: only the runtime's AlreadyProcessed", async () => {
+    const { isDuplicateOfLandedTx } = await import("./recovery-cranker.ts");
+    assert.equal(isDuplicateOfLandedTx("AlreadyProcessed"), true);
+    assert.equal(isDuplicateOfLandedTx({ AlreadyProcessed: null }), true);
+    for (const e of [null, "BlockhashNotFound", { InstructionError: [1, { Custom: 19 }] }, { InstructionError: [1, { Custom: 22 }] }]) assert.equal(isDuplicateOfLandedTx(e), false);
+  });
+
+  it("control: WITHOUT the v2.2 layer a variant-B market still gets the loud unsupported verdict (unchanged)", async () => {
+    const r = await cycle({ delegate: false, simErrs: [] });
+    assert.ok(r.newLayoutProblems > 0);
+    assert.match(r.state.lastLayoutProblem ?? "", /variant-B/);
+  });
+});

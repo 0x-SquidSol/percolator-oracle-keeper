@@ -638,7 +638,16 @@ export async function crankOneMarket(
     // v2.2 (KEEPER_V22_SWEEP): the v2.2 layer owns the positioned-refresh sweep of a variant-B market. No delegate is
     // installed unless the flags are on, so every other market (and every market with the flags off) skips this.
     const sweepDelegate = getSweepDelegate();
-    if (sweepDelegate && detection.known && detection.layout.id === "v2.2-b") {
+    /**
+     * R3.22b: the v2.2 layer is installed and this is a variant-B market, so the v2.2 layer OWNS it. When its delegate
+     * declines a cycle (a gap backoff after a split round, an unreadable positioned set, ...), this path only keeps the
+     * engine clock moving: accrual crank (observing every asset), no legacy refresh / sweep, no layout verdict, and no
+     * crank-health record (the v2.2 layer publishes that). It used to fall through to the legacy layout check and raise
+     * "variant-B market on the legacy cranker" every time 2xhs backed off (flapping layoutProblemMarkets).
+     * Without the v2.2 layer (no delegate) a variant-B market still gets the loud "unsupported" verdict, as before.
+     */
+    const v22Owned = sweepDelegate !== null && detection.known && detection.layout.id === "v2.2-b";
+    if (v22Owned) {
       const handled = await sweepDelegate({ conn: devnetConn, keeper, entry, marketData: acct.value.data, slot: acct.context.slot, dryRun });
       if (handled) return;
     }
@@ -654,20 +663,20 @@ export async function crankOneMarket(
         }
       }
     }
-    const layoutHealth = layoutHealthFor(detection, pre);
+    const layoutHealth = v22Owned ? v22OwnedLayoutHealth(detection, pre) : layoutHealthFor(detection, pre);
     if (layoutHealth.problem) noteLayoutProblem(label, marketAddress, state, layoutHealth);
     else state.lastLayoutProblem = null;
     /** The keeper's other v2.1 decoders (liveness repairs, ADL) only read v2.1-compatible headers. */
     const v21Decoders = detection.known && detection.layout.v21Decoders;
     const catchup = pre ? catchupCrankCount(BigInt(acct.context.slot) - pre.slotLast, pre.maxAccrualDtSlots) : 0;
-    const positionedAll = pre && !layoutHealth.problem && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
+    const positionedAll = pre && !v22Owned && !layoutHealth.problem && marketHasPositions(pre) && catchupAllowsRefresh(catchup)
       ? await positionedPortfoliosFor(devnetConn, market, label, pre, state)
       : [];
     // Drift-layout market (v21-funding-scale program): continuous round-robin sweep of
     // k portfolios per transaction instead of refreshing every positioned portfolio
     // in the accrual's slot. Legacy / unknown layout: sweepCtx stays null and the
     // cycle below is byte-for-byte the previous behaviour.
-    const sweepCtx = pre && !layoutHealth.problem ? sweepContextFor(acct.value.data, positionedAll, state, sweepCfg) : null;
+    const sweepCtx = pre && !v22Owned && !layoutHealth.problem ? sweepContextFor(acct.value.data, positionedAll, state, sweepCfg) : null;
     const targets = sweepCtx ? sweepCtx.firstBatch : positionedAll;
 
     // Liveness repairs (lapsed Fresh backing bucket, side stuck in ResetPending):
@@ -687,7 +696,7 @@ export async function crankOneMarket(
     const obs = observeMarket(acct.value.data, BigInt(acct.context.slot), pre, repairs, { skipAdl: !detection.known });
     obs.layout = layoutHealth;
     state.obs = obs;
-    if (pre || layoutHealth.problem) observed = obs;
+    if (!v22Owned && (pre || layoutHealth.problem)) observed = obs;
     if (sweepCtx) {
       // Until this cycle's cranks prove otherwise, the market is as the pre-crank read says.
       sweepBlocked = sweepCtx.coverage.blocksRiskIncrease;
@@ -798,6 +807,12 @@ export async function crankOneMarket(
       }
     }
 
+    if (resolved.sim.err && isDuplicateOfLandedTx(resolved.sim.err)) {
+      // R3.22b: "AlreadyProcessed" = this exact transaction (same cached blockhash, same instructions) already landed,
+      // i.e. the previous cycle's identical crank. Not a revert and not progress: counters untouched, nothing sent.
+      state.benignNoProgress++;
+      return;
+    }
     if (resolved.sim.err && isBenignNoProgress(resolved.sim.err, resolved.plan, pre, BigInt(acct.context.slot))) {
       // B7: EngineNonProgress on the accrual crank while the engine clock is already
       // current = nothing to accrue this slot (a duplicate crank). Not a revert, not
@@ -988,7 +1003,7 @@ export async function crankOneMarket(
       }
       state.lastOverflowSummary = ovSummary;
     }
-    if (!sweepCtx) reportRefreshOutcome(label, pre, resolved, state, finalPost);
+    if (!sweepCtx && !v22Owned) reportRefreshOutcome(label, pre, resolved, state, finalPost);
     postStale = finalPost;
   } catch (err) {
     state.totalErrors++;
@@ -1796,6 +1811,32 @@ export const NO_PROGRESS_CURRENT_SLOTS = 2n;
  * the loop's first cycle. Anything else (another code, a repair/liquidate/refresh
  * instruction, a clock that is behind) stays a real revert.
  */
+/**
+ * R3.22b: the simulation refused the tx as a duplicate of one that already landed ("AlreadyProcessed": the same
+ * message, i.e. same blockhash and instructions, was processed). Not a program revert.
+ */
+export function isDuplicateOfLandedTx(err: unknown): boolean {
+  if (err === "AlreadyProcessed") return true;
+  return typeof err === "object" && err !== null && "AlreadyProcessed" in err;
+}
+
+/** R3.22b: the layout verdict of a variant-B market the v2.2 layer owns (never a problem: the layer reads it). */
+export function v22OwnedLayoutHealth(
+  detection: LayoutDetection,
+  pre: Pick<MarketRefreshState, "storedPosLong" | "storedPosShort"> | null,
+): MarketLayoutHealth {
+  if (!detection.known) return layoutHealthFor(detection, pre);
+  const L = detection.layout;
+  return {
+    id: L.id,
+    problem: null,
+    kind: "ok",
+    accountLen: L.groupOff + L.headerLen + detection.slots * L.slotStride,
+    provisional: L.provisional,
+    hasPositions: pre ? pre.storedPosLong !== 0n || pre.storedPosShort !== 0n : null,
+  };
+}
+
 export function isBenignNoProgress(
   err: unknown,
   plan: Pick<CrankPlan, "cranks">,
