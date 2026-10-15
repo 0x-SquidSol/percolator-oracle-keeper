@@ -163,6 +163,7 @@ import { decodeLivenessState, describeRepair, planLivenessRepairs } from "./live
 import { adlHealth, adlHealthOf, decodeAdlState } from "./adl-state.ts";
 import type { AdlAssetHealth } from "./adl-state.ts";
 import { isTerminalMarket } from "./market-state.ts";
+import { recordPushDeadline } from "./push-deadline.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { isLockFamilyCode } from "./lock-codes.ts";
 import { isP2bSupported } from "./p2b-feature.ts";
@@ -610,6 +611,9 @@ export async function crankOneMarket(
       ? prefetched
       : await withRpcRetry(label, () => devnetConn.getAccountInfoAndContext(market, "processed"));
     if (!acct.value) throw new Error(`market ${marketAddress} could not find account`);
+    // R3.24: the push loop's view of this market's fail-closed deadlines (stale window, band pin) and terminal state.
+    // The boot crank runs this before the push loop's first cycle, so cycle 1 already knows whether withholding is safe.
+    recordPushDeadline(marketAddress, acct.value.data, BigInt(acct.context.slot));
     // B13 (E2E 2026-09-30): a Resolved market / CloseSlab tombstone is never
     // cranked again. The engine refuses it, and cranking only produced critical
     // crank-reverts + slot-lag alert noise. No observation is recorded, so any

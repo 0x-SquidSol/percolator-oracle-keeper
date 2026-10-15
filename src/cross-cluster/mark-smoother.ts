@@ -139,6 +139,19 @@ export interface MarkSmoother {
    * is still priming/re-priming and publishing would require a raw passthrough.
    */
   smooth(poolAddress: string, priceE6: bigint, nowMs: number): bigint | null;
+  /**
+   * R3.24 deadline bypass: the median of the samples ALREADY in the pool's window (no new sample, no span / count
+   * gate), or null when the window is empty. Only for a market whose on-chain fail-closed deadline is close
+   * (push-deadline.ts): there, withholding is no longer "stale but trusted", it is an irreversible resolve at a stale
+   * price, while a short-window median is still bounded by the circuit breaker, the band and the engine's step cap.
+   * Same even-count rule as `smooth` (a single sample is used as-is).
+   */
+  peek(poolAddress: string): bigint | null;
+  /**
+   * What the priming gate is waiting for (for /health): the samples and span the pool's window holds now, and what it
+   * needs. Read-only.
+   */
+  status(poolAddress: string): { samples: number; spanMs: number; minSamples: number; minSpanMs: number };
   /** Drop every window (tests / registry rebuilds). */
   reset(): void;
 }
@@ -204,6 +217,17 @@ export function createMarkSmoother(opts: MarkSmootherOptions = {}): MarkSmoother
       // balanced churn yields the stable midpoint (the fair price of a pool a
       // bot round-trips symmetrically).
       // (A single-sample window has nothing older to drop — use it as-is.)
+      const usable = win.length % 2 === 0 || win.length === 1 ? win : win.slice(1);
+      return medianE6(usable.map((s) => s.px));
+    },
+    status(poolAddress: string): { samples: number; spanMs: number; minSamples: number; minSpanMs: number } {
+      const win = windows.get(poolAddress) ?? [];
+      const spanMs = win.length > 1 ? win[win.length - 1].t - win[0].t : 0;
+      return { samples: win.length, spanMs, minSamples, minSpanMs };
+    },
+    peek(poolAddress: string): bigint | null {
+      const win = windows.get(poolAddress);
+      if (!win || win.length === 0) return null;
       const usable = win.length % 2 === 0 || win.length === 1 ? win : win.slice(1);
       return medianE6(usable.map((s) => s.px));
     },

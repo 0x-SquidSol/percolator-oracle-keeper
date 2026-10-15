@@ -77,7 +77,8 @@ export type AlertKind =
   | "p3-senior-backing-exhausted"
   | "hedged-lockout"
   | "earn-par-e3-gap"
-  | "pusher-takeover";
+  | "pusher-takeover"
+  | "band-pin-expiring";
 
 export interface Alert {
   kind: AlertKind;
@@ -125,6 +126,11 @@ export interface AlertThresholds {
   markLagPct: number;
   /** K-3: ms the raw pool price may stay bit-identical before a source-frozen warning. */
   sourceFrozenMs: number;
+  /**
+   * R3.24: alert when a LIVE band market's pin is within this many slots of `band_max_pin_slots` (BandPinExpired
+   * resolves it at that point, by anyone's crank). Default 4,500 = half the default Pmax of 9,000.
+   */
+  bandPinExpirySlots: number;
 }
 
 export const DEFAULT_THRESHOLDS: AlertThresholds = {
@@ -142,6 +148,7 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   markLagMs: 120_000,
   markLagPct: 10,
   sourceFrozenMs: 2 * 3_600_000,
+  bandPinExpirySlots: 4_500,
 };
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -173,6 +180,7 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     markLagMs: envInt(env, "ALERT_MARK_LAG_MS", DEFAULT_THRESHOLDS.markLagMs),
     markLagPct: envInt(env, "ALERT_MARK_LAG_PCT", DEFAULT_THRESHOLDS.markLagPct),
     sourceFrozenMs: envInt(env, "ALERT_SOURCE_FROZEN_MS", DEFAULT_THRESHOLDS.sourceFrozenMs),
+    bandPinExpirySlots: envInt(env, "ALERT_BAND_PIN_EXPIRY_SLOTS", DEFAULT_THRESHOLDS.bandPinExpirySlots),
   };
   if (t.slotLagCritical < t.slotLagWarn) {
     throw new Error("ALERT_SLOT_LAG_CRITICAL must be >= ALERT_SLOT_LAG_WARN");
@@ -552,6 +560,59 @@ export function evaluateMarketPush(
     });
   }
   return { status, active };
+}
+
+// ── Band pin approaching expiry (R3.24) ─────────────────────────────────────
+
+/** What the keeper knows about one market's band pin (push-deadline.ts) plus its push streak. */
+export interface BandPinSample {
+  label: string;
+  market: string;
+  /** Not Live (Resolved / closed / Recovery) or no longer registered: never alerted. */
+  terminal: boolean;
+  /** The pin closest to expiry; null = not pinned / not a band market / unknown. */
+  pin: { assetIndex: number; sinceSlot: bigint; durationSlots: bigint; maxPinSlots: bigint; remaining: bigint; expired: boolean } | null;
+  /** Consecutive push cycles without a landed push (0 = the last cycle landed one). */
+  noPushCycles: number;
+  lastPushAt: number | null;
+}
+
+/**
+ * R3.24: a live band market whose pin is within `bandPinExpirySlots` of `band_max_pin_slots`. At expiry ANY crank
+ * resolves the market (BandPinExpired, recovery_reason 8) at the stale P_last, irreversibly. A push does NOT reset the
+ * pin; only an accrual after the book is certified (every positioned leg refreshed this epoch) or a target back inside
+ * the band does. CRITICAL when no push has landed for the market (the keeper is not even keeping the oracle fresh, so
+ * its own certifying cranks may be refused), or when the pin already expired; WARN otherwise. Pure.
+ */
+export function evaluateBandPinExpiry(s: BandPinSample, t: AlertThresholds): Alert[] {
+  if (s.terminal || s.pin === null) return [];
+  const p = s.pin;
+  if (!p.expired && p.remaining > BigInt(t.bandPinExpirySlots)) return [];
+  const noPush = s.lastPushAt === null || s.noPushCycles > 0;
+  const severity: AlertSeverity = p.expired || noPush ? "critical" : "warn";
+  const what = p.expired
+    ? `band pin on asset ${p.assetIndex} EXPIRED (${p.durationSlots} > ${p.maxPinSlots} slots): the next crank by anyone resolves this market (BandPinExpired)`
+    : `band pin on asset ${p.assetIndex} expires in ${p.remaining} slots (pinned ${p.durationSlots}/${p.maxPinSlots})`;
+  return [
+    {
+      kind: "band-pin-expiring",
+      severity,
+      subject: s.label,
+      message:
+        `${what}; ${noPush ? "NO push has landed for it" : "pushes are landing"}. A push does not clear a pin: the book must be ` +
+        "certified (every positioned leg refreshed this epoch) so the anchor can advance, or the target must come back inside the band.",
+      data: {
+        market: s.market,
+        assetIndex: p.assetIndex,
+        pinSinceSlot: p.sinceSlot.toString(),
+        remainingSlots: p.remaining.toString(),
+        maxPinSlots: p.maxPinSlots.toString(),
+        expired: p.expired,
+        noPushCycles: s.noPushCycles,
+        lastPushAt: s.lastPushAt,
+      },
+    },
+  ];
 }
 
 // ── Sink: dedupe, cooldown, delivery ─────────────────────────────────────────

@@ -22,12 +22,13 @@ import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
+import type { MarkSmoother } from "./mark-smoother.ts";
 import { createTickPublisher, type TickPublisher, type TickInput } from "./tick-publisher.ts";
 import { checkCircuitBreaker, markGap, recordMarkInForce } from "../circuit-breaker.ts";
 import type { CircuitBreakerState } from "../circuit-breaker.ts";
 import { pushAuthMarkBatch, fetchOracleAuthority, getQuarantinedMarkets, pruneAuthMarkPusherState } from "./auth-mark-pusher.ts";
-import { evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
-import type { Alert, MarketPushSample } from "./alerting.ts";
+import { evaluateBandPinExpiry, evaluateMarketPush, evaluatePushCycle, getAlertSink } from "./alerting.ts";
+import type { Alert, BandPinSample, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
 import { v22HealthFields } from "./v22/health.ts";
@@ -42,6 +43,8 @@ import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth
 import { DEPTH_SOURCE_ONCHAIN_DEX, DepthSourceCache, pushDepthOnchainEnabled, type DexDepthPin } from "./depth-source.ts";
 import { WRAPPER_PROGRAM_ID as DEPTH_WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, pruneMarketAccrual } from "./multi-asset.ts";
+import { DEADLINE_FRESH_MS, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
+import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
 import { pushGenerationKey } from "./auth-mark-pusher.ts";
 
@@ -577,6 +580,8 @@ export function multiAssetMarketHealth(
       lastPriceE6: stat.lastPriceE6.toString(),
       lastPriceUsd: stat.lastPriceE6 > 0n ? (Number(stat.lastPriceE6) / 1e6).toFixed(4) : null,
       sourcePriceUsd: stat.sourcePriceE6 > 0n ? (Number(stat.sourcePriceE6) / 1e6).toString() : null,
+      // R3.24: the last RAW pool reading, so a unit the smoother is still withholding shows its pool is being read.
+      rawSourcePriceUsd: stat.lastRawPriceE6 > 0n ? (Number(stat.lastRawPriceE6) / 1e6).toString() : null,
       markGapPct: stat.markGap ? Number(stat.markGap.pct.toFixed(2)) : null,
       lastPushAgo: stat.lastPushAt !== null ? `${Math.floor((ctx.nowMs - stat.lastPushAt) / 1000)}s` : null,
       totalPushes: stat.totalPushes,
@@ -639,10 +644,14 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       const verdict = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, addr)), thresholds, nowMs);
       if (verdict.status === "no-push") noPushMarkets.push(stat.label || addr);
       if (verdict.active.some((a) => a.kind === "mark-lagging")) markLaggingMarkets.push(stat.label || addr);
+      // R3.24 (b): a terminal market reads "resolved" (or closed / recovery), never ok-with-a-stale-error.
+      const terminalStatus = terminalHealthStatus(state, addr);
       markets[addr] = {
-        status: verdict.status,
+        status: terminalStatus ?? verdict.status,
+        ...(terminalStatus ? { terminal: true } : {}),
         noPushCycles: stat.noPushCycles,
         sourcePriceUsd: stat.sourcePriceE6 > 0n ? (Number(stat.sourcePriceE6) / 1e6).toString() : null,
+        rawSourcePriceUsd: stat.lastRawPriceE6 > 0n ? (Number(stat.lastRawPriceE6) / 1e6).toString() : null,
         markGapPct: stat.markGap ? Number(stat.markGap.pct.toFixed(2)) : null,
         markGapAgo: stat.markGap ? `${Math.floor(stat.markGap.ageMs / 1000)}s` : null,
         sourceUnchangedFor:
@@ -660,7 +669,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         totalPushes: stat.totalPushes,
         totalErrors: stat.totalErrors,
         authorityMismatch: stat.authorityMismatch,
-        lastError: stat.lastErrorMsg,
+        lastError: terminalStatus ? null : stat.lastErrorMsg,
         depthE6: stat.lastDepthE6 === null ? null : stat.lastDepthE6.toString(),
         depthSource: stat.lastDepthSource,
         ...crankHealthFields(getCrankRefreshHealth(addr)),
@@ -679,7 +688,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       noPushMarkets.push(...h.noPush);
       markLaggingMarkets.push(...h.markLagging);
       accrualLaggingAssets.push(...h.accrualLagging);
-      markets[addr] = { ...h.row, ...crankHealthFields(getCrankRefreshHealth(addr)) };
+      const terminalStatus = terminalHealthStatus(state, addr);
+      markets[addr] = { ...h.row, ...(terminalStatus ? { status: terminalStatus, terminal: true } : {}), ...crankHealthFields(getCrankRefreshHealth(addr)) };
     }
     const lossStaleMarkets = lossStaleMarketLabels(marketLabels, state.terminalMarkets, getCrankRefreshHealth);
     // Markets whose account the keeper cannot read (unknown stride / unsupported portfolio layout):
@@ -805,6 +815,100 @@ const markSmoother = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
  * supplies extra digits for a price the e6 path already accepted (auth-mark-pusher.ts perLotMarkFromE12 guards that).
  */
 const markSmootherE12 = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
+/** /health lastError of a unit skipped because the cranker holds its market's pushes. */
+export const PUSH_HELD_MSG = "push held: cranker follow-up refreshes in flight for this market (auto-expires)";
+
+/**
+ * /health lastError while the smoother withholds: what the window holds vs what it needs, so a pool that can never
+ * prime (sampled too sparsely for the window) is visible as such instead of a generic "re-priming" forever. Keeps the
+ * historical prefix so existing log greps still match.
+ */
+export function primingMessage(st: { samples: number; spanMs: number; minSamples: number; minSpanMs: number }): string {
+  return (
+    `mark smoother re-priming — withholding push until minSamples (window holds ${st.samples} sample(s) over ` +
+    `${(st.spanMs / 1000).toFixed(1)} s; needs ${st.minSamples} over ${(st.minSpanMs / 1000).toFixed(1)} s)`
+  );
+}
+
+/** Pools whose last smooth() published (window primed). A pool not in here is priming / re-priming. */
+const primedPools = new Set<string>();
+
+/**
+ * R3.24: is this market terminal for the push loop? Either the pusher already reported it non-Live (state set), or a
+ * market read (cranker / deadline read) decoded it Resolved / closed / Recovery. The state set is kept in step.
+ */
+export function isTerminalForPush(state: Pick<LoopState, "terminalMarkets">, marketAddress: string): boolean {
+  if (state.terminalMarkets.has(marketAddress)) return true;
+  if (!isKnownTerminal(marketAddress)) return false;
+  state.terminalMarkets.add(marketAddress);
+  return true;
+}
+
+/**
+ * R3.24: markets that need a deadline read BEFORE this cycle's smoothing: pool-priced, not terminal, whose pool window
+ * is not primed (so the smoother may withhold), and with no deadline entry fresher than DEADLINE_FRESH_MS. After
+ * priming this is empty, so steady state costs no extra RPC.
+ */
+export function deadlineReadsNeeded(
+  units: ReadonlyArray<Pick<PriceUnit, "marketAddress" | "poolAddress" | "source">>,
+  terminal: ReadonlySet<string>,
+  primed: ReadonlySet<string>,
+  nowMs: number,
+): string[] {
+  const out = new Set<string>();
+  for (const u of units) {
+    if (u.source !== "pool" || primed.has(u.poolAddress)) continue;
+    if (terminal.has(u.marketAddress) || isKnownTerminal(u.marketAddress)) continue;
+    if (getPushDeadline(u.marketAddress, nowMs, DEADLINE_FRESH_MS) !== undefined) continue;
+    out.add(u.marketAddress);
+  }
+  return [...out];
+}
+
+/**
+ * R3.24 (a): the price to publish for a market whose smoother window is still priming, or null to keep withholding.
+ * Bypass only when the market is Live and one of its fail-closed deadlines is close (push-deadline.ts), and only with
+ * a price the window already holds. Unknown deadline = keep the priming gate (the anti-manipulation default).
+ */
+export function deadlineBypass(deadline: PushDeadline | undefined, windowMedianE6: bigint | null): { priceE6: bigint; reason: string } | null {
+  if (!deadline || deadline.terminal !== null || !deadline.urgent || windowMedianE6 === null || windowMedianE6 <= 0n) return null;
+  return { priceE6: windowMedianE6, reason: deadline.urgentReason ?? "a fail-closed deadline is close" };
+}
+
+/**
+ * R3.24: feed every live pool's reading of this cycle into the smoothers ONCE, before any per-unit skip (push hold,
+ * P3 withhold, authority latch). Fills `smoothed` / `smoothedE12` (pool -> published mark or null) and keeps `primed`
+ * in step. Terminal markets' pools are not sampled for them (another live market on the same pool still samples it).
+ */
+export function samplePoolsForCycle(
+  units: ReadonlyArray<Pick<PriceUnit, "marketAddress" | "poolAddress" | "source">>,
+  isTerminal: (marketAddress: string) => boolean,
+  prices: ReadonlyMap<string, bigint>,
+  pricesE12: ReadonlyMap<string, bigint>,
+  smoothers: { e6: Pick<MarkSmoother, "smooth">; e12: Pick<MarkSmoother, "smooth"> },
+  nowMs: number,
+  smoothed: Map<string, bigint | null>,
+  smoothedE12: Map<string, bigint | null>,
+  primed: Set<string>,
+): void {
+  for (const u of units) {
+    if (u.source !== "pool" || smoothed.has(u.poolAddress)) continue;
+    if (isTerminal(u.marketAddress)) continue;
+    const raw = prices.get(u.poolAddress);
+    if (raw === undefined || raw <= 0n) continue;
+    const px = smoothers.e6.smooth(u.poolAddress, raw, nowMs);
+    smoothed.set(u.poolAddress, px);
+    // Same sample, same instant, at e12 (the e6 value x 1e6 when the read produced no e12), so the two windows stay aligned.
+    smoothedE12.set(u.poolAddress, smoothers.e12.smooth(u.poolAddress, pricesE12.get(u.poolAddress) ?? raw * 1_000_000n, nowMs));
+    if (px === null) primed.delete(u.poolAddress);
+    else primed.add(u.poolAddress);
+  }
+}
+
+/** Test hook: forget which pools are primed (the smoothers themselves are module-private). */
+export function resetPrimedPools(): void {
+  primedPools.clear();
+}
 
 function parseCrossClusterPositiveNumberEnv(
   name: string,
@@ -1128,11 +1232,32 @@ async function runCycle(
   const smoothedThisCycle = new Map<string, bigint | null>();
   const smoothedE12ThisCycle = new Map<string, bigint | null>();
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
+  // R3.24: a market whose pool window is still priming would be withheld this cycle. Make sure its fail-closed
+  // deadlines (push-deadline.ts) are known before deciding that: one read for all such markets, only while priming.
+  await refreshPushDeadlines(devnetConn, deadlineReadsNeeded(units, state.terminalMarkets, primedPools, smoothNowMs));
+  // R3.24: sample EVERY live pool once per cycle, before any per-unit skip. The smoother used to be fed only on the
+  // cycles a unit reached it, so a pool whose only market was push-held most cycles (2xhs asset 2, cbBTC, 2026-10-15:
+  // 25 unheld cycles of 174, i.e. one sample per ~21 s against a 15 s window) never held 3 samples and re-primed
+  // forever, while its siblings' pools were kept primed by other markets. Withholding a push must not starve its window.
+  samplePoolsForCycle(units, (m) => isTerminalForPush(state, m), prices, pricesE12, { e6: markSmoother, e12: markSmootherE12 }, smoothNowMs, smoothedThisCycle, smoothedE12ThisCycle, primedPools);
   for (const entry of units) {
     if (notPushable.has(entry.key)) continue;
+    // R3.24 (b): a terminal market (Resolved / closed / Recovery) is never smoothed, breaker-checked or pushed again,
+    // and it stays terminal (resolution is one-way). It used to be re-discovered by the PUSHER every cycle, so a cycle
+    // in which the smoother or the breaker held it back dropped it from the terminal set and it alerted as no-push.
+    if (isTerminalForPush(state, entry.marketAddress)) {
+      const ts = state.stats.get(entry.key);
+      if (ts) ts.lastErrorMsg = null;
+      continue;
+    }
     // The cranker is landing follow-up refreshes for this market's current
     // accrual; a push now would void them (Custom(22)). Auto-expires.
-    if (isPushHeld(entry.marketAddress)) continue;
+    if (isPushHeld(entry.marketAddress)) {
+      // R3.24: say so. This skip was silent, so a market held most cycles showed only an unrelated stale lastError.
+      const hs = state.stats.get(entry.key);
+      if (hs) hs.lastErrorMsg = PUSH_HELD_MSG;
+      continue;
+    }
     if (withheldFromPush(entry.marketAddress, config.withholdPush)) {
       const ws = state.stats.get(entry.key);
       if (ws) ws.lastErrorMsg = "push withheld: P3 senior backing exhausted, waiting for the tag 39 stale window";
@@ -1174,11 +1299,22 @@ async function runCycle(
       smoothedThisCycle.set(entry.poolAddress, priceE6);
       // Same sample, same instant, at e12 (the e6 value x 1e6 when the read produced no e12), so the two windows stay aligned.
       smoothedE12ThisCycle.set(entry.poolAddress, markSmootherE12.smooth(entry.poolAddress, pricesE12.get(entry.poolAddress) ?? rawPriceE6 * 1_000_000n, smoothNowMs));
+      if (priceE6 === null) primedPools.delete(entry.poolAddress);
+      else primedPools.add(entry.poolAddress);
     }
+    let smoothedE12: bigint | null | undefined = smoothedE12ThisCycle.get(entry.poolAddress);
     if (priceE6 === null) {
-      stat.totalErrors++;
-      stat.lastErrorMsg = "mark smoother re-priming — withholding push until minSamples";
-      continue;
+      // R3.24 (a): the priming gate is only safe while no fail-closed deadline is close. When one is, publish the
+      // median of what the window already holds (bounded by the breaker below, the band and the engine step cap).
+      const bypass = deadlineBypass(getPushDeadline(entry.marketAddress, smoothNowMs, DEADLINE_FRESH_MS), markSmoother.peek(entry.poolAddress));
+      if (bypass === null) {
+        stat.totalErrors++;
+        stat.lastErrorMsg = primingMessage(markSmoother.status(entry.poolAddress));
+        continue;
+      }
+      priceE6 = bypass.priceE6;
+      smoothedE12 = markSmootherE12.peek(entry.poolAddress);
+      console.warn(`[loop] ${entry.label}: smoother still priming but ${bypass.reason} — publishing the window median now (R3.24 deadline bypass)`);
     }
     // F2: standby (the primary is alive). The smoother above is already warm; do not touch the breaker or push.
     if (config.standby?.(entry.marketAddress)) {
@@ -1256,7 +1392,7 @@ async function runCycle(
 
     stat.lastPriceE6 = publish.priceE6;
     // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
-    const smoothedE12 = publish.priceE6 === priceE6 ? smoothedE12ThisCycle.get(entry.poolAddress) : null;
+    if (publish.priceE6 !== priceE6) smoothedE12 = null;
     pushes.push({
       key: entry.key,
       multi: entry.multi,
@@ -1336,7 +1472,12 @@ async function runCycle(
     // look healthy, which is how a stuck market goes unnoticed for days.
     const pushedSet = new Set(res.pushedMarkets);
     const terminalSet = new Set(res.terminalMarkets ?? []);
-    state.terminalMarkets = terminalSet;
+    // R3.24 (b): sticky. A market the pusher saw non-Live never becomes pushable again; replacing the set every cycle
+    // forgot every terminal market that did not reach the batch this cycle (smoother priming, breaker hold).
+    for (const m of terminalSet) {
+      state.terminalMarkets.add(m);
+      if (!isKnownTerminal(m)) markTerminal(m);
+    }
     const dexPushed = new Set(res.dexPushedMarkets ?? []);
     for (const m of res.dexRefusedMarkets ?? []) depthSourceCache.invalidate(m);
     for (const p of pushes) {
@@ -1472,11 +1613,47 @@ export function pruneDeregisteredMarkets(
   for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keepKeys.has(m)) crossClusterCircuitBreakerStates.delete(m);
   pruneAuthMarkPusherState(keep);
   pruneMarketAccrual(keep);
+  prunePushDeadlines(keep);
   return removed;
 }
 
 function pushExpected(state: LoopState, registry: Registry, market: string): boolean {
-  return !state.terminalMarkets.has(market) && registry.markets.some((m) => m.marketAddress === market);
+  return !isTerminalForPush(state, market) && registry.markets.some((m) => m.marketAddress === market);
+}
+
+/** Deadline cache entries older than this are not used for the pin alert (the cranker refreshes them every crank). */
+const PIN_ALERT_MAX_AGE_MS = 4 * DEADLINE_FRESH_MS;
+
+/** R3.24 (c): the band-pin alert sample of one market (its stats: the market's own, or every asset's of a multi-asset row). */
+export function bandPinSampleFor(
+  state: Pick<LoopState, "stats" | "terminalMarkets">,
+  registry: Pick<Registry, "markets">,
+  marketAddress: string,
+  label: string,
+  nowMs: number,
+): BandPinSample {
+  const stats = [...state.stats.values()].filter((st) => st.marketAddress === marketAddress);
+  const terminal = isTerminalForPush(state, marketAddress) || !registry.markets.some((m) => m.marketAddress === marketAddress);
+  const d = getPushDeadline(marketAddress, nowMs, PIN_ALERT_MAX_AGE_MS);
+  const pushes = stats.map((st) => st.lastPushAt).filter((t): t is number => t !== null);
+  return {
+    label,
+    market: marketAddress,
+    terminal: terminal || (d?.terminal ?? null) !== null,
+    pin: d?.pin ?? null,
+    noPushCycles: stats.length > 0 ? Math.max(...stats.map((st) => st.noPushCycles)) : 0,
+    lastPushAt: pushes.length === stats.length && pushes.length > 0 ? Math.min(...pushes) : null,
+  };
+}
+
+/**
+ * R3.24 (b): the /health status word of a market that will never be pushed again ("resolved" / "closed" /
+ * "recovery"), or null for a pushable market. A market the pusher reported non-Live before any read decoded it is
+ * "terminal".
+ */
+export function terminalHealthStatus(state: Pick<LoopState, "terminalMarkets">, marketAddress: string): string | null {
+  if (!isTerminalForPush(state, marketAddress)) return null;
+  return getPushDeadline(marketAddress)?.terminal ?? "terminal";
 }
 
 /** K-1/K-3: the per-market sample the alert evaluator and /health read. `terminal` = no push expected. */
@@ -1502,6 +1679,10 @@ async function reportMarketPush(state: LoopState, registry: Registry): Promise<v
     for (const stat of state.stats.values()) {
       const ev = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, stat.marketAddress)), sink.thresholds, now);
       active.push(...ev.active);
+    }
+    // R3.24 (c): a live band market's pin approaching expiry, per market (the pin is market-level: any asset expires it).
+    for (const m of registry.markets) {
+      active.push(...evaluateBandPinExpiry(bandPinSampleFor(state, registry, m.marketAddress, m.label, now), sink.thresholds));
     }
     await sink.reconcile("push-market", active);
   } catch (err) {
