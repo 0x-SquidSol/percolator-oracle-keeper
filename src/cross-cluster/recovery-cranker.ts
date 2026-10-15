@@ -136,6 +136,7 @@ import {
 import type { LegCostModel } from "./positioned-refresh.ts";
 import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
 import { getSweepDelegate } from "./v22/delegation.ts";
+import { observationAssetsFor, recordMarketAccrual, refreshStateForMarket } from "./multi-asset.ts";
 import { formatProgramError } from "./v22/errors.ts";
 import type { MarketLayoutHealth } from "./refresh-coordination.ts";
 import { SDK_PORTFOLIO_LENS, describeUnknownLayout, detectLayout } from "./market-layout.ts";
@@ -622,6 +623,8 @@ export async function crankOneMarket(
       return;
     }
     state.terminal = false;
+    // K-6: per-asset accrual lag of a multi-asset market for /health (no-op for single-asset markets).
+    recordMarketAccrual(marketAddress, acct.value.data, BigInt(acct.context.slot));
     // B7: this market was already cranked (by us) at this slot or later — e.g. the
     // boot crank, then the loop's first cycle in the same slot. A second crank can
     // only return Custom(22) EngineNonProgress; skip it instead of counting a revert.
@@ -642,7 +645,8 @@ export async function crankOneMarket(
     let pre: MarketRefreshState | null = null;
     if (detection.known) {
       try {
-        pre = decodeMarketRefreshState(acct.value.data);
+        // K-6: over every observed asset (exactly decodeMarketRefreshState for a single-asset market).
+        pre = refreshStateForMarket(acct.value.data, marketAddress);
       } catch (err) {
         if (!state.decodeWarned) {
           state.decodeWarned = true;
@@ -868,7 +872,7 @@ export async function crankOneMarket(
       );
     }
 
-    let finalPost = decodePostState(resolved.sim.marketData);
+    let finalPost = decodePostState(resolved.sim.marketData, marketAddress);
     if (sweepCtx) {
       // Visited = refreshed in this tx, or shown not stale by the simulation (Custom(22) prune).
       const visitedThisCycle = new Set<string>(targets.map((t) => t.pubkey.toBase58()));
@@ -915,7 +919,7 @@ export async function crankOneMarket(
           fu = emptySweepFollowup(`accrual tx ${mainLanded}`);
         }
       }
-      finalPost = decodePostState(lastMarketData);
+      finalPost = decodePostState(lastMarketData, marketAddress);
       const postSweep = lastMarketData ? decodeSweepMarketStateSafe(lastMarketData) : null;
       const cov = postSweep ? evaluateCoverage(postSweep) : sweepCtx.coverage;
       sweepBlocked = cov.blocksRiskIncrease;
@@ -961,7 +965,7 @@ export async function crankOneMarket(
         // Verification read: the stale counts the market really ended with.
         try {
           const after = await withRpcRetry(label, () => devnetConn.getAccountInfo(market, "processed"));
-          if (after) finalPost = decodePostState(after.data);
+          if (after) finalPost = decodePostState(after.data, marketAddress);
         } catch {
           /* keep the simulated post-state */
         }
@@ -1039,7 +1043,8 @@ async function positionedPortfoliosFor(
   state.positionedFetchedAt = now;
   try {
     const accounts = await withRpcRetry(label, () => fetchMarketPortfolios(conn, market, state.portfolioLen));
-    const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })));
+    // K-6: a leg on ANY observed asset (asset 0 only on a single-asset market).
+    const set = selectPositionedPortfolios(accounts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })), observationAssetsFor(market.toBase58()));
     const changed =
       cached === null ||
       cached.length !== set.length ||
@@ -1065,10 +1070,10 @@ async function positionedPortfoliosFor(
   }
 }
 
-function decodePostState(data: Uint8Array | null): MarketRefreshState | null {
+function decodePostState(data: Uint8Array | null, marketAddress: string): MarketRefreshState | null {
   if (!data) return null;
   try {
-    return decodeMarketRefreshState(data);
+    return refreshStateForMarket(data, marketAddress);
   } catch {
     return null;
   }

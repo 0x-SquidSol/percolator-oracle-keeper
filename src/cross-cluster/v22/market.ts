@@ -24,7 +24,7 @@ import { noteLayoutGuardRefusal } from "../layout-guard-metrics.ts";
 import type { MarketV22 } from "@percolatorct/sdk";
 import { assetSlotsOff, detectLayout, engineSlotBase, describeUnknownLayout } from "../market-layout.ts";
 import type { MarketLayout } from "../market-layout.ts";
-import { decodeMarketRefreshState } from "../positioned-refresh.ts";
+import { refreshStateForMarket } from "../multi-asset.ts";
 import type { MarketRefreshState } from "../positioned-refresh.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "../resolved-portfolio-cleanup.ts";
 import { lpVaultRegistryBound, lpVaultRegistryExtFlag } from "../registry-flags.ts";
@@ -146,7 +146,8 @@ export function buildV22MarketCtx(p: {
   }
   let refresh: MarketRefreshState;
   try {
-    refresh = decodeMarketRefreshState(p.data);
+    // K-6: over every observed asset of a multi-asset registry market (exactly asset 0 otherwise).
+    refresh = refreshStateForMarket(p.data, p.marketAddress);
   } catch (err) {
     return { ok: false, reason: "unreadable", detail: err instanceof Error ? err.message : String(err) };
   }

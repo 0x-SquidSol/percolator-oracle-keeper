@@ -17,18 +17,59 @@ import path from "path";
 /** DEX types supported by the dex-oracle module. */
 export type DexType = "raydium-clmm" | "meteora-dlmm" | "pumpswap";
 
+/** What the pool price reader needs from a price source (a single-asset row, or one pool-sourced asset). */
+export interface PoolPriceSource {
+  poolAddress: string;
+  dexType: DexType;
+  label: string;
+  symbol?: string;
+  mainnetCa?: string;
+}
+
 /**
- * A single market registration: one devnet slab tracked against one mainnet pool.
+ * K-6: the price source of ONE asset of a multi-asset market (see multi-asset.ts).
+ *   pool   live spot from a mainnet DEX pool (same reader, smoother and circuit breaker as a single-asset market)
+ *   fixed  a constant mark pushed every cycle (synthetic QA assets with no real pool); no smoother, no breaker
+ */
+export interface AssetSource {
+  /** Engine asset slot index in the market. */
+  assetIndex: number;
+  source: "pool" | "fixed";
+  /** pool: mainnet DEX pool address. */
+  poolAddress?: string;
+  /** pool: DEX type. */
+  dexType?: DexType;
+  /** pool: the token's mainnet CA, bound against the pool's mints (#100), when known. */
+  mainnetCa?: string;
+  /** fixed: the mark to push, e6, as a decimal integer string (or a safe integer). "100000000" = 100.0. */
+  fixedPriceE6?: string | number;
+  /** Display only. */
+  symbol?: string;
+}
+
+/**
+ * A single market registration: one devnet slab tracked against one mainnet pool, or (K-6) against one price source
+ * per asset when `assets` is present.
  */
 export interface MarketEntry {
   /** Human-readable label, e.g. "SOL/USDC (Raydium CLMM)". */
   label: string;
   /** Devnet slab (market) account address — target for PushAuthMark. */
   marketAddress: string;
-  /** Mainnet DEX pool address — price source. */
-  poolAddress: string;
-  /** DEX type for price computation. */
-  dexType: DexType;
+  /**
+   * Mainnet DEX pool address — price source. Required on a single-asset row. On a multi-asset row (`assets` present)
+   * it is ignored (each asset names its own source) and may be omitted.
+   */
+  poolAddress?: string;
+  /** DEX type for price computation. Required on a single-asset row; ignored on a multi-asset row. */
+  dexType?: DexType;
+  /**
+   * K-6: a MULTI-ASSET market. When present (non-empty), the keeper pushes every listed asset each cycle (batched),
+   * every observation crank accrues all of them, positioned portfolios are those holding a leg on any of them, and
+   * /health reports each asset (multi-asset.ts). `assetIndex` / `poolAddress` / `dexType` / `mainnetCa` of the row
+   * are then not used for pricing. Absent = the single-asset behaviour, unchanged.
+   */
+  assets?: AssetSource[];
   /**
    * #100 — the mainnet contract address this market is FOR, when the DB knows it.
    * Bound against the pool's base/quote mint before the pool is trusted as a price

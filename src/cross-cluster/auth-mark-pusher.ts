@@ -49,6 +49,7 @@ import { isLiveMarket, isTerminalMarket } from "./market-state.ts";
 import { encodePushAuthMarkDexMode, encodePushAuthMarkMaybeDepth, type PushDepth } from "./push-depth.ts";
 import { WRAPPER_ERR_DEPTH_SOURCE_INVALID, type DexDepthPin } from "./depth-source.ts";
 import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
+import { decodeMarketRefreshState } from "./positioned-refresh.ts";
 
 /**
  * B20 (E2E 2026-09-30): Resolved markets and CloseSlab tombstones are never
@@ -568,6 +569,12 @@ type AuthMarkPushInput = {
   depth?: PushDepth | null;
   /** Round 2: the market's active, same-cluster depth-source pin (mode 2). Used only if it matches the live asset generation. */
   dex?: DexDepthPin | null;
+  /**
+   * K-6: an asset of a MULTI-ASSET market (multi-asset.ts). Such a push is skipped (not struck) while its asset is not
+   * Active / DrainOnly, so a Disabled asset can never revert the batch and quarantine its market's other assets.
+   * Absent / false = the single-asset behaviour, unchanged.
+   */
+  multi?: boolean;
 };
 
 /**
@@ -681,10 +688,23 @@ function chunkPushes(
   return chunks;
 }
 
-/** Composite key — the same market address can (in principle) carry more than one asset index. */
-function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): string {
+/** Composite key — the same market address can carry more than one asset index (K-6 multi-asset markets). */
+export function pushGenerationKey(p: { marketAddress: string; assetIndex: number }): string {
   return `${p.marketAddress}:${p.assetIndex}`;
 }
+
+/** handle_push_auth_mark accepts an Active (2) or DrainOnly (3) asset only, else 21 (v16_program.rs:28448-28451). */
+function assetAcceptsPush(data: Uint8Array, assetIndex: number): boolean {
+  try {
+    const lifecycle = decodeMarketRefreshState(data, assetIndex).lifecycle;
+    return lifecycle === 2 || lifecycle === 3;
+  } catch {
+    return false;
+  }
+}
+
+/** K-6: multi-asset pushes already logged as skipped for an inactive asset (logged once per key). */
+const inactiveLogged = new Set<string>();
 
 /**
  * Batched live-read of market_id + observation_sequence for every push this
@@ -703,6 +723,8 @@ export async function fetchPushAuthMarkGenerationFields(
   devnetConn: Connection,
   pushes: AuthMarkPushInput[],
   terminal: Set<string>,
+  /** K-6: multi-asset pushes whose asset is not Active / DrainOnly (skipped, by generation key). */
+  inactive?: Set<string>,
 ): Promise<Map<string, { marketId: bigint; observationSequence: bigint; lotExp: number }>> {
   const uniqueAddrs = [...new Set(pushes.map((p) => p.marketAddress))];
   // "processed", not "confirmed" (#Custom19, 2026-09-28): the watermark this
@@ -736,6 +758,10 @@ export async function fetchPushAuthMarkGenerationFields(
     // Recovery is refused (21) like a Resolved one; it is cranked, not priced.
     if (isTerminalMarket(data) || marketModeIsNotLive(data)) {
       terminal.add(p.marketAddress);
+      continue;
+    }
+    if (p.multi && !assetAcceptsPush(data, p.assetIndex)) {
+      inactive?.add(key);
       continue;
     }
     const fields = parsePushAuthMarkGenerationFields(data, p.assetIndex);
@@ -1011,6 +1037,10 @@ export async function pushAuthMarkBatch(
   count: number;
   /** Markets whose push actually went out — NOT the whole input batch. */
   pushedMarkets: string[];
+  /** K-6: `${market}:${assetIndex}` of every push that went out (per asset; a multi-asset market has several). */
+  pushedKeys?: string[];
+  /** K-6: `${market}:${assetIndex}` of multi-asset pushes skipped because the asset is not Active / DrainOnly. */
+  inactiveKeys?: string[];
   /** Markets dropped this cycle (reverted in preflight, or quarantined). */
   skippedMarkets: string[];
   /** B20: Resolved / tombstoned markets, not pushed and not counted as drops. */
@@ -1056,7 +1086,16 @@ export async function pushAuthMarkBatch(
   // value it last stored, so reusing a stale/cached sequence across pushes
   // would make every push after the first one revert.
   const terminal = new Set<string>();
-  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible, terminal);
+  const inactive = new Set<string>();
+  const generationFields = await fetchPushAuthMarkGenerationFields(devnetConn, eligible, terminal, inactive);
+  for (const k of inactive) {
+    if (!inactiveLogged.has(k)) {
+      inactiveLogged.add(k);
+      console.log(`[push] ${k.slice(0, 8)}…:${k.slice(k.lastIndexOf(":") + 1)} asset is not Active/DrainOnly — not pushed (K-6)`);
+    }
+  }
+  for (const k of [...inactiveLogged]) if (!inactive.has(k) && eligible.some((p) => pushGenerationKey(p) === k)) inactiveLogged.delete(k);
+  const inactiveKeys = [...inactive];
   for (const m of terminal) {
     if (!terminalLogged.has(m)) {
       terminalLogged.add(m);
@@ -1068,6 +1107,7 @@ export async function pushAuthMarkBatch(
   const missingGeneration: string[] = [];
   for (const p of eligible) {
     if (terminal.has(p.marketAddress)) continue;
+    if (inactive.has(pushGenerationKey(p))) continue;
     const fields = generationFields.get(pushGenerationKey(p));
     if (!fields) {
       missingGeneration.push(p.marketAddress);
@@ -1096,6 +1136,8 @@ export async function pushAuthMarkBatch(
       pushed: false,
       count: 0,
       pushedMarkets: [],
+      pushedKeys: [],
+      inactiveKeys,
       skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !terminal.has(m)),
       terminalMarkets,
     };
@@ -1120,6 +1162,8 @@ export async function pushAuthMarkBatch(
       pushed: false,
       count: pushable.length,
       pushedMarkets: pushable.map((p) => p.marketAddress),
+      pushedKeys: pushable.map((p) => pushGenerationKey(p)),
+      inactiveKeys,
       skippedMarkets: missingGeneration,
       terminalMarkets,
     };
@@ -1127,6 +1171,7 @@ export async function pushAuthMarkBatch(
 
   let firstSig: string | undefined;
   const pushedMarkets: string[] = [];
+  const pushedKeys: string[] = [];
   const dexPushedMarkets: string[] = [];
   const dexRefusedMarkets: string[] = [];
   const errors: string[] = [];
@@ -1197,6 +1242,7 @@ export async function pushAuthMarkBatch(
       if (inFlightPushes.length > MAX_IN_FLIGHT_PUSHES) inFlightPushes.splice(0, inFlightPushes.length - MAX_IN_FLIGHT_PUSHES);
       for (const p of chunk) {
         pushedMarkets.push(p.marketAddress);
+        pushedKeys.push(pushGenerationKey(p));
         if (p.dex) {
           dexPushedMarkets.push(p.marketAddress);
           dexRefusalLogged.delete(p.marketAddress);
@@ -1325,6 +1371,8 @@ export async function pushAuthMarkBatch(
     signature: firstSig,
     count: pushedMarkets.length,
     pushedMarkets,
+    pushedKeys,
+    inactiveKeys,
     // Everything asked for that did NOT go out — quarantined or reverting. The
     // caller must not stamp these as freshly pushed (that was the /health lie).
     skippedMarkets: pushes.map((p) => p.marketAddress).filter((m) => !pushedSet.has(m) && !terminal.has(m)),

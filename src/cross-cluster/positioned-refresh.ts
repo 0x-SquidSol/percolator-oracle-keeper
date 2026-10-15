@@ -59,8 +59,12 @@ import { buildLivenessRepairIx } from "./liveness-repair.ts";
 import type { LivenessRepair } from "./liveness-repair.ts";
 
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { accrueCrankCuFor, catchupCrankCuFor, maxCatchupCranksFor, observationAssetsFor, observationHints } from "./multi-asset.ts";
 
-/** The asset every registry market trades (single-asset markets). */
+/**
+ * The asset every single-asset registry market trades. A K-6 multi-asset market observes every asset its registry
+ * row lists (multi-asset.ts `observationAssetsFor`); the builders below look that up per market.
+ */
 export const REFRESH_ASSET_INDEX = 0;
 
 // ── Market account offsets ────────────────────────────────────────────────
@@ -220,11 +224,16 @@ export interface PositionedPortfolio {
  * that are not full-size portfolios, or do not decode, are skipped. A leg is
  * counted by its side (0 = long, 1 = short), which is how
  * `stored_pos_count_<side>` counts it.
+ *
+ * K-6: `assetIndex` may be a LIST (a multi-asset market's observed assets): a portfolio is then positioned when it
+ * holds a leg on ANY of them, and its long / short counts are summed over them (matching the summed
+ * `stored_pos_count` of `decodeMarketRefreshStateFor`). A single number is the pre-K-6 behaviour.
  */
 export function selectPositionedPortfolios(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
-  assetIndex = REFRESH_ASSET_INDEX,
+  assetIndex: number | ReadonlyArray<number> = REFRESH_ASSET_INDEX,
 ): PositionedPortfolio[] {
+  const onAsset: (a: number) => boolean = typeof assetIndex === "number" ? (a) => a === assetIndex : (a) => assetIndex.includes(a);
   const out: PositionedPortfolio[] = [];
   for (const { pubkey, data } of accounts) {
     if (!SDK_PORTFOLIO_LENS.has(data.length)) continue;
@@ -242,7 +251,7 @@ export function selectPositionedPortfolios(
     let activeLegs = 0;
     for (const leg of parsed.legs) {
       if (leg.active) activeLegs++;
-      if (!leg.active || leg.assetIndex !== assetIndex) continue;
+      if (!leg.active || !onAsset(leg.assetIndex)) continue;
       lossWeight += leg.lossWeight;
       if (leg.side === 0) {
         longLegs++;
@@ -276,7 +285,11 @@ export function positionedSetMatchesMarket(
   return longs === s.storedPosLong && shorts === s.storedPosShort;
 }
 
-/** Observation crank (accrues asset 0 from the committed AUTH_MARK mark). */
+/**
+ * Observation crank (accrues asset 0 from the committed AUTH_MARK mark). K-6: on a multi-asset registry market it
+ * carries one hint per observed asset (`observationAssetsFor`), so every asset accrues in this instruction; on every
+ * other market the hint list is `[{asset 0}]`, byte-identical to before.
+ */
 export function buildObservationCrankIx(
   owner: PublicKey,
   market: PublicKey,
@@ -311,7 +324,7 @@ function buildPermissionlessCrankIx(
   if (withObservation) for (const a of oracleAccounts) keys.push({ pubkey: a, isSigner: false, isWritable: false });
   const data = encodePermissionlessCrank({
     nowSlot: 0n, // wrapper authenticates against Clock::get()
-    observations: withObservation ? [{ assetIndex: REFRESH_ASSET_INDEX, oracleAccounts: oracleAccounts.length }] : [],
+    observations: withObservation ? observationHints(observationAssetsFor(market.toBase58()), oracleAccounts.length) : [],
   });
   return new TransactionInstruction({
     programId: WRAPPER_PROGRAM_ID,
@@ -568,21 +581,28 @@ export function planCrankTx(params: {
     repair: r,
   }));
   const repairCu = repairs.length * REPAIR_CU;
-  for (let i = 0; i < catchup; i++) {
+  // K-6: a multi-asset market's observation cranks carry one hint per asset and cost more; single-asset: hints = 1,
+  // every figure below is the pre-K-6 one.
+  const hints = observationAssetsFor(market.toBase58()).length;
+  const catchupCu = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
+  const catchupN = hints <= 1 ? catchup : Math.min(catchup, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - repairCu));
+  for (let i = 0; i < catchupN; i++) {
     cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
   }
-  if (!catchupAllowsRefresh(catchup)) {
+  // The observation crank settles the LP it targets: a heavy LP (3+ legs) makes the accrual itself the big crank.
+  const accrueCu = accrueCrankCuFor(cost && params.lp && cost.isSolo(params.lp) ? cost.worstRefreshCu(params.lp) : ACCRUE_CRANK_CU, hints);
+  // K-6 (multi-asset only): the catch-up and the accrual must fit one transaction, else catch up first.
+  const multiTooBig = hints > 1 && catchupN > 0 && repairCu + catchupN * catchupCu + accrueCu > MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
+  if (!catchupAllowsRefresh(catchup) || catchupN < catchup || multiTooBig) {
     // Too far behind to finish this cycle: catch-up cranks only.
     return {
       cranks,
       overflow: [],
-      computeUnits: Math.min(MAX_TX_CU, repairCu + catchup * CATCHUP_CRANK_CU + ACCRUAL_TX_CU_HEADROOM),
+      computeUnits: Math.min(MAX_TX_CU, repairCu + catchupN * catchupCu + ACCRUAL_TX_CU_HEADROOM),
     };
   }
   cranks.push({ kind: "accrue", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
-  // The observation crank settles the LP it targets: a heavy LP (3+ legs) makes the accrual itself the big crank.
-  const accrueCu = cost && params.lp && cost.isSolo(params.lp) ? cost.worstRefreshCu(params.lp) : ACCRUE_CRANK_CU;
-  let cu = repairCu + catchup * CATCHUP_CRANK_CU + accrueCu;
+  let cu = repairCu + catchupN * catchupCu + accrueCu;
   /** Packing ceiling: the headroom is reserved, never spent on another refresh. */
   const packCap = MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
 

@@ -20,7 +20,9 @@ import type { Connection, Keypair } from "@solana/web3.js";
 import { deriveInsuranceUnitsV22, deriveStakePool } from "@percolatorct/sdk";
 import type { MarketEntry } from "../registry.ts";
 import { STAKE_PROGRAM_ID } from "../../program-ids.ts";
-import { decodeMarketRefreshState, isAssetLossStale } from "../positioned-refresh.ts";
+import { ACCRUAL_TX_CU_HEADROOM, CATCHUP_CRANK_CU, MAX_CATCHUP_CRANKS, MAX_TX_CU, catchupCrankCount, isAssetLossStale } from "../positioned-refresh.ts";
+import { CU_PER_WEIGHT } from "./settle-pairing.ts";
+import { EXTRA_HINT_ACCRUE_CU, accrueCrankCuFor, catchupCrankCuFor, isMultiAssetMarket, maxCatchupCranksFor, observationAssetsFor, refreshStateForMarket } from "../multi-asset.ts";
 import { setCrankRefreshHealth } from "../refresh-coordination.ts";
 import { LOSS_STALE_ALERT_CYCLES } from "../recovery-cranker.ts";
 import { describeV22Flags, pairingActive } from "./flags.ts";
@@ -30,7 +32,7 @@ import type { ExecContext } from "./exec.ts";
 import { crankOracleAccounts, loadV22Market } from "./market.ts";
 import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
 import { loadV22Positioned, parseAccrueAnchors } from "./positioned.ts";
-import { simulateOnly } from "./exec.ts";
+import { simulateAndSend, simulateOnly } from "./exec.ts";
 import { buildObservationCrankIx } from "../positioned-refresh.ts";
 import { parseSeniorDrawLogs } from "../vault-lp-crank.ts";
 import type { V22Positioned } from "./positioned.ts";
@@ -233,6 +235,17 @@ export class V22Loop {
         this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
         return false;
       }
+      // K-6: a multi-asset market whose oldest observed asset is a full accrual window (or more) behind: a round now would
+      // only advance each asset by one window (the program's bounded catch-up return) and every refresh would be refused
+      // (22). Send bounded catch-up cranks observing every asset first (they return before settling anyone, so the LP is
+      // never settled alone); the round runs on the next cycle, inside one window.
+      if (isMultiAssetMarket(ctx.marketAddress)) {
+        const n = catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots);
+        if (n > 0) {
+          await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
+          return true;
+        }
+      }
       const f = this.d.flags;
       // Rent (tag 106) runs AFTER the LP tx of a round, sequentially, for portfolios the plain refresh already settled.
       let rent: RoundInputRent | undefined;
@@ -245,6 +258,11 @@ export class V22Loop {
       }
       const useAnchor = r.anchorBadRounds > 0 ? null : positioned.flatAnchor;
       if (r.anchorBadRounds > 0) r.anchorBadRounds--;
+      // K-6: every accrue crank of a multi-asset round carries one observation per asset; reserve that compute in the
+      // per-tx weight budget (single-asset: the budget is unchanged).
+      const roundCfg = this.roundConfig();
+      const hints = observationAssetsFor(ctx.marketAddress).length;
+      if (hints > 1) roundCfg.weightBudget = Math.max(6, roundCfg.weightBudget - Math.ceil(((hints - 1) * EXTRA_HINT_ACCRUE_CU) / CU_PER_WEIGHT));
       const res = await runSettleRound(
         this.sweepDeps(),
         { market: ctx.market, label: ctx.label },
@@ -263,7 +281,7 @@ export class V22Loop {
           protective,
           liq: f.liquidate ? { layout: ctx.layout, slots: ctx.slots, params: readMarginParams(ctx.data, ctx.layout, ctx.slots), padBps: f.liquidatePadBps, maxPerTx: f.liquidateMaxPerTx } : undefined,
         },
-        this.roundConfig(),
+        roundCfg,
       );
       if (res.backedOff) return false; // nothing ran: let the legacy accrual crank run this cycle (N-4)
       if (res.anchorRefused) {
@@ -315,6 +333,22 @@ export class V22Loop {
   }
 
   /**
+   * K-6: one transaction of bounded catch-up cranks for a multi-asset market, each observing every asset (simulate first,
+   * dry-run = simulate only). `n` is capped to what fits the compute budget at the multi-hint cost; a further gap is
+   * covered on the next cycles. Never throws.
+   */
+  private async multiAssetCatchup(ctx: V22MarketCtx, target: PublicKey, wanted: number): Promise<void> {
+    const hints = observationAssetsFor(ctx.marketAddress).length;
+    const n = Math.min(wanted, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM));
+    const ixs = Array.from({ length: n }, () => buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx)));
+    const units = Math.min(MAX_TX_CU, n * catchupCrankCuFor(CATCHUP_CRANK_CU, hints) + ACCRUAL_TX_CU_HEADROOM);
+    const out = await simulateAndSend(this.execCtx(), ixs, { job: "catchup-multi", label: ctx.label, units });
+    const gap = BigInt(ctx.readSlot) - ctx.refresh.slotLast;
+    const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
+    this.log(`[v22][catchup] ${ctx.label}: ${hints} assets, oldest ${gap} slots behind: ${n} catch-up crank(s) (${wanted} wanted) on ${target.toBase58().slice(0, 8)}…: ${what}`);
+  }
+
+  /**
    * Protective trigger (installed into the suppressed lone-LP-crank path). When the LP itself needs protection the v2.2
    * layer runs a full PAIRED round NOW instead of waiting for the next crank cycle. Never a lone LP crank.
    *
@@ -339,7 +373,7 @@ export class V22Loop {
     let signal = false;
     if (ctx.lpPortfolio) {
       try {
-        const sim = await simulateOnly(this.execCtx(), [buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, ctx.lpPortfolio, crankOracleAccounts(ctx))], { units: 400_000 });
+        const sim = await simulateOnly(this.execCtx(), [buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, ctx.lpPortfolio, crankOracleAccounts(ctx))], { units: Math.min(1_400_000, accrueCrankCuFor(400_000, observationAssetsFor(ctx.marketAddress).length)) });
         if (!sim.err) signal = parseSeniorDrawLogs(sim.logs).some((e) => e.kind === "draw" || e.kind === "booked");
       } catch {
         signal = false;
@@ -374,7 +408,7 @@ export class V22Loop {
       const info = await this.d.conn.getAccountInfo(ctx.market, "processed");
       if (info) {
         postData = new Uint8Array(info.data);
-        post = decodeMarketRefreshState(postData);
+        post = refreshStateForMarket(postData, ctx.marketAddress);
       }
     } catch {
       // keep the pre-read

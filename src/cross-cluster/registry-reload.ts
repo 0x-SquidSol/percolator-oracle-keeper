@@ -39,6 +39,7 @@
 import fs from "fs";
 import { assertRegistryProgramSet, loadRegistry, registryProgramSet } from "./registry.ts";
 import type { MarketEntry, Registry } from "./registry.ts";
+import { validateMultiAssetEntry } from "./multi-asset.ts";
 
 export interface RegistryReloadConfig {
   /** Path to registry.json to poll. */
@@ -76,6 +77,9 @@ export function reloadRegistryOnce(
     // v2.1 cutover: never hot-load the other world's registry into a running
     // keeper (an untagged file on both sides = v1 = unchanged behaviour).
     assertRegistryProgramSet(onDisk, registryProgramSet(registry), registryPath);
+    // K-6: a malformed multi-asset row is refused like a malformed file (the keeper never guesses a source).
+    const problems = onDisk.markets.flatMap((m) => validateMultiAssetEntry(m));
+    if (problems.length > 0) throw new Error(`invalid multi-asset row(s): ${problems.join("; ")}`);
   } catch (err) {
     console.warn(
       `[registry-reload] failed to read/parse ${registryPath} — keeping current in-memory registry: ` +

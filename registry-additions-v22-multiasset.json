@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "description": "K-6 (R3.22): multi-asset QA fixtures for the v2.2 fresh keeper. NOT the live registry: append these two objects to the \"markets\" array of ~/wt-v22-fresh/keeper/registry.v22fresh.json at deploy (needs keeper code >= feat/v22-keeper-growth K-6). Each row is ONE market with an \"assets\" list; the keeper pushes every asset each cycle, every observation crank accrues all of them, and /health reports each asset. 2xhs: live mainnet spot (same pools as the fixtures ledger, assets 0/3 SOL, 1/4 LINK, 2 cbBTC). 3vW8: synthetic fixed 100.000000 marks (no real pool); crank target F1febXof (a flat cap4 user portfolio; 3vW8 has no vault LP and the keeper owns no portfolio there). Assets 0 and 3 carry symbol \"SOL/USDC\" so they are the SOL/USD reference the price reader needs for the WSOL-quoted LINK pool (isSolUsdEntry), even without another SOL/USDC row.",
+  "markets": [
+    {
+      "label": "cap4b multi-asset (SOL/LINK/cbBTC/SOL/LINK) — 2xhs",
+      "marketAddress": "2xhsLP9NLkUMMsCsyzkHM9R1zsVU2V2vDo6v9WuPBzVw",
+      "assetIndex": 0,
+      "symbol": "CAP4B-MA",
+      "collateral": "ERe2nVetnKFH4Am7hh1cVWXd52s7uhWjorwFkU61kwan",
+      "registeredAt": 1791842400000,
+      "lpPortfolio": "6w14eZR3S4e1AxkWEtruGZ6dRSj2mDaNsWtfcKZ3Dg4W",
+      "assets": [
+        {
+          "assetIndex": 0,
+          "symbol": "SOL/USDC",
+          "source": "pool",
+          "poolAddress": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+          "dexType": "meteora-dlmm"
+        },
+        {
+          "assetIndex": 1,
+          "symbol": "LINK",
+          "source": "pool",
+          "poolAddress": "6BA6yuymxx8qLdEkMqNPcJQn4ZEQ2pF6DVe6h2GuDxV5",
+          "dexType": "meteora-dlmm"
+        },
+        {
+          "assetIndex": 2,
+          "symbol": "cbBTC",
+          "source": "pool",
+          "poolAddress": "7ubS3GccjhQY99AYNKXjNJqnXjaokEdfdV915xnCb96r",
+          "dexType": "meteora-dlmm"
+        },
+        {
+          "assetIndex": 3,
+          "symbol": "SOL/USDC",
+          "source": "pool",
+          "poolAddress": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+          "dexType": "meteora-dlmm"
+        },
+        {
+          "assetIndex": 4,
+          "symbol": "LINK",
+          "source": "pool",
+          "poolAddress": "6BA6yuymxx8qLdEkMqNPcJQn4ZEQ2pF6DVe6h2GuDxV5",
+          "dexType": "meteora-dlmm"
+        }
+      ]
+    },
+    {
+      "label": "cap4 multi-asset synthetic (5 x 100.0) — 3vW8",
+      "marketAddress": "3vW8VARnfB4y3QdJaWYebSv5WQvChnAHFL3MNLSH4JAy",
+      "assetIndex": 0,
+      "symbol": "CAP4-SYN",
+      "registeredAt": 1791842400000,
+      "lpPortfolio": "F1febXof8V7bhqEmD6iEFbbuqfpSAgSEkToQpqdaVm5Q",
+      "assets": [
+        {
+          "assetIndex": 0,
+          "symbol": "SYN0",
+          "source": "fixed",
+          "fixedPriceE6": "100000000"
+        },
+        {
+          "assetIndex": 1,
+          "symbol": "SYN1",
+          "source": "fixed",
+          "fixedPriceE6": "100000000"
+        },
+        {
+          "assetIndex": 2,
+          "symbol": "SYN2",
+          "source": "fixed",
+          "fixedPriceE6": "100000000"
+        },
+        {
+          "assetIndex": 3,
+          "symbol": "SYN3",
+          "source": "fixed",
+          "fixedPriceE6": "100000000"
+        },
+        {
+          "assetIndex": 4,
+          "symbol": "SYN4",
+          "source": "fixed",
+          "fixedPriceE6": "100000000"
+        }
+      ]
+    }
+  ]
+}

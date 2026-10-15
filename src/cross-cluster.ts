@@ -73,6 +73,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
+import { bindObservationRegistry, validateMultiAssetEntry } from "./cross-cluster/multi-asset.ts";
 import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
@@ -349,6 +350,16 @@ const REGISTRY_RELOAD_INTERVAL_MS = parseInt(process.env.REGISTRY_RELOAD_INTERVA
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
 const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
+// K-6: multi-asset rows must be well formed (the keeper never guesses a source or an asset), and every observation
+// crank looks its market's asset list up in the LIVE registry (hot-reloaded in place, hence the getter).
+{
+  const problems = registry.markets.flatMap((m) => validateMultiAssetEntry(m));
+  if (problems.length > 0) {
+    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid multi-asset row(s):\n  ${problems.join("\n  ")}`);
+    process.exit(1);
+  }
+}
+bindObservationRegistry(() => registry.markets);
 
 if (registry.markets.length === 0) {
   console.warn(
@@ -416,7 +427,7 @@ console.log(
 );
 for (const m of registry.markets) {
   console.log(
-    `  market:    ${m.label} | slab=${m.marketAddress.slice(0, 8)}… → pool=${m.poolAddress.slice(0, 8)}… (${m.dexType})${m.lpPortfolio ? ` | lp=${m.lpPortfolio.slice(0, 8)}…` : ""}`,
+    `  market:    ${m.label} | slab=${m.marketAddress.slice(0, 8)}… → ${m.assets?.length ? `assets=[${m.assets.map((a) => `${a.assetIndex}:${a.source === "fixed" ? `fixed ${String(a.fixedPriceE6)}` : `${(a.poolAddress ?? "?").slice(0, 8)}…`}`).join(", ")}]` : `pool=${(m.poolAddress ?? "?").slice(0, 8)}… (${m.dexType})`}${m.lpPortfolio ? ` | lp=${m.lpPortfolio.slice(0, 8)}…` : ""}`,
   );
 }
 console.log();

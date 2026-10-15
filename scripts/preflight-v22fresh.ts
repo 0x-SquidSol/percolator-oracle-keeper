@@ -18,7 +18,30 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
-interface Entry { label?: string; marketAddress?: string; poolAddress?: string; dexType?: string; assetIndex?: number }
+interface AssetRow { assetIndex?: number; source?: string; poolAddress?: string; dexType?: string; fixedPriceE6?: string | number }
+interface Entry { label?: string; marketAddress?: string; poolAddress?: string; dexType?: string; assetIndex?: number; assets?: AssetRow[] }
+
+/** K-6: a multi-asset row (`assets`) names one source per asset instead of a row-level pool. */
+function checkAssets(m: Entry): void {
+  const assets = m.assets ?? [];
+  if (!Array.isArray(assets) || assets.length === 0) fail(`entry ${m.label ?? "?"}: "assets" must be a non-empty list`);
+  const seen = new Set<number>();
+  for (const a of assets) {
+    if (!Number.isInteger(a.assetIndex) || (a.assetIndex as number) < 0 || (a.assetIndex as number) >= 16) fail(`entry ${m.label}: bad assetIndex ${String(a.assetIndex)}`);
+    if (seen.has(a.assetIndex as number)) fail(`entry ${m.label}: asset ${a.assetIndex} listed twice`);
+    seen.add(a.assetIndex as number);
+    if (a.source === "pool") {
+      if (!a.poolAddress || !a.dexType || !DEX.has(a.dexType)) fail(`entry ${m.label} asset ${a.assetIndex}: pool source needs poolAddress + a known dexType`);
+      new PublicKey(a.poolAddress);
+    } else if (a.source === "fixed") {
+      const v = a.fixedPriceE6;
+      const ok = (typeof v === "string" && /^[0-9]+$/.test(v) && BigInt(v) > 0n) || (typeof v === "number" && Number.isSafeInteger(v) && v > 0);
+      if (!ok) fail(`entry ${m.label} asset ${a.assetIndex}: fixed source needs a positive integer fixedPriceE6`);
+    } else {
+      fail(`entry ${m.label} asset ${a.assetIndex}: unknown source ${String(a.source)}`);
+    }
+  }
+}
 
 async function main(): Promise<void> {
   if (!DEVNET_RPC || !WRAPPER || !REGISTRY_PATH) fail("DEVNET_RPC_URL, WRAPPER_PROGRAM_ID and REGISTRY_PATH are required");
@@ -35,11 +58,17 @@ async function main(): Promise<void> {
   }
   const seen = new Set<string>();
   for (const m of markets) {
-    if (!m.marketAddress || !m.poolAddress || !m.dexType) fail(`entry ${m.label ?? "?"} lacks marketAddress/poolAddress/dexType`);
-    if (!DEX.has(m.dexType)) fail(`entry ${m.label}: unknown dexType ${m.dexType}`);
+    if (m.assets !== undefined) {
+      if (!m.marketAddress) fail(`entry ${m.label ?? "?"} lacks marketAddress`);
+      checkAssets(m);
+    } else {
+      if (!m.marketAddress || !m.poolAddress || !m.dexType) fail(`entry ${m.label ?? "?"} lacks marketAddress/poolAddress/dexType`);
+      if (!DEX.has(m.dexType)) fail(`entry ${m.label}: unknown dexType ${m.dexType}`);
+      new PublicKey(m.poolAddress);
+    }
     if (seen.has(m.marketAddress)) fail(`duplicate market ${m.marketAddress}`);
     seen.add(m.marketAddress);
-    new PublicKey(m.marketAddress); new PublicKey(m.poolAddress);
+    new PublicKey(m.marketAddress);
   }
   const conn = new Connection(DEVNET_RPC, "confirmed");
   const infos = await conn.getMultipleAccountsInfo(markets.map((m) => new PublicKey(m.marketAddress as string)));

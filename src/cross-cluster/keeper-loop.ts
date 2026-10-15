@@ -18,7 +18,7 @@
  */
 import http from "http";
 import { Connection, Keypair } from "@solana/web3.js";
-import type { Registry } from "./registry.ts";
+import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
@@ -41,6 +41,9 @@ import type { SweepHealth } from "./positioned-sweep.ts";
 import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth.ts";
 import { DEPTH_SOURCE_ONCHAIN_DEX, DepthSourceCache, pushDepthOnchainEnabled, type DexDepthPin } from "./depth-source.ts";
 import { WRAPPER_PROGRAM_ID as DEPTH_WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, pruneMarketAccrual } from "./multi-asset.ts";
+import type { PriceUnit } from "./multi-asset.ts";
+import { pushGenerationKey } from "./auth-mark-pusher.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
 const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
@@ -102,6 +105,13 @@ export interface LoopConfig {
 interface MarketStat {
   label: string;
   marketAddress: string;
+  /**
+   * K-6: this stat's key in LoopState.stats. The market address for a single-asset market (every /health key and map
+   * unchanged), `<market>#<asset>` for one asset of a multi-asset market (multi-asset.ts PriceUnit.key).
+   */
+  key: string;
+  /** K-6: the asset this stat tracks when it belongs to a multi-asset market, else null. */
+  multiAsset: { assetIndex: number; source: "pool" | "fixed"; symbol: string | null } | null;
   poolAddress: string;
   dexType: string;
   lastPriceE6: bigint;
@@ -133,13 +143,28 @@ interface MarketStat {
   lastDepthSource: string | null;
 }
 
-/** A fresh /health stat record for one registry entry. */
-export function newMarketStat(m: { label: string; marketAddress: string; poolAddress: string; dexType: string }): MarketStat {
+/**
+ * A fresh /health stat record for one registry entry, or (K-6) for one price unit of a multi-asset market (pass the
+ * unit: its `key` and `multi` select the per-asset record). A plain registry entry gives the pre-K-6 record.
+ */
+export function newMarketStat(m: {
+  label: string;
+  marketAddress: string;
+  poolAddress?: string;
+  dexType?: string;
+  key?: string;
+  multi?: boolean;
+  assetIndex?: number;
+  source?: "pool" | "fixed";
+  symbol?: string;
+}): MarketStat {
   return {
     label: m.label,
     marketAddress: m.marketAddress,
-    poolAddress: m.poolAddress,
-    dexType: m.dexType,
+    key: m.key ?? m.marketAddress,
+    multiAsset: m.multi ? { assetIndex: m.assetIndex ?? 0, source: m.source ?? "pool", symbol: m.symbol ?? null } : null,
+    poolAddress: m.poolAddress ?? "",
+    dexType: m.dexType ?? "",
     lastPriceE6: 0n,
     lastPushAt: null,
     lastSig: null,
@@ -257,14 +282,18 @@ interface LoopState {
  * signature, not terminal) — what the P3 vault-LP crank hook runs on. A market dropped
  * from the batch (preflight revert / quarantine) or terminal did NOT move its mark.
  */
-export function landedPushes<T extends { marketAddress: string; priceE6: bigint }>(
+export function landedPushes<T extends { marketAddress: string; priceE6: bigint; assetIndex?: number; multi?: boolean }>(
   pushes: ReadonlyArray<T>,
-  res: { pushedMarkets: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
+  res: { pushedMarkets: ReadonlyArray<string>; pushedKeys?: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
 ): T[] {
   if (!res.signature) return [];
   const pushed = new Set(res.pushedMarkets);
+  const pushedKeys = new Set(res.pushedKeys ?? []);
   const terminal = new Set(res.terminalMarkets ?? []);
-  return pushes.filter((p) => pushed.has(p.marketAddress) && !terminal.has(p.marketAddress));
+  // K-6: an asset of a multi-asset market landed only if ITS push went out (the market has several).
+  const went = (p: T): boolean =>
+    p.multi ? pushedKeys.has(pushGenerationKey({ marketAddress: p.marketAddress, assetIndex: p.assetIndex ?? 0 })) : pushed.has(p.marketAddress);
+  return pushes.filter((p) => went(p) && !terminal.has(p.marketAddress));
 }
 
 /**
@@ -273,9 +302,10 @@ export function landedPushes<T extends { marketAddress: string; priceE6: bigint 
  */
 export function publishLandedTicks(
   publisher: TickPublisher,
-  pushes: ReadonlyArray<{ marketAddress: string; assetIndex: number; priceE6: bigint }>,
-  res: { pushedMarkets: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
-  rawByMarket: (marketAddress: string) => bigint | null,
+  pushes: ReadonlyArray<{ marketAddress: string; assetIndex: number; priceE6: bigint; multi?: boolean }>,
+  res: { pushedMarkets: ReadonlyArray<string>; pushedKeys?: ReadonlyArray<string>; terminalMarkets?: ReadonlyArray<string>; signature?: string | null },
+  /** Raw source price of the push's market (K-6: and asset; a single-asset caller may ignore the second argument). */
+  rawByMarket: (marketAddress: string, assetIndex: number) => bigint | null,
   slot: bigint,
   landedMs: number,
 ): void {
@@ -286,7 +316,7 @@ export function publishLandedTicks(
       marketAddress: p.marketAddress,
       assetIndex: p.assetIndex,
       markE6: p.priceE6,
-      oracleE6: rawByMarket(p.marketAddress),
+      oracleE6: rawByMarket(p.marketAddress, p.assetIndex),
     }));
     publisher.publish(inputs, slot, landedMs);
   } catch {
@@ -411,6 +441,53 @@ export function withheldFromPush(market: string, withholdPush: ((m: string) => b
   }
 }
 
+/**
+ * K-6: record one MULTI-ASSET push's outcome on its own stat (`p.key`) and breaker. Mirrors the single-asset branch of
+ * runCycle, judged by the asset's own push (`pushedKeys`, generation key) instead of its market's.
+ */
+export function recordMultiAssetPushOutcome(
+  state: Pick<LoopState, "stats" | "landedThisCycle">,
+  p: { key: string; marketAddress: string; assetIndex: number; depth?: PushDepth | null },
+  res: { pushedKeys?: ReadonlyArray<string>; inactiveKeys?: ReadonlyArray<string>; signature?: string | null },
+  o: { dryRun: boolean; stamp: number; pending?: CircuitBreakerState },
+): "landed" | "inactive" | "dropped" {
+  const stat = state.stats.get(p.key);
+  if (!stat) return "dropped";
+  stat.authorityMismatch = false;
+  const genKey = pushGenerationKey(p);
+  if ((res.inactiveKeys ?? []).includes(genKey)) {
+    // The asset is not Active/DrainOnly (the program would refuse the push with 21): not landed, not an error.
+    stat.lastErrorMsg = "asset not Active/DrainOnly — not pushed";
+    return "inactive";
+  }
+  if (o.dryRun) {
+    stat.lastSig = "DRY_RUN";
+    stat.lastDepthE6 = p.depth?.depthE6 ?? null;
+    stat.lastDepthSource = p.depth?.source ?? null;
+    stat.noPushCycles = 0;
+    state.landedThisCycle.add(p.key);
+    return "landed";
+  }
+  if ((res.pushedKeys ?? []).includes(genKey) && res.signature) {
+    if (o.pending) {
+      crossClusterCircuitBreakerStates.set(p.key, commitPublishedBreakerState(crossClusterCircuitBreakerStates.get(p.key), o.pending, o.stamp));
+    }
+    recordLandedPush(stat, o.stamp, res.signature);
+    stat.lastDepthE6 = p.depth?.depthE6 ?? null;
+    stat.lastDepthSource = p.depth?.source ?? null;
+    state.landedThisCycle.add(p.key);
+    return "landed";
+  }
+  stat.totalErrors++;
+  stat.lastErrorMsg = "dropped from batch (reverted in preflight or quarantined)";
+  return "dropped";
+}
+
+/** K-6: the mark a fixed-source unit pushes (e6), or null when the unit is not a valid fixed source. */
+export function fixedPushFor(unit: Pick<PriceUnit, "source" | "fixedPriceE6">): bigint | null {
+  return unit.source === "fixed" && unit.fixedPriceE6 !== undefined && unit.fixedPriceE6 > 0n ? unit.fixedPriceE6 : null;
+}
+
 export function countPushableMarkets(markets: ReadonlyArray<{ marketAddress: string }>, terminal: ReadonlySet<string>): number {
   return markets.filter((m) => !terminal.has(m.marketAddress)).length;
 }
@@ -462,6 +539,78 @@ export function lossStaleMarketLabels(
     .map(([addr, stat]) => stat.label || addr);
 }
 
+/**
+ * K-6: the /health row of a MULTI-ASSET market, from its per-asset stats. Every asset is evaluated like a market of its
+ * own (no-push, mark-lagging) and checked for accrual lag (the cranker's latest read, multi-asset.ts); the market's
+ * `status` is "ok" only when every asset is, so ONE stale asset makes the market (and the keeper) degraded.
+ * Returns the row plus the labels to add to the top-level lists. Pure apart from the accrual sample lookup.
+ */
+export function multiAssetMarketHealth(
+  marketAddress: string,
+  label: string,
+  assetStats: ReadonlyArray<MarketStat>,
+  ctx: { terminal: boolean; thresholds: ReturnType<typeof getAlertSink>["thresholds"]; nowMs: number; accrualLagWarnSlots: number },
+): { row: Record<string, unknown>; noPush: string[]; markLagging: string[]; accrualLagging: string[] } {
+  const accrual = getMarketAccrual(marketAddress);
+  const lagging = new Set(ctx.terminal ? [] : laggingAssets(accrual, ctx.accrualLagWarnSlots));
+  const noPush: string[] = [];
+  const markLagging: string[] = [];
+  const accrualLagging: string[] = [];
+  const sorted = [...assetStats].sort((a, b) => (a.multiAsset?.assetIndex ?? 0) - (b.multiAsset?.assetIndex ?? 0));
+  const assets = sorted.map((stat) => {
+    const assetIndex = stat.multiAsset?.assetIndex ?? 0;
+    const verdict = evaluateMarketPush(marketPushSample(stat, ctx.terminal), ctx.thresholds, ctx.nowMs);
+    const lag = accrual?.assets.find((a) => a.assetIndex === assetIndex) ?? null;
+    let status: string = verdict.status;
+    if (verdict.status === "no-push") noPush.push(stat.label);
+    if (verdict.active.some((a) => a.kind === "mark-lagging")) markLagging.push(stat.label);
+    if (lagging.has(assetIndex)) {
+      accrualLagging.push(stat.label);
+      if (status === "ok") status = "accrual-lagging";
+    }
+    return {
+      assetIndex,
+      symbol: stat.multiAsset?.symbol ?? null,
+      source: stat.multiAsset?.source ?? "pool",
+      status,
+      noPushCycles: stat.noPushCycles,
+      lastPriceE6: stat.lastPriceE6.toString(),
+      lastPriceUsd: stat.lastPriceE6 > 0n ? (Number(stat.lastPriceE6) / 1e6).toFixed(4) : null,
+      sourcePriceUsd: stat.sourcePriceE6 > 0n ? (Number(stat.sourcePriceE6) / 1e6).toString() : null,
+      markGapPct: stat.markGap ? Number(stat.markGap.pct.toFixed(2)) : null,
+      lastPushAgo: stat.lastPushAt !== null ? `${Math.floor((ctx.nowMs - stat.lastPushAt) / 1000)}s` : null,
+      totalPushes: stat.totalPushes,
+      totalErrors: stat.totalErrors,
+      authorityMismatch: stat.authorityMismatch,
+      lastError: stat.lastErrorMsg,
+      accrualLagSlots: lag ? lag.lagSlots : null,
+      assetLossStale: lag ? lag.lossStale : null,
+    };
+  });
+  const stale = assets.filter((a) => a.status !== "ok");
+  const lastPushes = sorted.map((s) => s.lastPushAt).filter((t): t is number => t !== null);
+  const oldestPush = lastPushes.length === sorted.length && lastPushes.length > 0 ? Math.min(...lastPushes) : null;
+  return {
+    row: {
+      status: stale.length === 0 ? "ok" : (stale.find((a) => a.status === "no-push")?.status ?? stale[0].status),
+      label,
+      multiAsset: true,
+      assetCount: assets.length,
+      staleAssets: stale.map((a) => a.assetIndex),
+      // The OLDEST asset push (null until every asset has pushed once): what a single "last push" must mean here.
+      lastPushAgo: oldestPush !== null ? `${Math.floor((ctx.nowMs - oldestPush) / 1000)}s` : null,
+      noPushCycles: Math.max(0, ...sorted.map((s) => s.noPushCycles)),
+      totalPushes: sorted.reduce((n, s) => n + s.totalPushes, 0),
+      totalErrors: sorted.reduce((n, s) => n + s.totalErrors, 0),
+      accrualReadAgo: accrual ? `${Math.floor((ctx.nowMs - accrual.atMs) / 1000)}s` : null,
+      assets,
+    },
+    noPush,
+    markLagging,
+    accrualLagging,
+  };
+}
+
 export function makeHealthHandler(state: LoopState, config: LoopConfig, registry: Registry) {
   return (req: http.IncomingMessage, res: http.ServerResponse): void => {
     if (req.url !== "/health" && req.url !== "/") {
@@ -475,7 +624,18 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
     const thresholds = getAlertSink().thresholds;
     const noPushMarkets: string[] = [];
     const markLaggingMarkets: string[] = [];
+    // K-6: assets of multi-asset markets are grouped under their market (one /health row per market, `assets` inside).
+    const multiByMarket = new Map<string, MarketStat[]>();
+    /** One {label} per MARKET (single-asset: its stat; multi-asset: the registry label) for the market-level lists. */
+    const marketLabels = new Map<string, { label: string }>();
     for (const [addr, stat] of state.stats) {
+      if (stat.multiAsset) {
+        const list = multiByMarket.get(stat.marketAddress) ?? [];
+        list.push(stat);
+        multiByMarket.set(stat.marketAddress, list);
+        continue;
+      }
+      marketLabels.set(addr, stat);
       const verdict = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, addr)), thresholds, nowMs);
       if (verdict.status === "no-push") noPushMarkets.push(stat.label || addr);
       if (verdict.active.some((a) => a.kind === "mark-lagging")) markLaggingMarkets.push(stat.label || addr);
@@ -506,10 +666,25 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
     }
-    const lossStaleMarkets = lossStaleMarketLabels(state.stats, state.terminalMarkets, getCrankRefreshHealth);
+    const accrualLaggingAssets: string[] = [];
+    for (const [addr, assetStats] of multiByMarket) {
+      const label = registry.markets.find((m) => m.marketAddress === addr)?.label ?? addr;
+      marketLabels.set(addr, { label });
+      const h = multiAssetMarketHealth(addr, label, assetStats, {
+        terminal: !pushExpected(state, registry, addr),
+        thresholds,
+        nowMs,
+        accrualLagWarnSlots: thresholds.slotLagWarn,
+      });
+      noPushMarkets.push(...h.noPush);
+      markLaggingMarkets.push(...h.markLagging);
+      accrualLaggingAssets.push(...h.accrualLagging);
+      markets[addr] = { ...h.row, ...crankHealthFields(getCrankRefreshHealth(addr)) };
+    }
+    const lossStaleMarkets = lossStaleMarketLabels(marketLabels, state.terminalMarkets, getCrankRefreshHealth);
     // Markets whose account the keeper cannot read (unknown stride / unsupported portfolio layout):
     // their portfolios are not being refreshed. Reported, never silently treated as a legacy market.
-    const layoutProblemMarkets = [...state.stats.entries()]
+    const layoutProblemMarkets = [...marketLabels.entries()]
       .filter(([addr]) => getCrankRefreshHealth(addr)?.status.startsWith("layout-"))
       .map(([addr, stat]) => stat.label || addr);
     // A quarantined market reverted its push 3 cycles running, so the pusher
@@ -538,7 +713,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
               lossStaleMarkets.length > 0 ||
               layoutProblemMarkets.length > 0 ||
               noPushMarkets.length > 0 ||
-              markLaggingMarkets.length > 0
+              markLaggingMarkets.length > 0 ||
+              accrualLaggingAssets.length > 0
             ? "degraded-markets"
             : "ok",
       lastSuccessfulPushAgo:
@@ -551,6 +727,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       lossStaleMarkets,
       noPushMarkets,
       markLaggingMarkets,
+      // K-6: present only when a multi-asset market is registered (single-asset deployments keep today's key set).
+      ...(multiByMarket.size > 0 ? { accrualLaggingAssets } : {}),
       ...layoutProblemFields(layoutProblemMarkets),
       uptimeSec,
       cycleCount: state.cycleCount,
@@ -855,17 +1033,20 @@ async function runCycle(
   for (const addr of pruneDeregisteredMarkets(state, registry)) {
     console.log(`[keeper] ${addr.slice(0, 8)}… no longer registered — removed from /health`);
   }
+  // K-6: price units — one per single-asset market (key = market address, exactly the old per-entry state) and one
+  // per listed asset of a multi-asset market (key `<market>#<asset>`). Every per-unit map below is keyed by `key`.
+  const units = priceUnitsOfRegistry(registry.markets);
   // Ensure stat entries exist.
-  for (const entry of registry.markets) {
-    if (!state.stats.has(entry.marketAddress)) {
-      state.stats.set(entry.marketAddress, newMarketStat(entry));
+  for (const unit of units) {
+    if (!state.stats.has(unit.key)) {
+      state.stats.set(unit.key, unit.multi ? newMarketStat(unit) : newMarketStat(registry.markets.find((m) => m.marketAddress === unit.marketAddress) ?? unit));
     }
   }
 
   // ── 1. Oracle-authority check (only pushable markets go in a batch) ─────────
-  // "One-time" per 30-minute window — see maybeResetAuthorityLatches.
+  // "One-time" per 30-minute window — see maybeResetAuthorityLatches. K-6: per unit (each asset has its own profile).
   maybeResetAuthorityLatches();
-  const unchecked = registry.markets.filter((m) => !authorityChecked.has(m.marketAddress));
+  const unchecked = units.filter((m) => !authorityChecked.has(m.key));
   if (unchecked.length > 0) {
     await Promise.all(
       unchecked.map(async (m) => {
@@ -879,16 +1060,16 @@ async function runCycle(
           // (the set is module-level and never cleared), so a single rate-limit
           // burst at boot could take markets offline permanently while /health
           // still reported "ok".
-          const s = state.stats.get(m.marketAddress)!;
+          const s = state.stats.get(m.key)!;
           s.lastErrorMsg = `authority check failed (will retry): ${(err instanceof Error ? err.message : String(err)).slice(0, 80)}`;
           return;
         }
-        authorityChecked.add(m.marketAddress);
+        authorityChecked.add(m.key);
         // Only a SUCCESSFULLY READ, genuinely different authority is permanent.
         const ok = auth !== null && auth.equals(keeper.publicKey);
         if (!ok) {
-          notPushable.add(m.marketAddress);
-          const s = state.stats.get(m.marketAddress)!;
+          notPushable.add(m.key);
+          const s = state.stats.get(m.key)!;
           s.authorityMismatch = true;
           s.lastErrorMsg = "oracle_authority != keeper — market not pushable";
           console.warn(`[loop] ${m.label}: not pushable (oracle_authority != keeper)`);
@@ -914,7 +1095,8 @@ async function runCycle(
   try {
     prices = await readAllPoolPricesE6(
       mainnetConn,
-      registry.markets,
+      // K-6: pool-sourced units only (a fixed asset has no pool). For single-asset rows these are the rows' own fields.
+      units.filter((u) => u.source === "pool").map((u) => ({ poolAddress: u.poolAddress, dexType: u.dexType as DexType, label: u.label, symbol: u.symbol, mainnetCa: u.mainnetCa })),
       decimalsCache,
       // SOL/USD reference for WSOL-quoted (pumpswap) pools when no SOL/USDC
       // market is registered — see the param's doc comment.
@@ -936,7 +1118,7 @@ async function runCycle(
   state.lastBatchReadError = null;
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
-  const pushes: Array<{ marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null; dex?: DexDepthPin | null }> = [];
+  const pushes: Array<{ key: string; multi: boolean; marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null; dex?: DexDepthPin | null }> = [];
   const smoothNowMs = Date.now();
   // Smooth once per POOL per cycle, not once per market: N markets sharing a
   // pool would insert N identical samples per cycle, silently shrinking the
@@ -946,18 +1128,38 @@ async function runCycle(
   const smoothedThisCycle = new Map<string, bigint | null>();
   const smoothedE12ThisCycle = new Map<string, bigint | null>();
   const pendingCircuitBreakerStates = new Map<string, CircuitBreakerState>();
-  for (const entry of registry.markets) {
-    if (notPushable.has(entry.marketAddress)) continue;
+  for (const entry of units) {
+    if (notPushable.has(entry.key)) continue;
     // The cranker is landing follow-up refreshes for this market's current
     // accrual; a push now would void them (Custom(22)). Auto-expires.
     if (isPushHeld(entry.marketAddress)) continue;
     if (withheldFromPush(entry.marketAddress, config.withholdPush)) {
-      const ws = state.stats.get(entry.marketAddress);
+      const ws = state.stats.get(entry.key);
       if (ws) ws.lastErrorMsg = "push withheld: P3 senior backing exhausted, waiting for the tag 39 stale window";
       continue;
     }
+    const stat = state.stats.get(entry.key)!;
+    if (entry.source === "fixed") {
+      // K-6: a synthetic asset with a constant mark. No pool, so no smoother, no breaker and no source-frozen clock:
+      // the configured mark is pushed every cycle (that push is what keeps the asset's oracle fresh).
+      const fixed = fixedPushFor(entry);
+      if (fixed === null) {
+        stat.totalErrors++;
+        stat.lastErrorMsg = "fixed source without a valid fixedPriceE6";
+        continue;
+      }
+      if (config.standby?.(entry.marketAddress)) {
+        (state.standbyThisCycle ??= new Set()).add(entry.key);
+        state.landedThisCycle.add(entry.key);
+        stat.sourcePriceE6 = fixed;
+        continue;
+      }
+      stat.sourcePriceE6 = fixed;
+      stat.lastPriceE6 = fixed;
+      pushes.push({ key: entry.key, multi: entry.multi, marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6: fixed, depth: null });
+      continue;
+    }
     const rawPriceE6 = prices.get(entry.poolAddress);
-    const stat = state.stats.get(entry.marketAddress)!;
     if (rawPriceE6 === undefined || rawPriceE6 <= 0n) {
       stat.totalErrors++;
       stat.lastErrorMsg = noPoolPriceReason(priceSkipReasons, entry.poolAddress);
@@ -980,14 +1182,14 @@ async function runCycle(
     }
     // F2: standby (the primary is alive). The smoother above is already warm; do not touch the breaker or push.
     if (config.standby?.(entry.marketAddress)) {
-      (state.standbyThisCycle ??= new Set()).add(entry.marketAddress);
-      state.landedThisCycle.add(entry.marketAddress);
+      (state.standbyThisCycle ??= new Set()).add(entry.key);
+      state.landedThisCycle.add(entry.key);
       stat.sourcePriceE6 = priceE6;
       continue;
     }
 
     const currentCircuitBreakerState = getCrossClusterCircuitBreakerState(
-      entry.marketAddress,
+      entry.key,
       entry.label,
     );
     const candidateCircuitBreakerState = cloneCircuitBreakerState(
@@ -1010,7 +1212,7 @@ async function runCycle(
       // not advance the accepted baseline. checkCircuitBreaker() does not move
       // lastPrice on a rejected candidate.
       crossClusterCircuitBreakerStates.set(
-        entry.marketAddress,
+        entry.key,
         candidateCircuitBreakerState,
       );
       stat.totalErrors++;
@@ -1049,13 +1251,15 @@ async function runCycle(
       candidateCircuitBreakerState,
       publish.priceUsd,
     );
-    crossClusterCircuitBreakerStates.set(entry.marketAddress, commitNow);
-    pendingCircuitBreakerStates.set(entry.marketAddress, deferred);
+    crossClusterCircuitBreakerStates.set(entry.key, commitNow);
+    pendingCircuitBreakerStates.set(entry.key, deferred);
 
     stat.lastPriceE6 = publish.priceE6;
     // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
     const smoothedE12 = publish.priceE6 === priceE6 ? smoothedE12ThisCycle.get(entry.poolAddress) : null;
     pushes.push({
+      key: entry.key,
+      multi: entry.multi,
       marketAddress: entry.marketAddress,
       assetIndex: entry.assetIndex,
       priceE6: publish.priceE6,
@@ -1137,6 +1341,11 @@ async function runCycle(
     for (const m of res.dexRefusedMarkets ?? []) depthSourceCache.invalidate(m);
     for (const p of pushes) {
       if (terminalSet.has(p.marketAddress)) continue; // B20: Resolved/closed — not an error
+      if (p.multi) {
+        // K-6: an asset of a multi-asset market is judged by ITS push (generation key), with its own stat and breaker.
+        recordMultiAssetPushOutcome(state, p, res, { dryRun: config.dryRun, stamp, pending: pendingCircuitBreakerStates.get(p.key) });
+        continue;
+      }
       const stat = state.stats.get(p.marketAddress)!;
       stat.authorityMismatch = false;
       if (config.dryRun) {
@@ -1169,7 +1378,9 @@ async function runCycle(
       }
     }
     if (config.onPushLanded && !config.dryRun) {
-      for (const p of landedPushes(pushes, res)) {
+      // The P3 vault-LP hook is per MARKET mark move; a multi-asset market has no single mark (and cannot hold a bound
+      // vault LP: tag 40 ACTIVATE refuses one), so its assets never fire it.
+      for (const p of landedPushes(pushes, res).filter((x) => !x.multi)) {
         try {
           config.onPushLanded(p.marketAddress, p.priceE6, state.stats.get(p.marketAddress)?.label ?? p.marketAddress);
         } catch {
@@ -1182,8 +1393,8 @@ async function runCycle(
         state.tickPublisher,
         pushes,
         res,
-        (m) => {
-          const raw = state.stats.get(m)?.lastRawPriceE6 ?? 0n;
+        (m, assetIndex) => {
+          const raw = (state.stats.get(m) ?? state.stats.get(multiAssetKey(m, assetIndex)))?.lastRawPriceE6 ?? 0n;
           return raw > 0n ? raw : null;
         },
         nowSlot,
@@ -1208,7 +1419,7 @@ async function runCycle(
     console.error(`[loop] batch push error — ${msg}`);
     if (/blockhash/i.test(msg)) invalidateBlockhash(devnetConn); // force refresh next cycle
     for (const p of pushes) {
-      const s = state.stats.get(p.marketAddress)!;
+      const s = state.stats.get(p.key)!; // K-6: p.key === p.marketAddress for a single-asset market
       s.totalErrors++;
       s.lastErrorMsg = msg;
     }
@@ -1220,11 +1431,12 @@ async function runCycle(
  * land a push extends its no-push streak. A landed push already reset it.
  */
 export function advanceNoPushStreaks(
-  stats: Iterable<Pick<MarketStat, "marketAddress" | "noPushCycles">>,
+  stats: Iterable<Pick<MarketStat, "marketAddress" | "noPushCycles"> & Partial<Pick<MarketStat, "key">>>,
   landed: ReadonlySet<string>,
 ): void {
+  // K-6: `landed` holds stat keys (= the market address for a single-asset market).
   for (const stat of stats) {
-    if (!landed.has(stat.marketAddress)) stat.noPushCycles++;
+    if (!landed.has(stat.key ?? stat.marketAddress)) stat.noPushCycles++;
   }
 }
 
@@ -1243,9 +1455,11 @@ export function pruneDeregisteredMarkets(
   registry: Pick<Registry, "markets">,
 ): string[] {
   const keep = new Set(registry.markets.map((m) => m.marketAddress));
+  // K-6: per-asset keys of multi-asset markets (`<market>#<asset>`) live in the same maps; keep the listed ones.
+  const keepKeys = new Set([...keep, ...priceUnitsOfRegistry(registry.markets).map((u) => u.key)]);
   const removed: string[] = [];
   for (const addr of [...state.stats.keys()]) {
-    if (keep.has(addr)) continue;
+    if (keepKeys.has(addr)) continue;
     state.stats.delete(addr);
     state.terminalMarkets.delete(addr);
     state.landedThisCycle.delete(addr);
@@ -1253,10 +1467,11 @@ export function pruneDeregisteredMarkets(
   }
   for (const addr of pruneCrankRefreshHealth(keep)) if (!removed.includes(addr)) removed.push(addr);
   // Module-level per-market maps: authority latches, breaker state, nonce / quarantine / terminal-log.
-  for (const m of [...authorityChecked]) if (!keep.has(m)) authorityChecked.delete(m);
-  for (const m of [...notPushable]) if (!keep.has(m)) notPushable.delete(m);
-  for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keep.has(m)) crossClusterCircuitBreakerStates.delete(m);
+  for (const m of [...authorityChecked]) if (!keepKeys.has(m)) authorityChecked.delete(m);
+  for (const m of [...notPushable]) if (!keepKeys.has(m)) notPushable.delete(m);
+  for (const m of [...crossClusterCircuitBreakerStates.keys()]) if (!keepKeys.has(m)) crossClusterCircuitBreakerStates.delete(m);
   pruneAuthMarkPusherState(keep);
+  pruneMarketAccrual(keep);
   return removed;
 }
 
@@ -1378,7 +1593,8 @@ export async function startKeeperLoop(
     zeroPushStreak: 0,
     terminalMarkets: new Set(),
     landedThisCycle: new Set(),
-    stats: new Map(registry.markets.map((m) => [m.marketAddress, newMarketStat(m)])),
+    // K-6: one stat per price unit; for single-asset markets exactly the old per-market record.
+    stats: new Map(priceUnitsOfRegistry(registry.markets).map((u) => [u.key, u.multi ? newMarketStat(u) : newMarketStat(registry.markets.find((m) => m.marketAddress === u.marketAddress) ?? u)])),
   };
 
   const decimalsCache: DecimalsCache = new Map();
@@ -1468,7 +1684,8 @@ export async function startKeeperLoop(
       state.landedThisCycle,
     );
     // B20: terminal markets can never be pushed; a board of only terminal markets is not an outage.
-    await reportPushCycle(state, countPushableMarkets(registry.markets, state.terminalMarkets) - (state.standbyThisCycle?.size ?? 0));
+    // K-6: counted per price unit (= per market when every market is single-asset).
+    await reportPushCycle(state, countPushableMarkets(priceUnitsOfRegistry(registry.markets), state.terminalMarkets) - (state.standbyThisCycle?.size ?? 0));
     await reportMarketPush(state, registry);
     const elapsed = Date.now() - cycleStart;
     const remaining = config.intervalMs - elapsed;

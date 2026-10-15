@@ -20,6 +20,7 @@ import { Connection } from "@solana/web3.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import { loadRegistry } from "./cross-cluster/registry.ts";
+import { priceUnitsOfRegistry } from "./cross-cluster/multi-asset.ts";
 import {
   readPoolPriceE6,
   isSolUsdEntry,
@@ -110,10 +111,16 @@ if (solPriceE6 !== undefined) {
 // ── 2. Registered market prices ──────────────────────────────────────────────
 if (registry.markets.length > 0) {
   console.log("\n── Registry market push simulation ────────────────────────────────────");
-  for (const entry of registry.markets) {
+  // K-6: one line per price unit (a multi-asset row lists each asset; a fixed asset has no pool to read).
+  for (const entry of priceUnitsOfRegistry(registry.markets)) {
     process.stdout.write(`  ${entry.label} (${entry.dexType}) ... `);
+    if (entry.source === "fixed" || entry.dexType === "fixed") {
+      console.log(`FIXED priceE6=${entry.fixedPriceE6 ?? "?"}  [DRY-RUN] PushAuthMark market=${entry.marketAddress.slice(0, 8)}… assetIndex=${entry.assetIndex}`);
+      continue;
+    }
+    const poolEntry = { ...entry, dexType: entry.dexType };
     try {
-      const result = await readPoolPriceE6(mainnetConn, entry, decimalsCache, solPriceE6);
+      const result = await readPoolPriceE6(mainnetConn, poolEntry, decimalsCache, solPriceE6);
       if (result.skipped) {
         console.log(`SKIP: ${result.skipReason}`);
       } else {
@@ -125,7 +132,7 @@ if (registry.markets.length > 0) {
             ` assetIndex=${entry.assetIndex}` +
             ` priceE6=${result.priceE6} ($${usd})`,
         );
-        if (solPriceE6 === undefined && isSolUsdEntry(entry)) {
+        if (solPriceE6 === undefined && isSolUsdEntry(poolEntry)) {
           solPriceE6 = result.priceE6;
           console.log(`    [info] SOL/USD reference now resolved: $${usd} (from this entry)`);
         }

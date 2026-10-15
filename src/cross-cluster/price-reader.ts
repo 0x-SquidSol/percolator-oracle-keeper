@@ -38,7 +38,7 @@ import {
   SPL_MINT_DECIMALS_OFFSET,
   WSOL_MINT,
 } from "@percolatorct/sdk";
-import type { MarketEntry } from "./registry.ts";
+import type { PoolPriceSource } from "./registry.ts";
 
 /** Per-pool cached mint decimals (keyed by pool address string). */
 export type DecimalsCache = Map<string, { base: number; quote: number }>;
@@ -54,7 +54,7 @@ export type DecimalsCache = Map<string, { base: number; quote: number }>;
  * every pre-seeded registry.json entry and by register-poll.ts), falling
  * back to a `label` prefix check for entries that lack `symbol`.
  */
-export function isSolUsdEntry(entry: Pick<MarketEntry, "dexType" | "label" | "symbol">): boolean {
+export function isSolUsdEntry(entry: Pick<PoolPriceSource, "dexType" | "label" | "symbol">): boolean {
   if (entry.dexType !== "raydium-clmm" && entry.dexType !== "meteora-dlmm") return false;
   const sym = (entry.symbol ?? "").toUpperCase();
   if (sym === "SOL/USDC" || sym === "SOL/USDT") return true;
@@ -479,7 +479,7 @@ export const MIN_POOL_LIQUIDITY_USD_E6: bigint = (() => {
 
 export async function readPoolPriceE6(
   mainnetConn: Connection,
-  entry: Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "mainnetCa">,
+  entry: Pick<PoolPriceSource, "poolAddress" | "dexType" | "label" | "mainnetCa">,
   decimalsCache: DecimalsCache,
   solPriceE6?: bigint,
 ): Promise<PriceReadResult> {
@@ -865,7 +865,7 @@ async function getMultipleAccountsChunked(
 
 export async function readAllPoolPricesE6(
   mainnetConn: Connection,
-  entries: Array<Pick<MarketEntry, "poolAddress" | "dexType" | "label" | "symbol" | "mainnetCa">>,
+  entries: Array<Pick<PoolPriceSource, "poolAddress" | "dexType" | "label" | "symbol" | "mainnetCa">>,
   decimalsCache: DecimalsCache,
   /**
    * Mainnet raydium-clmm SOL/USDC pool used as the SOL/USD reference when no

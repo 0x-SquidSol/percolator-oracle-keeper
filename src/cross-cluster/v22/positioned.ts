@@ -12,6 +12,7 @@ import { fetchMarketPortfolios } from "../recovery-cranker.ts";
 import { riskSnapOf } from "../positioned-refresh.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { V22MarketCtx } from "./market.ts";
+import { observationAssetsFor } from "../multi-asset.ts";
 
 export interface V22Positioned {
   /** Every positioned portfolio of the asset (LP included, flagged `isLp`). */
@@ -36,9 +37,18 @@ export interface V22Positioned {
 
 export function analysePortfolios(
   accounts: ReadonlyArray<{ pubkey: PublicKey; data: Uint8Array }>,
-  p: { assetIndex?: number; lpPortfolio: PublicKey | null; portfolioLen: number; keeperOwner?: PublicKey | null; anchorOverride?: PublicKey | null },
+  p: {
+    assetIndex?: number;
+    /** K-6: every observed asset of a multi-asset market (a leg on ANY of them positions the portfolio). Wins over `assetIndex`. */
+    assetIndices?: ReadonlyArray<number>;
+    lpPortfolio: PublicKey | null;
+    portfolioLen: number;
+    keeperOwner?: PublicKey | null;
+    anchorOverride?: PublicKey | null;
+  },
 ): V22Positioned {
   const assetIndex = p.assetIndex ?? 0;
+  const onAsset: (a: number) => boolean = p.assetIndices && p.assetIndices.length > 0 ? (a) => p.assetIndices!.includes(a) : (a) => a === assetIndex;
   const all: PositionedPortfolio[] = [];
   const minLegAbs = new Map<string, bigint>();
   let flatAnchor: PublicKey | null = null;
@@ -72,7 +82,7 @@ export function analysePortfolios(
       if (!leg.active) continue;
       anyActive = true;
       activeLegs++;
-      if (leg.assetIndex !== assetIndex) continue;
+      if (!onAsset(leg.assetIndex)) continue;
       lossWeight += leg.lossWeight;
       const abs = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
       if (minAbs === null || abs < minAbs) minAbs = abs;
@@ -115,7 +125,7 @@ export async function loadV22Positioned(
     const accts = await fetchMarketPortfolios(conn, ctx.market, ctx.layout.portfolioAccountLen);
     const r = analysePortfolios(
       accts.map((a) => ({ pubkey: a.pubkey, data: a.account.data })),
-      { lpPortfolio: ctx.lpPortfolio, portfolioLen: ctx.layout.portfolioAccountLen, keeperOwner, anchorOverride },
+      { lpPortfolio: ctx.lpPortfolio, portfolioLen: ctx.layout.portfolioAccountLen, keeperOwner, anchorOverride, assetIndices: observationAssetsFor(ctx.marketAddress) },
     );
     if (r.anchorOverrideRejected) console.warn(`[v22] ${ctx.label}: KEEPER_V22_ACCRUE_ANCHORS ignored: ${r.anchorOverrideRejected}`);
     return r;
