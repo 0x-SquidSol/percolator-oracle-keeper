@@ -235,11 +235,13 @@ describe("tag 111 G9", () => {
 });
 
 describe("stake v5 sync (tag 31)", () => {
-  function poolBytes(lastSync: bigint, cooldown = 150n): Uint8Array {
+  function poolBytes(lastSync: bigint, cooldown = 150n, o: { riskMode?: number; poolMode?: number } = {}): Uint8Array {
     const F = STAKE_POOL_FIELD_OFF_V5;
     const b = Buffer.alloc(STAKE_POOL_SIZE_V5);
     "SPOOL_V1".split("").forEach((c, i) => (b[F.reserved + i] = c.charCodeAt(0)));
     b[F.version] = 5;
+    b[F.riskMode] = o.riskMode ?? 1;
+    if (o.poolMode !== undefined) b[F.poolMode] = o.poolMode;
     b.writeBigUInt64LE(lastSync, F.lastSyncSlot);
     b.writeBigUInt64LE(cooldown, F.syncCooldownSlots);
     return new Uint8Array(b);
@@ -279,6 +281,16 @@ describe("stake v5 sync (tag 31)", () => {
     assert.equal((await stakeSyncOnce(execCtx(g.conn), ctx, poolBytes(0n), freshStakeSyncState(), { intervalMs: 0, nowMs: 1 })).kind, "quiet");
     assert.equal((await stakeSyncOnce(execCtx(f.conn), ctx, new Uint8Array(100), freshStakeSyncState(), { intervalMs: 0 })).kind, "skipped");
     assert.equal((await stakeSyncOnce(execCtx(f.conn), ctx, null, freshStakeSyncState(), { intervalMs: 0 })).kind, "skipped");
+  });
+  it("tag 31 is FIRST_LOSS + insurance-mode only: FEE_ONLY / legacy / fee-mode pools are skipped, never simulated (no InvalidPoolMode(17))", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn({ simErr: () => customAt(0, 17) });
+    for (const o of [{ riskMode: 2 }, { riskMode: 0 }, { riskMode: 1, poolMode: 1 }]) {
+      const r = await stakeSyncOnce(execCtx(f.conn), ctx, poolBytes(0n, 150n, o), freshStakeSyncState(), { intervalMs: 0, nowMs: 1 });
+      assert.equal(r.kind, "skipped", JSON.stringify(o));
+    }
+    assert.equal(f.sims.length, 0, "no simulation, no send");
+    assert.equal(f.sent.length, 0);
   });
 });
 

@@ -10,6 +10,9 @@
  *                                  exit readings differ. The keeper backs off for DIVERGED_BACKOFF_COOLDOWNS
  *                                  cooldowns and counts it; it never retry-spams the program.
  *   other 33-45                    named in the log, counted, backed off one cooldown.
+ *
+ * Only FIRST_LOSS pools in insurance mode deploy insurance: the program refuses tag 31 on any other pool with
+ * InvalidPoolMode(17) (`!is_first_loss() || pool_mode != 0`), so those pools are skipped before simulating.
  */
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import {
@@ -21,6 +24,7 @@ import {
   deriveStakeVaultAuth,
   encodeStakeSyncInsuranceDeploymentV5,
   parseWrapperConfigV17,
+  STAKE_RISK_MODE,
   stakeMetasV5,
 } from "@percolatorct/sdk";
 import type { StakePoolV5 } from "@percolatorct/sdk";
@@ -82,6 +86,9 @@ export async function stakeSyncOnce(
     decoded = decodeStakePoolV5(poolData);
   } catch (e) {
     return { kind: "skipped", reason: `pool is not a v5 pool (${(e instanceof Error ? e.message : String(e)).slice(0, 80)})` };
+  }
+  if (decoded.riskMode !== STAKE_RISK_MODE.FirstLoss || decoded.poolMode !== 0) {
+    return { kind: "skipped", reason: `tag 31 is FIRST_LOSS insurance-mode only (risk mode ${decoded.riskMode}, pool mode ${decoded.poolMode})` };
   }
   const nowSlot = BigInt(ctx.readSlot);
   const nowMs = p.nowMs ?? Date.now();
