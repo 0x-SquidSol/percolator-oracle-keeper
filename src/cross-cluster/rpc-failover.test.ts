@@ -26,6 +26,7 @@ interface Host {
   slot?: number;
   blockAgeSec?: number; // age of the block returned by getBlockTime (default 8)
   noBlockTime?: boolean;
+  slotFn?: (nowMs: number) => number; // exact slot as a function of the clock
   frozen?: boolean; // slot does not advance with the clock (a stuck node)
 }
 
@@ -45,7 +46,7 @@ function makeNet(hosts: Record<string, Host>, nowMs: () => number = () => 1_000_
     }
     if (method === "getGenesisHash" || method === "getSlot") {
       if (h.status && h.status !== 200) return new Response(h.body ?? "x", { status: h.status });
-      const result = method === "getGenesisHash" ? (h.genesis ?? GENESIS_HASH.devnet) : (h.slot ?? 1000) + (h.frozen ? 0 : Math.floor(((nowMs() - 1_000_000) * 2.5) / 1000));
+      const result = method === "getGenesisHash" ? (h.genesis ?? GENESIS_HASH.devnet) : h.slotFn ? h.slotFn(nowMs()) : (h.slot ?? 1000) + (h.frozen ? 0 : Math.floor(((nowMs() - 1_000_000) * 2.5) / 1000));
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 });
     }
     return new Response(h.body ?? JSON.stringify({ jsonrpc: "2.0", id: 1, result: `ok:${url}` }), { status: h.status ?? 200 });
@@ -200,7 +201,7 @@ describe("rpc-failover: cluster check per endpoint", () => {
 describe("rpc-failover: slot freshness", () => {
   it("a fallback lagging more than maxSlotLag behind the best seen slot is treated as down", async () => {
     // primary answers (slot 10_000) so the best slot is known; then quota hits, fallback is 500 slots behind
-    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 9_500 } }, [P, F1], { maxSlotLag: 50, slotCheckIntervalMs: 1 });
+    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 9_500, blockAgeSec: 200 } }, [P, F1], { maxSlotLag: 50, slotCheckIntervalMs: 1 }); // a node 500 slots behind has a ~200 s old block time
     await call(f); // vets primary: records slot 10_000
     net.hosts[P] = { status: 429 };
     tick(1_000);
@@ -219,7 +220,7 @@ describe("rpc-failover: slot freshness", () => {
   });
 
   it("the bound is configurable", async () => {
-    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 9_970 } }, [P, F1], { maxSlotLag: 10, slotCheckIntervalMs: 1 });
+    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 9_970, blockAgeSec: 20 } }, [P, F1], { maxSlotLag: 10, slotCheckIntervalMs: 1 });
     await call(f);
     net.hosts[P] = { status: 429 };
     tick(1_000);
@@ -230,13 +231,13 @@ describe("rpc-failover: slot freshness", () => {
     const { f, net, tick } = mk({ [P]: { status: 429 }, [F1]: { slot: 10_000 } }, [P, F1], { maxSlotLag: 50, primaryRetryMs: 1_000, backoffBaseMs: 1_000 });
     await call(f);
     assert.equal(f.snapshot().activeIndex, 1);
-    net.hosts[P] = { slot: 9_000 }; // back, but 1000+ slots behind the fallback
+    net.hosts[P] = { slot: 9_000, blockAgeSec: 400 }; // back, but 1000+ slots (400 s) behind the fallback
     tick(30_000);
     await call(f);
     await new Promise((r) => setTimeout(r, 10));
     assert.equal(f.snapshot().activeIndex, 1);
     assert.equal(f.snapshot().endpoints[0].state, "down");
-    net.hosts[P] = { slot: 10_000 + 2 * 120 }; // caught up
+    net.hosts[P] = { slotFn: (ms) => 10_000 + Math.floor(((ms - 1_000_000) * 2.5) / 1000) }; // caught up (tracks the fallback)
     tick(120_000);
     await call(f);
     await new Promise((r) => setTimeout(r, 10));
@@ -299,7 +300,7 @@ const sendCall = (f: RpcFailover) => call(f, "sendTransaction");
 
 describe("rpc-failover: R153 F1 slot guard survives a long outage / a baseline-less boot", () => {
   it("primary 429 for 120 s, then a fallback 5000 slots behind is NOT served", async () => {
-    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 5_000, frozen: true } }, [P, F1], { slotCheckIntervalMs: 1 });
+    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 5_000, frozen: true, blockAgeSec: 2_000 } }, [P, F1], { slotCheckIntervalMs: 1 });
     await call(f); // primary vetted: floor slot 10_000
     net.hosts[P] = { status: 429 };
     tick(120_000); // > the 60 s window in which a peer observation counts
@@ -516,16 +517,6 @@ describe("rpc-failover: N1/N2/N3 follow-ups", () => {
     assert.ok(peerCalls <= 4, `dead peer probed ${peerCalls} times in 3 s of vets`);
   });
 
-  it("N3: a plausibly-higher genesis-verified peer is a lower bound; the lagging endpoint is refused", async () => {
-    // F1 is 120 slots behind F2 (> maxSlotLag 50, within the plausible window); block times look fine
-    const { f, net } = mk({ [P]: { status: 429 }, [F1]: { slot: 10_000 }, [F2]: { slot: 10_120 } }, [P, F1, F2]);
-    assert.equal(await who(await call(f)), `ok:${F2}`);
-    const s = f.snapshot();
-    assert.equal(s.endpoints[1].state, "down");
-    assert.match(s.endpoints[1].lastError ?? "", /behind a genesis-verified peer/);
-    assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "getBalance"));
-  });
-
   it("N3: an implausibly-high peer is still discarded (it cannot take the floor)", async () => {
     const { f } = mk({ [P]: { status: 429 }, [F1]: { slot: 10_000 }, [F2]: { slot: 4_000_000 } }, [P, F1, F2]);
     assert.equal(await who(await call(f)), `ok:${F1}`);
@@ -544,5 +535,108 @@ describe("rpc-failover: N1/N2/N3 follow-ups", () => {
       await call(f).catch(() => undefined);
     }
     assert.equal(f.snapshot().floorSlot, 100, "re-seeded to the raw replies (100), not 100 + elapsed*2.5");
+  });
+});
+
+describe("rpc-failover: R153 round 4 (corroborated raises, re-anchor, headroom, alerts)", () => {
+  const T0 = 1_000_000;
+  const honest = (ms: number) => 100_000 + Math.floor(((ms - T0) * 2.5) / 1000);
+
+  it("boot with a fallback +100 ahead of an honest primary: the primary stays active and serving (no takeover)", async () => {
+    for (const K of [100, 240]) {
+      const { f, net, tick } = mk({ [P]: { slotFn: honest }, [F1]: { slotFn: (ms) => honest(ms) + K } }, [P, F1], { slotCheckIntervalMs: 1 });
+      for (let i = 0; i < 10; i++) {
+        assert.equal(await who(await call(f)), `ok:${P}`, `K=${K} request ${i}`);
+        tick(11_000);
+      }
+      const s = f.snapshot();
+      assert.equal(s.activeIndex, 0);
+      assert.equal(s.endpoints[0].state, "ok");
+      assert.equal(s.endpoints[0].confirmed, true);
+      void net;
+    }
+  });
+
+  it("a fallback +100 ahead is refused as uncorroborated once the primary's slot is known (never carries a send)", async () => {
+    const { f, net, tick } = mk({ [P]: { slotFn: honest }, [F1]: { slotFn: (ms) => honest(ms) + 100 } }, [P, F1], { slotCheckIntervalMs: 1 });
+    await call(f);
+    net.hosts[P] = { status: 429 };
+    tick(5_000);
+    // while the primary's observation is fresh (<60 s) the +100 fallback is NOT believed (uncorroborated)
+    await assert.rejects(call(f), /rpc-degraded/);
+    tick(65_000);
+    // the primary has been silent for over a minute: the fallback is the sole live endpoint and IS used ...
+    assert.equal(await who(await call(f)), `ok:${F1}`);
+    // ... but with the primary live again and honest, the fallback is no longer believed
+    net.hosts[P] = { slotFn: honest };
+    tick(60_000);
+    await call(f);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(f.snapshot().activeIndex, 0);
+  });
+
+  it("2 h of a rogue fallback pacing the ceiling, then the honest primary returns: it is re-accepted and an [ALERT] is logged", async () => {
+    const { f, net, tick, logs } = mk({ [P]: { slotFn: honest }, [F1]: { slotFn: honest } }, [P, F1], { slotCheckIntervalMs: 1, primaryRetryMs: 1, backoffBaseMs: 1, backoffMaxMs: 1 });
+    await call(f);
+    const a0 = honest(T0);
+    let now = T0;
+    net.hosts[P] = { status: 429 };
+    // the rogue reports exactly the (new, 1.15x) ceiling of the anchor set at t0
+    const rogue = (ms: number) => Math.floor(a0 + ((ms - T0) / 1000) * 2.5 * 1.15 + 100 - 1);
+    net.hosts[F1] = { slotFn: rogue };
+    let served = 0;
+    for (let s = 0; s < 7_200; s += 11) {
+      tick(11_000);
+      now += 11_000;
+      if ((await call(f).then((r) => r.status, () => 0)) === 200) served++;
+    }
+    assert.ok(served > 600, `rogue served ${served}`);
+    const lead = rogue(now) - honest(now);
+    assert.ok(lead < 3_000, `lead ${lead}`); // was 9,105 with 1.5x headroom
+    // honest primary returns; the rogue keeps lying
+    net.hosts[P] = { slotFn: honest };
+    for (let i = 0; i < 10; i++) {
+      tick(30_000);
+      now += 30_000;
+      await call(f).catch(() => undefined);
+    }
+    const s = f.snapshot();
+    assert.equal(s.endpoints[0].state, "ok", JSON.stringify(s.endpoints[0]));
+    assert.equal(s.activeIndex, 0);
+    assert.ok((s.floorSlot as number) <= honest(now) + 60, `floor ${s.floorSlot} vs honest ${honest(now)}`);
+    assert.ok(logs.some((l) => /\[ALERT\] slot floor .* overturned/.test(l)), logs.slice(-5).join("\n"));
+  });
+
+  it("(4) primary rejected as lagging while the active fallback is the sole floor source -> [ALERT] naming both slots", async () => {
+    const { f, net, tick, logs } = mk({ [P]: { slotFn: honest }, [F1]: { slotFn: honest } }, [P, F1], { primaryRetryMs: 1, backoffBaseMs: 1 });
+    await call(f);
+    net.hosts[P] = { status: 429 };
+    net.hosts[F1] = { slotFn: (ms) => honest(ms) + 62 }; // leads by more than maxSlotLag, inside the clock-skew allowance
+    tick(65_000);
+    assert.equal(await who(await call(f)), `ok:${F1}`); // sole live endpoint: believed, floor raised (uncorroborated)
+    net.hosts[P] = { slotFn: honest };
+    tick(3_000);
+    await call(f);
+    await new Promise((r) => setTimeout(r, 10));
+    const a = logs.find((l) => /\[ALERT\] primary rejected as lagging/.test(l));
+    assert.ok(a, logs.join("\n"));
+    assert.match(a as string, /primary slot \d+ vs floor \d+/);
+    assert.equal(f.snapshot().activeIndex, 1);
+  });
+
+  it("(2) agreement re-anchors: two agreeing endpoints reset the ceiling line, so the slack does not accumulate", async () => {
+    const { f, net, tick } = mk({ [P]: { slotFn: honest }, [F1]: { slotFn: honest } }, [P, F1], { slotCheckIntervalMs: 1_000 });
+    // an hour of both endpoints live and agreeing
+    for (let s = 0; s < 3_600; s += 10) {
+      tick(10_000);
+      await call(f);
+    }
+    // now the primary goes away; the rogue can only gain the slack accrued since the last agreement (~seconds)
+    net.hosts[P] = { status: 429 };
+    const nowMs = T0 + 3_600_000;
+    net.hosts[F1] = { slotFn: (ms) => honest(nowMs) + 400 + Math.floor(((ms - nowMs) * 2.5) / 1000) };
+    tick(15_000);
+    await call(f).catch(() => undefined);
+    assert.equal(f.snapshot().endpoints[1].state, "down", "a +400 lead is beyond the freshly re-anchored ceiling");
   });
 });

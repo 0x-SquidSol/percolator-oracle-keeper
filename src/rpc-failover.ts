@@ -71,6 +71,9 @@ export const GENESIS_HASH = {
   devnet: "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
   mainnet: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
 } as const;
+/** Real chain speed is ~2.5 slots/s; ceilings allow 15% over it. (R153 round 4: 1.5x left 1.25 slots/s of slack.) */
+export const HEADROOM = 1.15;
+
 export type FailoverCluster = keyof typeof GENESIS_HASH;
 
 // ── secret redaction ─────────────────────────────────────────────────────────
@@ -224,6 +227,10 @@ export class RpcFailover {
   /** Highest slot ever observed on any endpoint. Never expires, never projected: the chain only moves forward. */
   private floorSlot: number | null = null;
   /** N1: the plausibility line is anchored HERE, set at first corroboration or a hatch reseed, never by a raise. */
+  /** Was the current floor corroborated by two agreeing genesis-verified endpoints (vs raised by a sole live one)? */
+  private floorCorroborated = false;
+  private floorSource: number | null = null;
+  private primaryAlertAt = 0;
   private anchor: { slot: number; at: number } | null = null;
   private allDownSince: number | null = null;
   private allDownAlertedAt = 0;
@@ -317,18 +324,17 @@ export class RpcFailover {
     this.logLine(`ACTIVE ENDPOINT ${from.label} -> #${ep.idx} ${ep.label} (${why})`);
   }
 
-  /** Best slot seen on any endpoint (other than `except`), projected forward by elapsed time. */
-  private bestOtherSlot(except: Endpoint): number | null {
+  /** Recent (<60 s) observations of the other genesis-verified endpoints, projected to now. */
+  private recentOthers(except: Endpoint): number[] {
     const t = this.now();
-    let best: number | null = null;
+    const out: number[] = [];
     for (const o of this.eps) {
-      if (o === except || o.slot === null || o.refused) continue;
+      if (o === except || o.slot === null || o.refused || !o.genesisOk) continue;
       const age = t - o.slotAt;
       if (age > 60_000) continue;
-      const proj = o.slot + Math.floor((age / 1000) * this.cfg.slotsPerSecond);
-      if (best === null || proj > best) best = proj;
+      out.push(o.slot + Math.floor((age / 1000) * this.cfg.slotsPerSecond));
     }
-    return best;
+    return out;
   }
 
   private async rpc(ep: Endpoint, method: string, params?: unknown[]): Promise<{ status: number; result?: unknown; err?: string }> {
@@ -385,7 +391,7 @@ export class RpcFailover {
    */
   private floorCeiling(): number | null {
     if (this.anchor === null) return null;
-    return this.anchor.slot + ((this.now() - this.anchor.at) / 1000) * this.cfg.slotsPerSecond * 1.5 + 2 * this.cfg.maxSlotLag;
+    return this.anchor.slot + ((this.now() - this.anchor.at) / 1000) * this.cfg.slotsPerSecond * HEADROOM + 2 * this.cfg.maxSlotLag;
   }
 
   /**
@@ -433,7 +439,7 @@ export class RpcFailover {
     const raws = live.map((e) => e.rawSlot as number).sort((x, y) => x - y);
     const ats = live.map((e) => e.rawAt);
     // replies were taken at different moments; allow the chain's own movement between them on top of maxSlotLag
-    const tolerance = this.cfg.maxSlotLag + 1.5 * this.cfg.slotsPerSecond * ((Math.max(...ats) - Math.min(...ats)) / 1000);
+    const tolerance = this.cfg.maxSlotLag + HEADROOM * this.cfg.slotsPerSecond * ((Math.max(...ats) - Math.min(...ats)) / 1000);
     if (raws[raws.length - 1] - raws[0] > tolerance) return;
     const proj = raws;
     // SAFE CHOICE, deliberately: the median of the RAW replies, not of replies projected forward by elapsed time. The
@@ -444,6 +450,7 @@ export class RpcFailover {
     this.logLine(`[ALERT] every endpoint has been rejected as lagging for >= ${Math.round(this.cfg.floorReseedMs / 1000)}s but they agree with each other (slots ${proj.join(",")}); the slot floor ${this.floorSlot} was wrong, re-seeding it to ${median}`);
     this.floorSlot = median;
     this.anchor = { slot: median, at: t };
+    this.floorCorroborated = true;
     for (const e of live) {
       e.laggingSince = null;
       e.downUntil = 0;
@@ -498,26 +505,18 @@ export class RpcFailover {
         this.accept(ep, slot);
         const hi = Math.max(slot, ...agree);
         if (hi > (this.floorSlot ?? 0)) this.floorSlot = hi; // corroborated by a second genesis-verified endpoint
+        this.floorCorroborated = true;
+        this.floorSource = ep.idx;
         confirmed = true;
       } else {
         const fresh = await this.blockTimeFresh(ep, slot);
         if (fresh === "stale") return false;
-        // N3: a genesis-verified peer clearly AHEAD of this endpoint is evidence the endpoint lags. Use it as a lower
-        // bound when it is plausible given the block-time window (what the chain can do in maxAge seconds, same
-        // headroom as the ceiling); an implausibly high peer is discarded, exactly as before.
-        const maxAgeSec = this.cfg.maxSlotLag * 0.4 + 18;
-        const plausibleHi = slot + maxAgeSec * this.cfg.slotsPerSecond * 1.5 + 2 * this.cfg.maxSlotLag;
-        const higher = peers.filter((p) => p - slot > this.cfg.maxSlotLag && p <= plausibleHi);
-        if (higher.length > 0) {
-          const lb = Math.max(...higher);
-          this.accept(ep, lb); // sets floor + anchor from the corroborated-by-plausibility peer slot
-          ep.slot = slot;
-          ep.slotAt = this.now();
-          this.markDown(ep, `lagging: slot ${slot} is ${lb - slot} behind a genesis-verified peer (${lb})`);
-          return false;
-        }
+        // (A lone peer ahead of this endpoint is NOT used as a lower bound: one uncorroborated reply must never be able to
+        // make an honest endpoint look lagging. R153 round 4 reverted the N3 lower-bound behaviour.)
         if (fresh === "fresh") {
           this.accept(ep, slot);
+          this.floorCorroborated = false;
+          this.floorSource = ep.idx;
           confirmed = true;
         } else {
           // Nothing to corroborate with. The operator's primary is trusted as before (no floor is set from an
@@ -539,26 +538,69 @@ export class RpcFailover {
         return false;
       }
       ep.suspectAhead = false;
-      // (b) lower bound: never more than maxSlotLag below the highest accepted slot (no expiry).
-      const floor = this.floorSlot;
-      if (floor - slot > this.cfg.maxSlotLag) {
-        ep.slot = slot;
-        ep.slotAt = this.now();
-        if (ep.laggingSince === null) ep.laggingSince = this.now();
-        this.markDown(ep, `lagging: slot ${slot} is ${floor - slot} behind the highest slot seen ${floor} (max ${this.cfg.maxSlotLag})`);
+      const t = this.now();
+      const others = this.recentOthers(ep);
+      const agreeing = others.filter((o) => Math.abs(o - slot) <= this.cfg.maxSlotLag);
+      // (a2) corroborated raises only: a reply more than maxSlotLag above EVERY other recent endpoint is believed only
+      //      if another endpoint agrees with it, or if it is the only live endpoint (nothing to compare against).
+      if (others.length > 0 && agreeing.length === 0 && slot - Math.max(...others) > this.cfg.maxSlotLag) {
+        ep.suspectAhead = true;
+        if (ep.laggingSince === null) ep.laggingSince = t;
+        this.markDown(ep, `suspect-ahead: slot ${slot} is ${slot - Math.max(...others)} above every other endpoint and none agrees (uncorroborated)`);
         this.maybeReseedFloor();
         return false;
       }
-      // (c) projected bound against a RECENT (<60 s) observation of another endpoint.
-      const best = this.bestOtherSlot(ep);
-      if (best !== null && best - slot > this.cfg.maxSlotLag) {
-        ep.slot = slot;
-        ep.slotAt = this.now();
-        this.markDown(ep, `lagging: slot ${slot} is ${best - slot} behind best ${best} (max ${this.cfg.maxSlotLag})`);
-        return false;
+      // (b) lower bound: never more than maxSlotLag below the highest accepted slot (no expiry) ...
+      const floor = this.floorSlot;
+      if (floor - slot > this.cfg.maxSlotLag) {
+        // ... unless that floor was raised by a SOLE live endpoint (uncorroborated) and is now contradicted: by two
+        // agreeing endpoints below it, or by this endpoint's own fresh block time with the floor beyond what the
+        // block-time window can explain. Then the floor was the lie: overturn it.
+        let why: string | null = null;
+        let base = slot;
+        if (!this.floorCorroborated && agreeing.length > 0) {
+          why = "agreement of two genesis-verified endpoints below it";
+          base = Math.min(slot, ...agreeing);
+        } else if (!this.floorCorroborated) {
+          // Wall-clock arbiter: this endpoint's own block time dates its slot; the chain head cannot be further ahead
+          // than (slot-20) + age*2.5. A floor beyond that by more than the lag bound (+ ~6 s of clock skew) is a lie.
+          const head = await this.headEstimate(ep, slot);
+          if (head !== null && floor - Math.max(slot, head) > this.cfg.maxSlotLag + 15) {
+            why = `this endpoint's block time (chain head ~${Math.floor(head)})`;
+            base = Math.min(slot, head);
+          }
+        }
+        if (why !== null) {
+          this.logLine(`[ALERT] slot floor ${floor} (from sole-source endpoint #${this.floorSource}) overturned by ${why}: endpoint #${ep.idx} is at ${slot}; floor and anchor reset to ${base}`);
+          this.floorSlot = base;
+          this.anchor = { slot: base, at: t };
+          this.floorCorroborated = agreeing.length > 0;
+          this.floorSource = ep.idx;
+        } else {
+          ep.slot = slot;
+          ep.slotAt = t;
+          if (ep.laggingSince === null) ep.laggingSince = t;
+          if (ep.idx === 0 && !this.floorCorroborated && t - this.primaryAlertAt >= 300_000) {
+            this.primaryAlertAt = t;
+            this.logLine(`[ALERT] primary rejected as lagging: primary slot ${slot} vs floor ${floor} raised by sole-source endpoint #${this.floorSource}; if the fallback is the one that is wrong the keeper is stuck on it until the chain view agrees`);
+          }
+          this.markDown(ep, `lagging: slot ${slot} is ${floor - slot} behind the highest slot seen ${floor} (max ${this.cfg.maxSlotLag})`);
+          this.maybeReseedFloor();
+          return false;
+        }
       }
+      const raised = slot > (this.floorSlot ?? 0);
       this.accept(ep, slot);
-      confirmed = best !== null;
+      if (agreeing.length > 0) {
+        // (2) re-anchor from agreement: slack is bounded by the interval since two endpoints last agreed.
+        this.anchor = { slot: Math.min(slot, ...agreeing), at: t };
+        this.floorCorroborated = true;
+        this.floorSource = ep.idx;
+      } else if (raised) {
+        this.floorCorroborated = false;
+        this.floorSource = ep.idx;
+      }
+      confirmed = agreeing.length > 0;
       if (!confirmed) {
         const fresh = await this.blockTimeFresh(ep, slot);
         if (fresh === "stale") return false;
@@ -572,13 +614,21 @@ export class RpcFailover {
     return true;
   }
 
+  /** Chain-head estimate from an endpoint's own block time: (slot-20) + seconds since that block * slots/s. */
+  private async headEstimate(ep: Endpoint, slot: number): Promise<number | null> {
+    const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
+    if (bt.err !== undefined || typeof bt.result !== "number") return null;
+    return Math.max(0, slot - 20) + (this.now() / 1000 - bt.result) * this.cfg.slotsPerSecond;
+  }
+
   /** Wall-clock anchor: the block time of a recent slot must be close to now. */
-  private async blockTimeFresh(ep: Endpoint, slot: number): Promise<"fresh" | "stale" | "unknown"> {
+  private async blockTimeFresh(ep: Endpoint, slot: number, markStale = true): Promise<"fresh" | "stale" | "unknown"> {
     const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
     if (bt.err !== undefined || typeof bt.result !== "number") return "unknown";
     const ageSec = this.now() / 1000 - bt.result;
     const maxAge = this.cfg.maxSlotLag * 0.4 + 8 + 10; // lag bound + the 20-slot offset + clock skew allowance
     if (ageSec > maxAge) {
+      if (!markStale) return "stale";
       this.markDown(ep, `stale: block time of slot ${slot - 20} is ${Math.round(ageSec)}s old (max ${Math.round(maxAge)}s)`);
       return "stale";
     }
