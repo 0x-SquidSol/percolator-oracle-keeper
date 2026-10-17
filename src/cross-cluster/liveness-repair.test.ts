@@ -29,6 +29,7 @@ import {
 import type { LivenessState } from "./liveness-repair.ts";
 import { planCrankTx } from "./positioned-refresh.ts";
 import { crankAllOnce, resolveCrankPlan } from "./recovery-cranker.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = (name: string): Buffer =>
@@ -205,7 +206,7 @@ describe("crank transaction carries the repairs", () => {
     await run(conn);
     assert.equal(sent.length, 1);
     const tags = sent[0].instructions
-      .filter((ix) => ix.programId.equals(new PublicKey("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ")))
+      .filter((ix) => ix.programId.equals(WRAPPER_PROGRAM_ID))
       .map((ix) => ix.data[0]);
     assert.equal(tags[0], IX_TAG.ExpireBackingBucket, `first wrapper ix must be the expiry, got tags ${tags.join(",")}`);
     assert.deepEqual([...sent[0].instructions.find((ix) => ix.data[0] === IX_TAG.ExpireBackingBucket)!.data], [89, 1, 0]);

@@ -42,7 +42,7 @@ const MARKET = PublicKey.unique();
 const PORTFOLIO = PublicKey.unique();
 
 // Fresh devnet triple — deployed + upgraded 2026-07-17, hash-verified on-chain.
-const FRESH_WRAPPER = "DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj";
+const FRESH_WRAPPER = process.env.WRAPPER_PROGRAM_ID?.trim() || "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 
 // Superseded 2026-06-26 wrapper — still live on devnet with ~152 existing
 // markets, but no longer the SDK default. buildCrankIx must NOT target it.

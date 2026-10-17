@@ -147,64 +147,48 @@ describe("v17 oracle mode → push instruction mapping", () => {
 // PushEwmaMark (tag 36) wire format
 // ══════════════════════════════════════════════════════════════
 //
-// Evidence from v16_program.rs decode at line 3891:
-//   36 => Self::PushEwmaMark {
-//     asset_index: read_u16(&mut rest)?,
-//     now_slot:    read_u64(&mut rest)?,
-//     mark_e6:     read_u64(&mut rest)?,
-//   }
-// Total wire: 1 (tag) + 2 (u16) + 8 (u64) + 8 (u64) = 19 bytes.
-//
-// Serialized in to_bytes (line 4284):
-//   out.push(36); push_u16(asset_index); push_u64(now_slot); push_u64(mark_e6);
+// Wire (SDK encodePushEwmaMark, v18+): tag(1) + asset_index(u16=2) + market_id(u64=8) +
+// now_slot(u64=8) + mark_e6(u64=8) + observation_sequence(u64=8) = 35 bytes.
+// (The pre-v18 19-byte {asset_index, now_slot, mark_e6} shape no longer exists in the SDK; the keeper
+// does not build PushEwmaMark on its live path, so this only pins the SDK encoder it would use.)
 
 describe("PushEwmaMark (tag 36) wire format", () => {
-  it("produces exactly 19 bytes", () => {
-    const data = encodePushEwmaMark({
-      assetIndex: 0,
-      nowSlot: 300_000_001n,
-      markE6: 50_100_000_000n,
-    });
-    assert.equal(data.length, 19,
-      "PushEwmaMark wire: tag(1) + asset_index(u16=2) + now_slot(u64=8) + mark_e6(u64=8) = 19");
+  const base = { assetIndex: 0, marketId: 1n, nowSlot: 1n, markE6: 1_000_000n, observationSequence: 1n };
+  const u64At = (d: Uint8Array, o: number): bigint => new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(o, true);
+
+  it("produces exactly 35 bytes", () => {
+    const data = encodePushEwmaMark({ ...base, nowSlot: 300_000_001n, markE6: 50_100_000_000n });
+    assert.equal(data.length, 35);
   });
 
   it("first byte is tag 36", () => {
-    const data = encodePushEwmaMark({ assetIndex: 0, nowSlot: 1n, markE6: 1_000_000n });
-    assert.equal(data[0], 36, "PushEwmaMark tag must be 0x24 (36)");
+    assert.equal(encodePushEwmaMark(base)[0], 36, "PushEwmaMark tag must be 0x24 (36)");
   });
 
   it("asset_index is encoded as u16 LE at bytes [1..3]", () => {
-    // asset_index=5 → 0x05 0x00
-    const data = encodePushEwmaMark({ assetIndex: 5, nowSlot: 1n, markE6: 1_000_000n });
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    assert.equal(view.getUint16(1, true /* LE */), 5, "asset_index u16 LE at offset 1");
+    const data = encodePushEwmaMark({ ...base, assetIndex: 5 });
+    assert.equal(new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(1, true), 5);
   });
 
-  it("now_slot is encoded as u64 LE at bytes [3..11]", () => {
-    const nowSlot = 123_456_789n;
-    const data = encodePushEwmaMark({ assetIndex: 0, nowSlot, markE6: 1_000_000n });
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    // Read as two u32s and reconstruct
-    const lo = view.getUint32(3, true);
-    const hi = view.getUint32(7, true);
-    const decoded = BigInt(lo) | (BigInt(hi) << 32n);
-    assert.equal(decoded, nowSlot, "now_slot u64 LE at offset 3");
+  it("market_id is encoded as u64 LE at bytes [3..11]", () => {
+    assert.equal(u64At(encodePushEwmaMark({ ...base, marketId: 77n }), 3), 77n);
   });
 
-  it("mark_e6 is encoded as u64 LE at bytes [11..19]", () => {
-    const markE6 = 100_000_000_000n; // BTC ~$100k
-    const data = encodePushEwmaMark({ assetIndex: 0, nowSlot: 1n, markE6 });
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const lo = view.getUint32(11, true);
-    const hi = view.getUint32(15, true);
-    const decoded = BigInt(lo) | (BigInt(hi) << 32n);
-    assert.equal(decoded, markE6, "mark_e6 u64 LE at offset 11");
+  it("now_slot is encoded as u64 LE at bytes [11..19]", () => {
+    assert.equal(u64At(encodePushEwmaMark({ ...base, nowSlot: 123_456_789n }), 11), 123_456_789n);
+  });
+
+  it("mark_e6 is encoded as u64 LE at bytes [19..27]", () => {
+    assert.equal(u64At(encodePushEwmaMark({ ...base, markE6: 100_000_000_000n }), 19), 100_000_000_000n);
+  });
+
+  it("observation_sequence is encoded as u64 LE at bytes [27..35]", () => {
+    assert.equal(u64At(encodePushEwmaMark({ ...base, observationSequence: 9n }), 27), 9n);
   });
 
   it("rejects markE6=0 (program would reject OracleInvalid)", () => {
     assert.throws(
-      () => encodePushEwmaMark({ assetIndex: 0, nowSlot: 1n, markE6: 0n }),
+      () => encodePushEwmaMark({ ...{ assetIndex: 0, marketId: 1n, nowSlot: 1n, observationSequence: 1n }, markE6: 0n }),
       /markE6|positive|zero/i,
       "Zero mark_e6 must be rejected client-side — program rejects with OracleInvalid",
     );
@@ -477,25 +461,25 @@ describe("v17 AssetOracleProfile byte offset", () => {
     assert.equal(off, 1350);
   });
 
-  it("asset_index=1 profile starts at 3147 (=1350+1797)", () => {
+  it("asset_index=1 profile starts at 3675 (=1350+2325)", () => {
     const off = v17OracleProfileOffset(1);
     assert.equal(off, 1350 + V17_MARKET_ASSET_SLOT_LEN);
-    assert.equal(off, 3147);
+    assert.equal(off, 3675);
   });
 
-  it("asset_index=N profile starts at 1350 + N*1797", () => {
+  it("asset_index=N profile starts at 1350 + N*2325", () => {
     for (const n of [0, 1, 2, 5, 10]) {
       assert.equal(
         v17OracleProfileOffset(n),
-        1350 + n * 1797,
+        1350 + n * 2325,
         `Profile offset for asset_index=${n}`,
       );
     }
   });
 
-  it("profile block is 400 bytes (V17_ASSET_ORACLE_PROFILE_LEN)", () => {
-    assert.equal(V17_ASSET_ORACLE_PROFILE_LEN, 400,
-      "AssetOracleProfileV17 is 400 bytes per v16_program.rs ASSET_ORACLE_PROFILE_LEN");
+  it("profile block is 512 bytes (V17_ASSET_ORACLE_PROFILE_LEN)", () => {
+    assert.equal(V17_ASSET_ORACLE_PROFILE_LEN, 512,
+      "the SDK's AssetOracleProfile is 512 bytes (v2.2 layout; was 400 at v16/v17)");
   });
 
   it("oracleMode is at byte 0 within the profile (first field)", () => {

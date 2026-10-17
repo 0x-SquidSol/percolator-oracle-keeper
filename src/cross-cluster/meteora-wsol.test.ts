@@ -73,8 +73,8 @@ describe("meteoraWsolPriceToUsdE6", () => {
     assert.ok(naiveErr > 0.10, `naive err ${naiveErr} should exceed 10%`);
   });
 
-  it("returns 0 for an uninitialised pool (binStep=0) instead of throwing", () => {
-    assert.equal(meteoraWsolPriceToUsdE6(makePool(0, 0), DEC, SOL_USD_E6), 0n);
+  it("throws (fail closed) for an uninitialised pool (binStep=0); the SDK no longer returns 0n (#338) and the caller's per-pool catch skips it", () => {
+    assert.throws(() => meteoraWsolPriceToUsdE6(makePool(0, 0), DEC, SOL_USD_E6), /binStep = 0/);
   });
 
   it("scales linearly with the SOL/USD rate", () => {

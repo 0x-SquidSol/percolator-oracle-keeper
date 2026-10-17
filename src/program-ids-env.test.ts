@@ -12,6 +12,9 @@ const STAKE_OVERRIDE = "CNGBPZRALk9Xu8BdgWNyrLJ7daQ9eJYFf1GnEEC7YCU3";
 process.env.WRAPPER_PROGRAM_ID = OVERRIDE;
 process.env.STAKE_PROGRAM_ID = STAKE_OVERRIDE;
 delete process.env.PROGRAM_ID;
+// The override allowlist (fail-closed for unknown ids) is deliberate; this test opts in exactly as run-v22fresh.sh does.
+process.env.KEEPER_ALLOW_PROGRAM_ID_OVERRIDE = "1";
+process.env.PERCOLATOR_SDK_ALLOW_PROGRAM_OVERRIDE = "1";
 
 describe("WRAPPER_PROGRAM_ID reaches every builder (fresh-ID relaunch = config change)", () => {
   it("auth-mark-pusher, recovery-cranker, positioned-refresh, liveness-repair, stake-fee", async () => {

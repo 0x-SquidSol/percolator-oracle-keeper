@@ -21,10 +21,12 @@ import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cle
 import { landedPushes, withheldFromPush } from "./keeper-loop.ts";
 import { makeLpFeeJob } from "./lp-fee-cranker.ts";
 import type { Alert } from "./alerting.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string): Buffer => Buffer.from(readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64");
-const WRAPPER = new PublicKey("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ");
+// The wrapper the keeper builders actually target (env override, else the pinned default) - never a stale literal.
+const WRAPPER = WRAPPER_PROGRAM_ID;
 const SOL = "AzagguvrWmRgcBpsKuqomW7Yb1YUUd6UzcrkiRsqdhr";
 const SOLK = new PublicKey(SOL);
 const KEEPER = Keypair.generate();

@@ -8,6 +8,7 @@
  * Real bytes: SOL / TEXTIT markets (mode @1218, materialized @group+517,
  * c_tot @group+317 patched), the live SOLCAT LP-vault registry (bound flag @160).
  */
+import "./test-env-v18-wrapper.ts"; // fixtures are v18 bytes: pin the wrapper the builders target to GnwdeQr (see the module)
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";

@@ -15,10 +15,12 @@ import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import { parseLpVaultRegistry } from "@percolatorct/sdk";
 import { crankLpFeesOnce, LP_VAULT_REGISTRY_BOUND_FLAG_OFF, lpVaultRegistryBound } from "./lp-fee-cranker.ts";
+import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REG = Buffer.from(readFileSync(join(here, "__fixtures__", "solcat-lp-vault-registry-v18.b64"), "utf8").trim(), "base64");
-const WRAPPER = new PublicKey("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ");
+// The wrapper the keeper builders actually target (env override, else the pinned default) - never a stale literal.
+const WRAPPER = WRAPPER_PROGRAM_ID;
 const SOLCAT = "7mgX3bkzEivRrCffCJ7XzqfAp3gpjm63RNinwDhr7b41";
 const KEEPER = Keypair.generate();
 const bound = (flag: number): Buffer => { const b = Buffer.from(REG); b[LP_VAULT_REGISTRY_BOUND_FLAG_OFF] = flag; return b; };

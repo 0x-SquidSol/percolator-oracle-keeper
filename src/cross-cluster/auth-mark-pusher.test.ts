@@ -27,7 +27,8 @@ import { WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
 // (a FRESH program id; the SDK's declare_id is a placeholder — PDAs follow the
 // runtime deploy address). This is a deliberate literal pin, NOT a re-import of
 // the SDK constant, so a wrapper cutover forces a conscious update here.
-const FRESH_WRAPPER = "GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ";
+// The keeper resolves its wrapper from env WRAPPER_PROGRAM_ID, else the pinned v1 default (program-ids.ts). It is NOT the v18 id any more.
+const FRESH_WRAPPER = process.env.WRAPPER_PROGRAM_ID?.trim() || "ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB";
 
 // Superseded wrappers — still resolvable on devnet but no longer the target.
 const OLD_WRAPPER = "69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9"; // 2026-06-26
