@@ -39,6 +39,7 @@ import {
   WSOL_MINT,
 } from "@percolatorct/sdk";
 import type { PoolPriceSource } from "./registry.ts";
+import { redactUrl } from "../rpc-failover.ts";
 
 /** Per-pool cached mint decimals (keyed by pool address string). */
 export type DecimalsCache = Map<string, { base: number; quote: number }>;
@@ -125,6 +126,15 @@ export function raydiumPriceIsNotUsd(quoteMint: PublicKey): boolean {
  * high. Refused until there is a quote->USD conversion for that token.
  * (Raydium has no WSOL conversion, so it keeps raydiumPriceIsNotUsd.)
  */
+/**
+ * S3-B1 (audit 2026-10-17): a pool may serve as THE SOL/USD rate only if it really is WSOL priced in a USD stable.
+ * `isSolUsdEntry` matches a display symbol / label, which a DB row derives from its creator-supplied symbol
+ * (db-markets.ts: label `${symbol}/USDC — …`), so it can never be the only test.
+ */
+export function poolIsSolUsd(baseMint: PublicKey, quoteMint: PublicKey): boolean {
+  return baseMint.equals(WSOL_MINT) && !raydiumPriceIsNotUsd(quoteMint);
+}
+
 export function quoteIsNotUsdOrWsol(quoteMint: PublicKey): boolean {
   return !quoteMint.equals(WSOL_MINT) && raydiumPriceIsNotUsd(quoteMint);
 }
@@ -338,7 +348,7 @@ export async function readAtWatermark<T>(
         if (fails >= MAX_CONSECUTIVE_MIN_SLOT_FAILURES) {
           console.error(
             `[price-reader] ${fails} consecutive reads rejected below watermark ` +
-              `${slotWatermarks.get(key)} on ${key} — watermark likely poisoned by an ` +
+              `${slotWatermarks.get(key)} on ${redactUrl(key)} — watermark likely poisoned by an ` +
               `inflated context slot. DROPPING it; the next response rebuilds it.`,
           );
           slotWatermarks.delete(key);
@@ -396,12 +406,19 @@ export function checkMintBinding(
   if (!mainnetCa) return { ok: true };
   const base = baseMint.toBase58();
   const quote = quoteMint.toBase58();
-  if (mainnetCa === base || mainnetCa === quote) return { ok: true };
+  // S3-B2 (audit 2026-10-17): the token must be the BASE, i.e. the side the published price is for. Every reader
+  // here publishes quote-per-base and only accepts a WSOL / USD-stable quote, so a quote-side match only ever passed
+  // when the market is FOR WSOL (or a stable) and the pool prices a DIFFERENT token (a "SOL" market on a MEME/WSOL
+  // pool published MEME's price).
+  if (mainnetCa === base) return { ok: true };
   return {
     ok: false,
     reason:
-      `pool prices the WRONG TOKEN: market mainnet_ca ${mainnetCa} is neither ` +
-      `base ${base} nor quote ${quote}. Refusing to use it as the AuthMark.`,
+      mainnetCa === quote
+        ? `pool prices the WRONG TOKEN: market mainnet_ca ${mainnetCa} is the pool's QUOTE, the price is for ` +
+          `base ${base}. Refusing to use it as the AuthMark.`
+        : `pool prices the WRONG TOKEN: market mainnet_ca ${mainnetCa} is neither ` +
+          `base ${base} nor quote ${quote}. Refusing to use it as the AuthMark.`,
   };
 }
 
@@ -982,7 +999,7 @@ export async function readAllPoolPricesE6(
         const priceE6 = computeDexSpotPriceE6("raydium-clmm", data);
         if (priceE6 > 0n) {
           out.set(entry.poolAddress, priceE6);
-          if (solPriceE6 === undefined && isSolUsdEntry(entry)) solPriceE6 = priceE6;
+          if (solPriceE6 === undefined && isSolUsdEntry(entry) && poolIsSolUsd(parsedRay.baseMint, parsedRay.quoteMint)) solPriceE6 = priceE6;
         }
       } else if (entry.dexType === "meteora-dlmm") {
         const parsed = parseDexPool("meteora-dlmm", pubkeys[i], data);
@@ -1025,7 +1042,7 @@ export async function readAllPoolPricesE6(
         );
         if (priceE6 > 0n) {
           out.set(entry.poolAddress, priceE6);
-          if (solPriceE6 === undefined && isSolUsdEntry(entry)) solPriceE6 = priceE6;
+          if (solPriceE6 === undefined && isSolUsdEntry(entry) && poolIsSolUsd(parsed.baseMint, parsed.quoteMint)) solPriceE6 = priceE6;
           if (pricesE12) {
             // Same price at e12 (6 extra base decimals; see meteoraWsolPriceToUsdE6). Best effort: e6 stays the source of truth.
             try {
@@ -1084,8 +1101,15 @@ export async function readAllPoolPricesE6(
       if (refInfo?.data) {
         const refDex = detectDexType(refInfo.owner);
         if (refDex === "raydium-clmm") {
-          const refPrice = computeDexSpotPriceE6("raydium-clmm", new Uint8Array(refInfo.data));
-          if (refPrice > 0n) solPriceE6 = refPrice;
+          const refData = new Uint8Array(refInfo.data);
+          const refParsed = parseDexPool("raydium-clmm", refPk, refData);
+          // The reference pool is FOR SOL: bound like a market whose mainnet_ca is WSOL, and quoted in a USD stable.
+          if (checkMintBinding(WSOL_MINT.toBase58(), refParsed.baseMint, refParsed.quoteMint).ok && poolIsSolUsd(refParsed.baseMint, refParsed.quoteMint)) {
+            const refPrice = computeDexSpotPriceE6("raydium-clmm", refData);
+            if (refPrice > 0n) solPriceE6 = refPrice;
+          } else {
+            console.error(`[price-reader] SOL_USD_REFERENCE_POOL ${solUsdReferencePool} is not a WSOL/USD-stable pool — ignored`);
+          }
         }
       }
     } catch {
