@@ -13,6 +13,8 @@ import {
   buildCreateCreatorAtaIx,
   buildRecoverTerminalInsuranceIx,
   creatorCollateralAta,
+  CREATOR_ATA_MAX_ATTEMPTS,
+  isCreatorTokenAccount,
   isLegacyShapeRefusal,
   TerminalInsuranceState,
   windDownOnce,
@@ -95,14 +97,15 @@ function pool(riskMode: number): Buffer {
   b[408] = riskMode;
   return b;
 }
-function tokenAcct(owner: PublicKey): Buffer {
+function tokenAcct(owner: PublicKey, mint: PublicKey = MINT): Buffer {
   const b = Buffer.alloc(165);
+  mint.toBuffer().copy(b, 0);
   owner.toBuffer().copy(b, 32);
   b[108] = 1;
   return b;
 }
 
-function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boolean; err46?: boolean; createOnSend?: boolean }) {
+function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boolean; err46?: boolean; createOnSend?: boolean; needCreator?: boolean; closeAfterCreate?: boolean; ataOwner?: PublicKey; ataMint?: PublicKey }) {
   const ata = creatorCollateralAta(ADMIN, MINT);
   const sims: string[][] = [];
   let sends = 0;
@@ -116,7 +119,7 @@ function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boo
       ];
     },
     async getAccountInfo(key: PublicKey) {
-      if (key.equals(ata) && ataExists) return { data: tokenAcct(ADMIN), owner: TOKEN, lamports: 1, executable: false };
+      if (key.equals(ata) && ataExists) return { data: tokenAcct(opts.ataOwner ?? ADMIN, opts.ataMint ?? MINT), owner: TOKEN, lamports: 1, executable: false };
       return null;
     },
     async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 10 }; },
@@ -126,16 +129,17 @@ function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boo
       const keys = ix.accountKeyIndexes.map((i) => m.staticAccountKeys[i].toBase58());
       sims.push(keys);
       let err: unknown = null;
-      if (keys.length > 9 && !opts.deployedIsUpgraded) err = { InstructionError: [1, { Custom: 16 }] };
+      if (opts.needCreator && keys.length <= 9 && !ataExists) err = riskMode === 1 ? { InstructionError: [1, "NotEnoughAccountKeys"] } : { InstructionError: [1, { Custom: 46 }] };
+      else if (keys.length > 9 && !opts.deployedIsUpgraded) err = { InstructionError: [1, { Custom: 16 }] };
       else if (opts.err46 && keys.length <= 9) err = { InstructionError: [1, { Custom: 46 }] };
       else err = { InstructionError: [1, { Custom: 31 }] }; // NothingToRecover
       return { context: { slot: 1 }, value: { err, logs: [] } };
     },
-    async sendRawTransaction() { sends++; if (opts.createOnSend && !ataExists) { ataExists = true; created++; } return "5ig111111111111111111111111111111111111111111111111111111111111"; },
+    async sendRawTransaction() { sends++; if (opts.createOnSend && !ataExists) { ataExists = true; created++; if (opts.closeAfterCreate) setTimeout(() => {}, 0); } return "5ig111111111111111111111111111111111111111111111111111111111111"; },
     async getSignatureStatuses() { return { context: { slot: 2 }, value: [{ slot: 2, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     async getTokenAccountsByOwner() { return { context: { slot: 1 }, value: [] }; },
   };
-  return { conn: conn as unknown as TerminalConnection, sims, sends: () => sends, created: () => created, ata };
+  return { conn: conn as unknown as TerminalConnection, sims, sends: () => sends, created: () => created, ata, closeAta: () => { ataExists = false; } };
 }
 
 describe("windDownOnce account shape gating (v5 pool)", () => {
@@ -178,15 +182,78 @@ describe("windDownOnce account shape gating (v5 pool)", () => {
     assert.ok(s.sims.every((k) => k.length === 9));
   });
 
-  it("creator ATA missing (live): the keeper creates it (ATA CreateIdempotent, one send) and then uses the v5 shape", async () => {
+  it("creator ATA missing (live): NOT created pre-emptively; created only after the program refuses for want of it, then the v5 shape is used", async () => {
     for (const mode of [1, 2]) {
-      const s = stubV5(mode, { deployedIsUpgraded: true, ata: false, createOnSend: true });
-      const r = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+      const s = stubV5(mode, { deployedIsUpgraded: true, ata: false, createOnSend: true, needCreator: true });
+      const st = new TerminalInsuranceState();
+      const r1 = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+      assert.equal(s.created(), 0, "no create before a refusal");
+      assert.equal(s.sends(), 0);
+      assert.equal(r1.outcome.kind, "skipped");
+      assert.ok(st.creatorAtaNeeded.has(TEXTIT.toBase58()));
+      const r2 = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
       assert.equal(s.created(), 1, "exactly one ATA create tx");
-      assert.equal(r.outcome.kind, "nothing");
+      assert.equal(r2.outcome.kind, "nothing");
       const last = s.sims[s.sims.length - 1];
       assert.deepEqual(last.slice(9), mode === 1 ? [unitsKey, s.ata.toBase58()] : [s.ata.toBase58()]);
     }
+  });
+
+  it("a v5 pool whose creator ATA exists is never touched (no create, no refusal needed)", async () => {
+    const s = stubV5(1, { deployedIsUpgraded: true, needCreator: true });
+    await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    assert.equal(s.sends(), 0);
+  });
+
+  it("rent-drain griefing: an admin that closes its ATA every cycle gets at most CREATOR_ATA_MAX_ATTEMPTS creates, with backoff", async () => {
+    const s = stubV5(1, { deployedIsUpgraded: true, ata: false, createOnSend: true, needCreator: true });
+    const st = new TerminalInsuranceState();
+    let t = 0;
+    const cfg = { ...CFG, now: () => t };
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      for (let cycle = 0; cycle < 9; cycle++) {
+        await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, cfg, st);
+        s.closeAta(); // hostile admin closes the 0-balance ATA again
+        st.done.clear(); // the wind-down is re-attempted each cycle
+        t += 60_000; // one minute per cycle
+      }
+      assert.equal(s.created(), 1, "9 one-minute cycles sit inside the 10-minute first backoff: one create");
+      t += 100 * 3_600_000;
+      for (let cycle = 0; cycle < 40; cycle++) {
+        await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, cfg, st);
+        s.closeAta();
+        st.done.clear();
+        t += 3_600_000 * 24;
+      }
+    } finally {
+      console.log = originalLog;
+    }
+    assert.equal(s.created(), CREATOR_ATA_MAX_ATTEMPTS, "capped per market");
+  });
+
+  it("ready() checks mint and owner: a reassigned or wrong-mint ATA is not used and not 'created over'", async () => {
+    for (const o of [{ ataOwner: k() }, { ataMint: k() }]) {
+      const s = stubV5(1, { deployedIsUpgraded: true, needCreator: true, createOnSend: true, ...o });
+      const st = new TerminalInsuranceState();
+      st.creatorAtaNeeded.add(TEXTIT.toBase58());
+      await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
+      assert.equal(s.created(), 0);
+      assert.ok(s.sims.every((x) => x.length === 9), "legacy shape only; the doomed v5 shape is never sent");
+    }
+  });
+
+  it("isCreatorTokenAccount: initialized, classic token, mint and owner", () => {
+    const admin = k(), mint = k();
+    const good = { owner: TOKEN, data: tokenAcct(admin, mint) };
+    assert.equal(isCreatorTokenAccount(good, mint, admin), true);
+    assert.equal(isCreatorTokenAccount({ ...good, data: tokenAcct(k(), mint) }, mint, admin), false);
+    assert.equal(isCreatorTokenAccount({ ...good, data: tokenAcct(admin, k()) }, mint, admin), false);
+    const uninit = Buffer.from(good.data); uninit[108] = 0;
+    assert.equal(isCreatorTokenAccount({ ...good, data: uninit }, mint, admin), false);
+    assert.equal(isCreatorTokenAccount({ ...good, owner: k() }, mint, admin), false);
+    assert.equal(isCreatorTokenAccount(null, mint, admin), false);
   });
 
   it("buildCreateCreatorAtaIx: payer signs, ATA of pool.admin for the pool mint, CreateIdempotent", () => {
