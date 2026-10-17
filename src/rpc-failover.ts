@@ -748,6 +748,8 @@ export function failoverFromEnv(
     primaryRetryMs: envNumber(env.RPC_PRIMARY_RETRY_MS, 30_000),
     backoffBaseMs: envNumber(env.RPC_BACKOFF_BASE_MS, 2_000),
     backoffMaxMs: envNumber(env.RPC_BACKOFF_MAX_MS, 300_000),
+    floorReseedMs: envNumber(env.RPC_FLOOR_RESEED_MS, 300_000),
+    allDownAlertMs: envNumber(env.RPC_ALL_DOWN_ALERT_MS, 120_000),
   });
   registerRpcFailover(cluster, f);
   console.log(`[rpc-failover:${cluster}] ordered endpoints: ${[primaryUrl, ...fallbacks].map(redactUrl).join(" > ")}`);
