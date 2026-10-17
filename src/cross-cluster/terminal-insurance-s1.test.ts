@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { Keypair, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { deriveInsuranceUnitsV22, deriveStakePool } from "@percolatorct/sdk";
 import {
+  buildCreateCreatorAtaIx,
   buildRecoverTerminalInsuranceIx,
   creatorCollateralAta,
   isLegacyShapeRefusal,
@@ -101,10 +102,12 @@ function tokenAcct(owner: PublicKey): Buffer {
   return b;
 }
 
-function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boolean; err46?: boolean }) {
+function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boolean; err46?: boolean; createOnSend?: boolean }) {
   const ata = creatorCollateralAta(ADMIN, MINT);
   const sims: string[][] = [];
   let sends = 0;
+  let ataExists = opts.ata !== false;
+  let created = 0;
   const conn = {
     async getMultipleAccountsInfo() {
       return [
@@ -113,7 +116,7 @@ function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boo
       ];
     },
     async getAccountInfo(key: PublicKey) {
-      if (key.equals(ata) && opts.ata !== false) return { data: tokenAcct(ADMIN), owner: TOKEN, lamports: 1, executable: false };
+      if (key.equals(ata) && ataExists) return { data: tokenAcct(ADMIN), owner: TOKEN, lamports: 1, executable: false };
       return null;
     },
     async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 10 }; },
@@ -128,10 +131,11 @@ function stubV5(riskMode: number, opts: { ata?: boolean; deployedIsUpgraded: boo
       else err = { InstructionError: [1, { Custom: 31 }] }; // NothingToRecover
       return { context: { slot: 1 }, value: { err, logs: [] } };
     },
-    async sendRawTransaction() { sends++; return "5ig111111111111111111111111111111111111111111111111111111111111"; },
+    async sendRawTransaction() { sends++; if (opts.createOnSend && !ataExists) { ataExists = true; created++; } return "5ig111111111111111111111111111111111111111111111111111111111111"; },
+    async getSignatureStatuses() { return { context: { slot: 2 }, value: [{ slot: 2, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     async getTokenAccountsByOwner() { return { context: { slot: 1 }, value: [] }; },
   };
-  return { conn: conn as unknown as TerminalConnection, sims, sends: () => sends, ata };
+  return { conn: conn as unknown as TerminalConnection, sims, sends: () => sends, created: () => created, ata };
 }
 
 describe("windDownOnce account shape gating (v5 pool)", () => {
@@ -167,10 +171,32 @@ describe("windDownOnce account shape gating (v5 pool)", () => {
     assert.ok(s.sims.slice(before).every((k) => k.length === 9));
   });
 
-  it("creator ATA not created: legacy shape, never the v5 shape", async () => {
+  it("creator ATA missing + dry run: nothing is sent or created; legacy probe only", async () => {
     const s = stubV5(1, { deployedIsUpgraded: true, ata: false });
-    await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+    await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), true, CFG, new TerminalInsuranceState());
+    assert.equal(s.sends(), 0);
     assert.ok(s.sims.every((k) => k.length === 9));
+  });
+
+  it("creator ATA missing (live): the keeper creates it (ATA CreateIdempotent, one send) and then uses the v5 shape", async () => {
+    for (const mode of [1, 2]) {
+      const s = stubV5(mode, { deployedIsUpgraded: true, ata: false, createOnSend: true });
+      const r = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, new TerminalInsuranceState());
+      assert.equal(s.created(), 1, "exactly one ATA create tx");
+      assert.equal(r.outcome.kind, "nothing");
+      const last = s.sims[s.sims.length - 1];
+      assert.deepEqual(last.slice(9), mode === 1 ? [unitsKey, s.ata.toBase58()] : [s.ata.toBase58()]);
+    }
+  });
+
+  it("buildCreateCreatorAtaIx: payer signs, ATA of pool.admin for the pool mint, CreateIdempotent", () => {
+    const admin = k(), mint = k(), payer = k();
+    const ix = buildCreateCreatorAtaIx(payer, admin, mint);
+    assert.equal(ix.programId.toBase58(), "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    assert.deepEqual([...ix.data], [1]);
+    assert.ok(ix.keys[0].isSigner && ix.keys[0].isWritable && ix.keys[0].pubkey.equals(payer));
+    assert.ok(ix.keys[1].pubkey.equals(creatorCollateralAta(admin, mint)) && ix.keys[1].isWritable);
+    assert.ok(ix.keys[2].pubkey.equals(admin) && ix.keys[3].pubkey.equals(mint));
   });
 
   it("error 46 is a retryable skip, logged once per market, not a failure", async () => {

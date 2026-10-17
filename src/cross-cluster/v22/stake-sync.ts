@@ -9,6 +9,10 @@
  *   44 InsuranceReadingsDiverged   REFUSED, not retried: the market's insurance is lent out (G9) so the entry and
  *                                  exit readings differ. The keeper backs off for DIVERGED_BACKOFF_COOLDOWNS
  *                                  cooldowns and counts it; it never retry-spams the program.
+ *   21 (wrapper EngineLockActive via the inner tag 57)
+ *                                  WAITING, not a failure: the bankruptcy h-lock is latched after an insurance loss, so the recover
+ *                                  leg is closed until the lock clears or the market resolves. Counted as expected, backed off one
+ *                                  cooldown, never retry-spammed (same spirit as the R3.20 OracleStale wait).
  *   other 33-45                    named in the log, counted, backed off one cooldown.
  *
  * Only FIRST_LOSS pools in insurance mode deploy insurance: the program refuses tag 31 on any other pool with
@@ -34,6 +38,11 @@ import type { ExecContext, ExecOutcome } from "./exec.ts";
 import type { V22MarketCtx } from "./market.ts";
 import { STAKE_READINGS_DIVERGED, STAKE_SYNC_QUIET_CODES } from "./errors.ts";
 
+/**
+ * Wrapper 21 EngineLockActive surfacing through tag 31's inner wrapper tag 57 (recover leg): the bankruptcy h-lock is latched
+ * (E2E-A FCAFL 2026-10-17). The stake program itself never answers 21 on tag 31.
+ */
+export const STAKE_SYNC_WAITING_ENGINE_LOCK = 21;
 export const DIVERGED_BACKOFF_COOLDOWNS = 20n;
 export const STAKE_SYNC_UNITS = 600_000;
 
@@ -67,6 +76,7 @@ export type StakeSyncResult =
   | { kind: "skipped"; reason: string }
   | { kind: "backoff"; untilSlot: bigint }
   | { kind: "quiet"; code: number }
+  | { kind: "waiting"; code: number; outcome: ExecOutcome; untilSlot: bigint }
   | { kind: "diverged"; outcome: ExecOutcome }
   | { kind: "sent" | "dry-run" | "refused" | "failed"; outcome: ExecOutcome };
 
@@ -101,13 +111,21 @@ export async function stakeSyncOnce(
   }
   st.lastAttemptMs.set(key, nowMs);
   const ix = buildStakeSyncIx({ caller: exec.keeper.publicKey, pool, poolData: decoded, market: ctx.market, marketData: ctx.data, wrapperProgramId: ctx.programId, stakeProgramId });
-  const expected = new Set<number>([...STAKE_SYNC_QUIET_CODES, STAKE_READINGS_DIVERGED]);
+  const expected = new Set<number>([...STAKE_SYNC_QUIET_CODES, STAKE_READINGS_DIVERGED, STAKE_SYNC_WAITING_ENGINE_LOCK]);
   const outcome = await simulateAndSend(exec, [ix], { job: "stake-sync", label: ctx.label, units: STAKE_SYNC_UNITS, program: "stake", expected });
+  if (outcome.kind === "refused" && outcome.code === STAKE_SYNC_WAITING_ENGINE_LOCK) {
+    exec.log?.(`[v22][stake-sync] ${ctx.label}: wrapper EngineLockActive(21) on the recover leg: bankruptcy h-lock latched, waiting; not a failure`);
+  }
   if (outcome.kind === "refused") {
     if (outcome.code === STAKE_READINGS_DIVERGED) {
       st.diverged++;
       st.backoffUntil.set(key, nowSlot + decoded.syncCooldownSlots * DIVERGED_BACKOFF_COOLDOWNS);
       return { kind: "diverged", outcome };
+    }
+    if (outcome.code === STAKE_SYNC_WAITING_ENGINE_LOCK) {
+      const untilSlot = nowSlot + decoded.syncCooldownSlots;
+      st.backoffUntil.set(key, untilSlot);
+      return { kind: "waiting", code: outcome.code, outcome, untilSlot };
     }
     if (outcome.code !== null && STAKE_SYNC_QUIET_CODES.has(outcome.code)) return { kind: "quiet", code: outcome.code };
     st.backoffUntil.set(key, nowSlot + decoded.syncCooldownSlots);

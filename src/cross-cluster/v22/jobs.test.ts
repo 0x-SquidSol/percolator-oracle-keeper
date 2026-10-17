@@ -272,6 +272,23 @@ describe("stake v5 sync (tag 31)", () => {
     assert.equal(allJobCounters()["stake-sync"].byError["InsuranceReadingsDiverged(44)"], 1);
     assert.equal(allJobCounters()["stake-sync"].expected, 1);
   });
+  it("21 EngineLockActive (wrapper tag 57 inside tag 31, h-lock latched): WAITING, expected not refused, backed off one cooldown, no retry-spam", async () => {
+    const ctx = v22Ctx(); // read slot 5000
+    const f = fakeExecConn({ simErr: () => customAt(0, 21) });
+    const st = freshStakeSyncState();
+    const r1 = await stakeSyncOnce(execCtx(f.conn), ctx, poolBytes(0n), st, { intervalMs: 0, nowMs: 1 });
+    assert.equal(r1.kind, "waiting");
+    assert.equal(f.sent.length, 0);
+    for (let i = 0; i < 3; i++) assert.equal((await stakeSyncOnce(execCtx(f.conn), ctx, poolBytes(0n), st, { intervalMs: 0, nowMs: 10 + i })).kind, "backoff");
+    assert.equal(f.sims.length, 1, "no further simulation while backed off");
+    const c = allJobCounters()["stake-sync"];
+    assert.equal(c.expected, 1);
+    assert.equal(c.refused, 0, "not counted as a failure");
+    assert.equal(st.diverged, 0);
+    // a genuinely unexpected code is still a refusal
+    const g = fakeExecConn({ simErr: () => customAt(0, 40) });
+    assert.equal((await stakeSyncOnce(execCtx(g.conn), ctx, poolBytes(0n), freshStakeSyncState(), { intervalMs: 0, nowMs: 1 })).kind, "refused");
+  });
   it("cooldown is pre-checked locally (quiet 37); 43 NothingToSync is quiet; a non-v5 pool is skipped", async () => {
     const ctx = v22Ctx(); // read slot 5000
     const f = fakeExecConn();
