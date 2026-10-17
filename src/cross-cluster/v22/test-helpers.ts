@@ -117,7 +117,7 @@ export const computeAt = (i: number) => ({ InstructionError: [i + COMPUTE_IX_COU
 const L = layoutById("v2.2-b");
 
 /** A synthetic variant-B market (1 slot) with the wrapper header stamped, optional band / rent / pin words. */
-export function v22MarketBytes(o: { slots?: number; version?: number; band?: boolean; rent?: boolean; pinSince?: bigint; currentSlot?: bigint; maxPin?: bigint; oracleMode?: number; legs?: number; lifecycle?: number; staleLong?: bigint; legFeeds?: PublicKey[] } = {}): Uint8Array {
+export function v22MarketBytes(o: { slots?: number; version?: number; band?: boolean; rent?: boolean; pinSince?: bigint; currentSlot?: bigint; slotLast?: bigint; maxPin?: bigint; oracleMode?: number; legs?: number; lifecycle?: number; staleLong?: bigint; legFeeds?: PublicKey[] } = {}): Uint8Array {
   const slots = o.slots ?? 1;
   const len = L.groupOff + L.headerLen + slots * L.slotStride;
   const b = Buffer.alloc(len);
@@ -129,7 +129,7 @@ export function v22MarketBytes(o: { slots?: number; version?: number; band?: boo
   b.writeBigUInt64LE(o.currentSlot ?? 5000n, L.groupOff + L.header.currentSlot);
   const e = engineSlotBase(L, 0);
   b[e + L.asset.lifecycle] = o.lifecycle ?? 2;
-  b.writeBigUInt64LE(o.currentSlot ?? 5000n, e + L.asset.slotLast);
+  b.writeBigUInt64LE(o.slotLast ?? o.currentSlot ?? 5000n, e + L.asset.slotLast);
   if (o.staleLong !== undefined) b.writeBigUInt64LE(o.staleLong, e + L.asset.staleLong);
   if (o.band) {
     b.writeBigUInt64LE(130n, L.groupOff + V22_CONFIG_OFF.bandBps);
@@ -233,14 +233,14 @@ export function vaultLpStateBytes(lp: PublicKey, outstanding = 0n): Uint8Array {
 }
 
 /** A fake Connection for the V22Loop: reads, getProgramAccounts, plus the exec surface. */
-export function fakeLoopConn(o: { market: Uint8Array; registry?: Uint8Array | null; vaultLpState?: Uint8Array | null; portfolios?: Array<{ pubkey: PublicKey; data: Uint8Array }>; lpAccount?: Uint8Array | null; throwOnRead?: boolean } & FakeConnOptions) {
+export function fakeLoopConn(o: { market: Uint8Array; registry?: Uint8Array | null; vaultLpState?: Uint8Array | null; portfolios?: Array<{ pubkey: PublicKey; data: Uint8Array }>; lpAccount?: Uint8Array | null; throwOnRead?: boolean; readSlot?: number } & FakeConnOptions) {
   const base = fakeExecConn(o);
   const progCalls: Array<{ filters: unknown[] }> = [];
   const acct = (d: Uint8Array | null | undefined) => (d ? { data: Buffer.from(d), owner: key(1), lamports: 1, executable: false } : null);
   const conn = Object.assign(base.conn, {
     async getMultipleAccountsInfoAndContext() {
       if (o.throwOnRead) throw new Error("fetch failed https://x.helius-rpc.com/?api-key=SECRET123");
-      return { context: { slot: 5000 }, value: [acct(o.market), acct(o.registry ?? null), acct(o.vaultLpState ?? null)] };
+      return { context: { slot: o.readSlot ?? 5000 }, value: [acct(o.market), acct(o.registry ?? null), acct(o.vaultLpState ?? null)] };
     },
     async getAccountInfo() {
       return acct(o.lpAccount ?? null);

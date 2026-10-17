@@ -235,11 +235,14 @@ export class V22Loop {
         this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
         return false;
       }
-      // K-6: a multi-asset market whose oldest observed asset is a full accrual window (or more) behind: a round now would
-      // only advance each asset by one window (the program's bounded catch-up return) and every refresh would be refused
-      // (22). Send bounded catch-up cranks observing every asset first (they return before settling anyone, so the LP is
-      // never settled alone); the round runs on the next cycle, inside one window.
-      if (isMultiAssetMarket(ctx.marketAddress)) {
+      // K-6 (+ LIQ-DIAG 2026-10-17: every market, not only multi-asset): a market whose oldest observed asset is a full
+      // accrual window (or more) behind. A round now would only advance each asset by one window (the program's bounded
+      // catch-up return) and every refresh would be refused (22), so a bankrupt account that nobody refreshed during the
+      // outage could not be liquidated until enough rounds had each eaten one window. Send bounded catch-up cranks
+      // observing every asset first (at most MAX_CATCHUP_CRANKS per tx; a larger gap takes several cycles); they return
+      // before settling anyone, so the LP is never settled alone. The round runs on the next cycle, inside one window.
+      // In steady state the gap is below one window, so n is 0 and nothing changes.
+      {
         const n = catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots);
         if (n > 0) {
           await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
