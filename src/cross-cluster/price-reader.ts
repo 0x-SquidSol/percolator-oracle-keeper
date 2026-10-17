@@ -39,7 +39,7 @@ import {
   WSOL_MINT,
 } from "@percolatorct/sdk";
 import type { PoolPriceSource } from "./registry.ts";
-import { redactErrorText } from "./v22/redact.ts";
+import { redactUrl } from "../rpc-failover.ts";
 
 /** Per-pool cached mint decimals (keyed by pool address string). */
 export type DecimalsCache = Map<string, { base: number; quote: number }>;
@@ -348,7 +348,7 @@ export async function readAtWatermark<T>(
         if (fails >= MAX_CONSECUTIVE_MIN_SLOT_FAILURES) {
           console.error(
             `[price-reader] ${fails} consecutive reads rejected below watermark ` +
-              `${slotWatermarks.get(key)} on ${redactErrorText(key)} — watermark likely poisoned by an ` +
+              `${slotWatermarks.get(key)} on ${redactUrl(key)} — watermark likely poisoned by an ` +
               `inflated context slot. DROPPING it; the next response rebuilds it.`,
           );
           slotWatermarks.delete(key);
