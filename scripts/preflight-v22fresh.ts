@@ -7,6 +7,8 @@
  */
 import { Connection, PublicKey } from "@solana/web3.js";
 import fs from "fs";
+import crypto from "crypto";
+import { DEFAULT_DEVNET_FALLBACKS, failoverFetch, isTransientRpcError, parseFallbackUrls, preflightOutageDecision } from "../src/rpc-failover.ts";
 
 const DEVNET_RPC = process.env.DEVNET_RPC_URL ?? "";
 const WRAPPER = process.env.WRAPPER_PROGRAM_ID ?? "";
@@ -43,6 +45,7 @@ function checkAssets(m: Entry): void {
   }
 }
 
+void DEFAULT_DEVNET_FALLBACKS;
 async function main(): Promise<void> {
   if (!DEVNET_RPC || !WRAPPER || !REGISTRY_PATH) fail("DEVNET_RPC_URL, WRAPPER_PROGRAM_ID and REGISTRY_PATH are required");
   if (!fs.existsSync(REGISTRY_PATH)) {
@@ -70,13 +73,28 @@ async function main(): Promise<void> {
     seen.add(m.marketAddress);
     new PublicKey(m.marketAddress);
   }
-  const conn = new Connection(DEVNET_RPC, "confirmed");
-  const infos = await conn.getMultipleAccountsInfo(markets.map((m) => new PublicKey(m.marketAddress as string)));
+  const registrySha = crypto.createHash("sha256").update(fs.readFileSync(REGISTRY_PATH)).digest("hex");
+  const stampPath = process.env.PREFLIGHT_STAMP_PATH ?? `${REGISTRY_PATH}.preflight-ok`;
+  const fallbacks = parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS);
+  const conn = new Connection(DEVNET_RPC, { commitment: "confirmed", fetch: failoverFetch(DEVNET_RPC, fallbacks) });
+  let infos;
+  try {
+    infos = await conn.getMultipleAccountsInfo(markets.map((m) => new PublicKey(m.marketAddress as string)));
+  } catch (e) {
+    if (!isTransientRpcError(e)) throw e;
+    const stamp = fs.existsSync(stampPath) ? fs.readFileSync(stampPath, "utf8") : undefined;
+    if (preflightOutageDecision(registrySha, stamp) === "refuse") {
+      fail(`RPC unavailable (${e instanceof Error ? e.message : String(e)}) and this registry has not passed the ownership check before`);
+    }
+    console.warn(`[preflight] WARN: RPC unavailable (${e instanceof Error ? e.message : String(e)}); registry unchanged since the last passing check, starting degraded instead of exiting`);
+    return;
+  }
   infos.forEach((info, i) => {
     const m = markets[i] as Entry;
     if (!info) fail(`${m.label}: market ${m.marketAddress} does not exist on devnet`);
     if (info.owner.toBase58() !== WRAPPER) fail(`${m.label}: market ${m.marketAddress} is owned by ${info.owner.toBase58()}, not the fresh wrapper ${WRAPPER}`);
   });
+  try { fs.writeFileSync(stampPath, registrySha + "\n"); } catch { /* read-only checkout: the stamp is an optimisation */ }
   console.log(`[preflight] ok: ${markets.length} market(s), all owned by wrapper ${WRAPPER}`);
 }
 main().catch((e: unknown) => fail(e instanceof Error ? e.message : String(e)));
