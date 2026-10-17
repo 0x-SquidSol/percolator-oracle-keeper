@@ -186,6 +186,7 @@ export interface RpcFailoverSnapshot {
     slot: number | null;
     slotLag: number | null;
   }>;
+  floorSlot: number | null; // highest accepted slot (public chain data)
   switches: number;
   lastSwitchAt: string | null;
 }
@@ -222,7 +223,8 @@ export class RpcFailover {
   private rpcId = 1;
   /** Highest slot ever observed on any endpoint. Never expires, never projected: the chain only moves forward. */
   private floorSlot: number | null = null;
-  private floorAt = 0;
+  /** N1: the plausibility line is anchored HERE, set at first corroboration or a hatch reseed, never by a raise. */
+  private anchor: { slot: number; at: number } | null = null;
   private allDownSince: number | null = null;
   private allDownAlertedAt = 0;
   private pin: { idx: number; until: number } | null = null;
@@ -372,16 +374,18 @@ export class RpcFailover {
     const t = this.now();
     ep.slot = slot;
     ep.slotAt = t;
-    if (this.floorSlot === null || slot > this.floorSlot) {
-      this.floorSlot = slot;
-      this.floorAt = t;
-    }
+    if (this.floorSlot === null) this.anchor = { slot, at: t };
+    if (this.floorSlot === null || slot > this.floorSlot) this.floorSlot = slot; // raises do NOT move the anchor
   }
 
-  /** Highest slot the floor may reach from a reply now: the chain's real speed with 50% headroom, plus 2x the lag bound. */
+  /**
+   * Highest slot any reply may show now: a FIXED line from the anchor (slot, time) at the chain's real speed with 50%
+   * headroom, plus 2x the lag bound. Because accepted raises never move the anchor, a lying endpoint cannot creep the
+   * floor upward vet by vet: the most it can ever add is this line's own slack (100 slots + 1.25 slots per second).
+   */
   private floorCeiling(): number | null {
-    if (this.floorSlot === null) return null;
-    return this.floorSlot + ((this.now() - this.floorAt) / 1000) * this.cfg.slotsPerSecond * 1.5 + 2 * this.cfg.maxSlotLag;
+    if (this.anchor === null) return null;
+    return this.anchor.slot + ((this.now() - this.anchor.at) / 1000) * this.cfg.slotsPerSecond * 1.5 + 2 * this.cfg.maxSlotLag;
   }
 
   /**
@@ -397,7 +401,10 @@ export class RpcFailover {
         .map(async (o) => {
           if (!o.genesisOk) {
             const g = await this.rpc(o, "getGenesisHash");
-            if (g.err !== undefined || typeof g.result !== "string") return;
+            if (g.err !== undefined || typeof g.result !== "string") {
+              this.markDown(o, g.err ?? "genesis probe returned no hash"); // N2: backoff, so dead peers are not re-probed every vet
+              return;
+            }
             if (g.result !== this.expectedGenesis) {
               this.refuse(o, g.result);
               return;
@@ -406,6 +413,7 @@ export class RpcFailover {
           }
           const r = await this.rpc(o, "getSlot");
           if (r.err === undefined && typeof r.result === "number") out.push(r.result);
+          else this.markDown(o, r.err ?? "slot probe returned no slot");
         }),
     );
     return out;
@@ -428,10 +436,14 @@ export class RpcFailover {
     const tolerance = this.cfg.maxSlotLag + 1.5 * this.cfg.slotsPerSecond * ((Math.max(...ats) - Math.min(...ats)) / 1000);
     if (raws[raws.length - 1] - raws[0] > tolerance) return;
     const proj = raws;
+    // SAFE CHOICE, deliberately: the median of the RAW replies, not of replies projected forward by elapsed time. The
+    // replies are hatch-old and a projection would assume the chain advanced at the full rate since; a floor that is
+    // slightly low is harmless (the lag check merely gets looser by seconds), one too high re-creates the very lockout
+    // this hatch exists to break.
     const median = raws[Math.floor(raws.length / 2)]; // unprojected: a floor slightly low is safe, one too high is the bug being repaired
     this.logLine(`[ALERT] every endpoint has been rejected as lagging for >= ${Math.round(this.cfg.floorReseedMs / 1000)}s but they agree with each other (slots ${proj.join(",")}); the slot floor ${this.floorSlot} was wrong, re-seeding it to ${median}`);
     this.floorSlot = median;
-    this.floorAt = t;
+    this.anchor = { slot: median, at: t };
     for (const e of live) {
       e.laggingSince = null;
       e.downUntil = 0;
@@ -490,6 +502,20 @@ export class RpcFailover {
       } else {
         const fresh = await this.blockTimeFresh(ep, slot);
         if (fresh === "stale") return false;
+        // N3: a genesis-verified peer clearly AHEAD of this endpoint is evidence the endpoint lags. Use it as a lower
+        // bound when it is plausible given the block-time window (what the chain can do in maxAge seconds, same
+        // headroom as the ceiling); an implausibly high peer is discarded, exactly as before.
+        const maxAgeSec = this.cfg.maxSlotLag * 0.4 + 18;
+        const plausibleHi = slot + maxAgeSec * this.cfg.slotsPerSecond * 1.5 + 2 * this.cfg.maxSlotLag;
+        const higher = peers.filter((p) => p - slot > this.cfg.maxSlotLag && p <= plausibleHi);
+        if (higher.length > 0) {
+          const lb = Math.max(...higher);
+          this.accept(ep, lb); // sets floor + anchor from the corroborated-by-plausibility peer slot
+          ep.slot = slot;
+          ep.slotAt = this.now();
+          this.markDown(ep, `lagging: slot ${slot} is ${lb - slot} behind a genesis-verified peer (${lb})`);
+          return false;
+        }
         if (fresh === "fresh") {
           this.accept(ep, slot);
           confirmed = true;
@@ -693,6 +719,7 @@ export class RpcFailover {
         slot: e.slot,
         slotLag: e.slot !== null && bestAll >= 0 ? Math.max(0, bestAll - (e.slot + Math.floor(((t - e.slotAt) / 1000) * this.cfg.slotsPerSecond))) : null,
       })),
+      floorSlot: this.floorSlot,
       switches: this.switches,
       lastSwitchAt: this.lastSwitchAt === null ? null : new Date(this.lastSwitchAt).toISOString(),
     };

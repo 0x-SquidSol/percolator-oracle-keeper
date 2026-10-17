@@ -480,3 +480,69 @@ describe("rpc-failover: R153 F1b the floor cannot be poisoned", () => {
     assert.ok(!alerts.join("").includes(SECRET));
   });
 });
+
+describe("rpc-failover: N1/N2/N3 follow-ups", () => {
+  it("N1: a lying fallback cannot creep the floor over many vets (anchor line is fixed)", async () => {
+    // two honest endpoints corroborate the floor at slot 100_000 (the anchor); the fallback then answers each vet
+    // with the highest slot the ceiling allows
+    const { f, net, tick } = mk({ [P]: { slot: 100_000 }, [F1]: { slot: 100_000 } }, [P, F1], { slotCheckIntervalMs: 1, backoffBaseMs: 1, backoffMaxMs: 1, primaryRetryMs: 1e9 });
+    await call(f);
+    const t0 = 1_000_000;
+    net.hosts[P] = { status: 429 };
+    let now = t0;
+    const ceilingAt = (ms: number) => 100_000 + ((ms - t0) / 1000) * 2.5 * 1.5 + 2 * 50;
+    for (let i = 0; i < 120; i++) {
+      tick(10_000);
+      now += 10_000;
+      // the liar creeps: each reply is the previous floor plus the most a time-base-resetting ceiling would allow
+      net.hosts[F1] = { slot: Math.floor((f.snapshot().floorSlot as number) + 10 * 3.75 + 90), frozen: true };
+      await call(f).catch(() => undefined);
+    }
+    const floor = f.snapshot().floorSlot as number;
+    const line = ceilingAt(now);
+    assert.ok(floor <= line, `floor ${floor} exceeded the fixed line ${line}`);
+    // with the old moving time base each accepted raise allowed another +10s*3.75+100 = +137: ~16k over 120 vets
+    assert.ok(floor < 100_000 + 5_000, `floor crept to ${floor}`);
+  });
+
+  it("N2: dead peers are not re-probed on every vet while the floor is null", async () => {
+    // primary healthy but without block time and with a dead fallback: floor stays null, every vet seeds peers
+    const { f, net, tick } = mk({ [P]: { slot: 100_000, noBlockTime: true }, [F1]: { throwNet: true } }, [P, F1], { slotCheckIntervalMs: 1 });
+    for (let i = 0; i < 30; i++) {
+      tick(100);
+      assert.equal(await who(await call(f)), `ok:${P}`);
+    }
+    const peerCalls = net.calls.filter((c) => c.url === F1).length;
+    assert.ok(peerCalls <= 4, `dead peer probed ${peerCalls} times in 3 s of vets`);
+  });
+
+  it("N3: a plausibly-higher genesis-verified peer is a lower bound; the lagging endpoint is refused", async () => {
+    // F1 is 120 slots behind F2 (> maxSlotLag 50, within the plausible window); block times look fine
+    const { f, net } = mk({ [P]: { status: 429 }, [F1]: { slot: 10_000 }, [F2]: { slot: 10_120 } }, [P, F1, F2]);
+    assert.equal(await who(await call(f)), `ok:${F2}`);
+    const s = f.snapshot();
+    assert.equal(s.endpoints[1].state, "down");
+    assert.match(s.endpoints[1].lastError ?? "", /behind a genesis-verified peer/);
+    assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "getBalance"));
+  });
+
+  it("N3: an implausibly-high peer is still discarded (it cannot take the floor)", async () => {
+    const { f } = mk({ [P]: { status: 429 }, [F1]: { slot: 10_000 }, [F2]: { slot: 4_000_000 } }, [P, F1, F2]);
+    assert.equal(await who(await call(f)), `ok:${F1}`);
+    assert.ok((f.snapshot().floorSlot as number) < 20_000);
+  });
+
+  it("hatch median is the RAW median, not a projected one (safe: a low floor is harmless, a high one re-locks)", async () => {
+    const { f, net, tick } = mk({ [P]: { slot: 10_000, frozen: true }, [F1]: { slot: 10_000, frozen: true } }, [P, F1], {
+      slotCheckIntervalMs: 1, floorReseedMs: 300_000, backoffBaseMs: 1_000, backoffMaxMs: 5_000, primaryRetryMs: 1,
+    });
+    await call(f);
+    net.hosts[P] = { slot: 100, frozen: true };
+    net.hosts[F1] = { slot: 100, frozen: true };
+    for (let i = 0; i < 20 && f.snapshot().floorSlot === 10_000; i++) {
+      tick(30_000);
+      await call(f).catch(() => undefined);
+    }
+    assert.equal(f.snapshot().floorSlot, 100, "re-seeded to the raw replies (100), not 100 + elapsed*2.5");
+  });
+});
