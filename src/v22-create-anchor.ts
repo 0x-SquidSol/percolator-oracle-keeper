@@ -9,6 +9,7 @@
  * Dry-run is the DEFAULT (simulate and print). A real send needs KEEPER_V22_CREATE_ANCHOR_DRY_RUN=off.
  */
 import fs from "fs";
+import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { parseFlag } from "./cross-cluster/v22/flags.ts";
 import { createKeeperAnchor } from "./cross-cluster/v22/create-anchor.ts";
@@ -28,7 +29,8 @@ if (!marketArg || !rpc) {
 }
 const secret = process.env.KEEPER_KEYPAIR ? JSON.parse(process.env.KEEPER_KEYPAIR) : JSON.parse(fs.readFileSync(process.env.KEEPER_KEYPAIR_PATH ?? "", "utf8"));
 const keeper = Keypair.fromSecretKey(Uint8Array.from(secret));
-const conn = new Connection(rpc, "confirmed");
+const failover = failoverFromEnv("devnet", rpc, parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS), process.env, (i, init) => fetch(i, init));
+const conn = new Connection(rpc, { commitment: "confirmed", ...(failover ? { fetch: failover.fetch } : {}) });
 const r = await createKeeperAnchor({ conn, keeper, dryRun }, conn, { market: new PublicKey(marketArg), programId: WRAPPER_PROGRAM_ID, dryRun });
 if (r.outcome.kind === "failed") {
   console.error(`[v22-create-anchor] ${r.outcome.error}`);

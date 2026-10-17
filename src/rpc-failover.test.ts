@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isTransientRpcError, parseFallbackUrls, preflightOutageDecision } from "./rpc-failover.ts";
+import { isTransientRpcError, parseFallbackUrls, preflightOutageDecision, preflightStampSha, GENESIS_HASH } from "./rpc-failover.ts";
 
 test("status and error classification", () => {
   assert.ok(isTransientRpcError(new Error("rpc-degraded: all devnet RPC endpoints are down")));
@@ -30,7 +30,7 @@ test("preflightOutageDecision: only an unchanged, previously verified registry m
 });
 
 // ── end to end: the real preflight script against a local RPC that answers 429 max usage reached ──
-function runPreflight(stamp: "match" | "stale" | "none") {
+function runPreflight(stamp: "match" | "stale" | "none" | "otherwrapper") {
   return new Promise<{ code: number | null; out: string }>((resolve) => {
     const srv = http.createServer((_q, r) => { r.statusCode = 429; r.end("max usage reached"); });
     srv.listen(0, "127.0.0.1", () => {
@@ -39,8 +39,9 @@ function runPreflight(stamp: "match" | "stale" | "none") {
       const reg = path.join(dir, "registry.json");
       const M = "11111111111111111111111111111111";
       fs.writeFileSync(reg, JSON.stringify({ markets: [{ label: "t", marketAddress: M, poolAddress: M, dexType: "pumpswap" }] }));
-      const sha = crypto.createHash("sha256").update(fs.readFileSync(reg)).digest("hex");
-      if (stamp !== "none") fs.writeFileSync(`${reg}.preflight-ok`, (stamp === "match" ? sha : "0".repeat(64)) + "\n");
+      const WRAP = "6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM";
+      const sha = preflightStampSha(fs.readFileSync(reg), stamp === "otherwrapper" ? "11111111111111111111111111111112" : WRAP, GENESIS_HASH.devnet);
+      if (stamp !== "none") fs.writeFileSync(`${reg}.preflight-ok`, (stamp !== "stale" ? sha : "0".repeat(64)) + "\n");
       // The child must not block the event loop that serves the 429s, so spawn asynchronously.
       import("node:child_process").then(({ spawn }) => {
         const c = spawn(process.execPath, ["--import", "tsx/esm", "scripts/preflight-v22fresh.ts"], {
@@ -54,6 +55,7 @@ function runPreflight(stamp: "match" | "stale" | "none") {
   });
 }
 void spawnSync;
+void crypto;
 
 test("preflight on an exhausted RPC: unchanged verified registry starts degraded (exit 0)", { timeout: 120_000 }, async () => {
   const r = await runPreflight("match");
@@ -62,9 +64,18 @@ test("preflight on an exhausted RPC: unchanged verified registry starts degraded
 });
 
 test("preflight on an exhausted RPC: an unverified or changed registry still refuses (exit 1)", { timeout: 120_000 }, async () => {
-  for (const s of ["none", "stale"] as const) {
+  for (const s of ["none", "stale", "otherwrapper"] as const) {
     const r = await runPreflight(s);
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /REFUSE/);
   }
+});
+
+test("F3: the stamp binds registry + wrapper program id + cluster genesis", () => {
+  const reg = Buffer.from('{"markets":[]}');
+  const base = preflightStampSha(reg, "WRAP1", GENESIS_HASH.devnet);
+  assert.equal(base, preflightStampSha(reg, "WRAP1", GENESIS_HASH.devnet));
+  assert.notEqual(base, preflightStampSha(reg, "WRAP2", GENESIS_HASH.devnet), "re-deploy to a new wrapper id must not reuse the stamp");
+  assert.notEqual(base, preflightStampSha(reg, "WRAP1", GENESIS_HASH.mainnet), "another cluster must not reuse the stamp");
+  assert.notEqual(base, preflightStampSha(Buffer.from('{"markets":[1]}'), "WRAP1", GENESIS_HASH.devnet));
 });

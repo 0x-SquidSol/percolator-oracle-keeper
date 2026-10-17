@@ -726,18 +726,22 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       status:
         pricingStatus !== "ok"
           ? pricingStatus
-          : rpcFailover.degraded
-            ? "rpc-degraded"
-            : restarts?.escalated
-              ? "restart-loop"
-              : quarantinedMarkets.length > 0 ||
+          : quarantinedMarkets.length > 0 ||
               lossStaleMarkets.length > 0 ||
               layoutProblemMarkets.length > 0 ||
               noPushMarkets.length > 0 ||
               markLaggingMarkets.length > 0 ||
               accrualLaggingAssets.length > 0
             ? "degraded-markets"
-            : "ok",
+            : rpcFailover.degraded
+              ? "rpc-degraded"
+              : restarts?.escalated
+                ? "restart-loop"
+                : "ok",
+      // F6: the infra states are ALSO their own fields, so a market problem outranking them in `status` never hides them.
+      // (present only when a failover / restart log is configured, so unconfigured deployments keep today's exact key set)
+      ...(Object.keys(rpcFailover.fields).length > 0 ? { rpcStatus: rpcFailover.degraded ? "rpc-degraded" : "ok" } : {}),
+      ...(restarts ? { restartLoop: restarts.escalated } : {}),
       lastSuccessfulPushAgo:
         state.lastSuccessfulPushAt !== null
           ? `${Math.floor((Date.now() - state.lastSuccessfulPushAt) / 1000)}s`

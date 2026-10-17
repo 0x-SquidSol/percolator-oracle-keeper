@@ -8,7 +8,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import fs from "fs";
 import crypto from "crypto";
-import { failoverFromEnv, isTransientRpcError, parseFallbackUrls, preflightOutageDecision, redactText } from "../src/rpc-failover.ts";
+import { failoverFromEnv, isTransientRpcError, parseFallbackUrls, preflightOutageDecision, preflightStampSha, redactText, GENESIS_HASH } from "../src/rpc-failover.ts";
 import { alertText, recordLaunch, restartConfig } from "../src/restart-escalation.ts";
 
 const DEVNET_RPC = process.env.DEVNET_RPC_URL ?? "";
@@ -97,7 +97,8 @@ async function main(): Promise<void> {
     seen.add(m.marketAddress);
     new PublicKey(m.marketAddress);
   }
-  const registrySha = crypto.createHash("sha256").update(fs.readFileSync(REGISTRY_PATH)).digest("hex");
+  // F3: the stamp binds registry + wrapper program id + cluster genesis, not the registry alone.
+  const registrySha = preflightStampSha(fs.readFileSync(REGISTRY_PATH), WRAPPER, GENESIS_HASH.devnet);
   const stampPath = process.env.PREFLIGHT_STAMP_PATH ?? `${REGISTRY_PATH}.preflight-ok`;
   const fallbacks = parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS);
   // Each endpoint passes the genesis-hash cluster check + slot-lag check before it answers (rpc-failover.ts).

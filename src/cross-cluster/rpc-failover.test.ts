@@ -24,10 +24,13 @@ interface Host {
   throwOnCall?: boolean; // network error on real calls only; probes succeed
   genesis?: string;
   slot?: number;
+  blockAgeSec?: number; // age of the block returned by getBlockTime (default 8)
+  noBlockTime?: boolean;
+  frozen?: boolean; // slot does not advance with the clock (a stuck node)
 }
 
 /** Scripted transport keyed by URL. Records every (url, method) it sees. */
-function makeNet(hosts: Record<string, Host>) {
+function makeNet(hosts: Record<string, Host>, nowMs: () => number = () => 1_000_000) {
   const calls: Array<{ url: string; method: string }> = [];
   const base: FetchLike = async (input, init) => {
     const url = String(input);
@@ -36,9 +39,13 @@ function makeNet(hosts: Record<string, Host>) {
     calls.push({ url, method });
     if (!h || h.throwNet) throw new Error(`ECONNRESET ${url}`);
     if (h.throwOnCall && method !== "getGenesisHash" && method !== "getSlot") throw new Error(`ECONNRESET ${url}`);
+    if (method === "getBlockTime") {
+      if (h.noBlockTime) return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32004, message: "Block not available" } }), { status: 200 });
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: Math.floor(nowMs() / 1000) - (h.blockAgeSec ?? 8) }), { status: 200 });
+    }
     if (method === "getGenesisHash" || method === "getSlot") {
       if (h.status && h.status !== 200) return new Response(h.body ?? "x", { status: h.status });
-      const result = method === "getGenesisHash" ? (h.genesis ?? GENESIS_HASH.devnet) : (h.slot ?? 1000);
+      const result = method === "getGenesisHash" ? (h.genesis ?? GENESIS_HASH.devnet) : (h.slot ?? 1000) + (h.frozen ? 0 : Math.floor(((nowMs() - 1_000_000) * 2.5) / 1000));
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }), { status: 200 });
     }
     return new Response(h.body ?? JSON.stringify({ jsonrpc: "2.0", id: 1, result: `ok:${url}` }), { status: h.status ?? 200 });
@@ -47,8 +54,8 @@ function makeNet(hosts: Record<string, Host>) {
 }
 
 function mk(hosts: Record<string, Host>, urls: string[], extra: Partial<ConstructorParameters<typeof RpcFailover>[0]> = {}) {
-  const net = makeNet(hosts);
   let t = 1_000_000;
+  const net = makeNet(hosts, () => t);
   const logs: string[] = [];
   const f = new RpcFailover({ cluster: "devnet", urls, base: net.base, now: () => t, log: (l) => logs.push(l), ...extra });
   return { f, net, logs, tick: (ms: number) => (t += ms) };
@@ -199,7 +206,7 @@ describe("rpc-failover: slot freshness", () => {
     tick(1_000);
     await assert.rejects(call(f), /rpc-degraded/, "lagging fallback must not carry the request");
     assert.equal(f.snapshot().endpoints[1].state, "down");
-    assert.match(f.snapshot().endpoints[1].lastError ?? "", /lagging: slot 9500 is \d+ behind/);
+    assert.match(f.snapshot().endpoints[1].lastError ?? "", /lagging: slot 95\d\d is \d+ behind/);
     assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "getBalance"), "no request ever sent via the lagging endpoint");
   });
 
@@ -285,5 +292,95 @@ describe("rpc-failover: secret redaction", () => {
   it("parseFallbackUrls errors never echo the offending value (it may carry a key)", () => {
     assert.throws(() => parseFallbackUrls(`http://x.example/?api-key=${SECRET}`), (e: Error) => !e.message.includes(SECRET));
     assert.throws(() => parseFallbackUrls(`nope-${SECRET}`), (e: Error) => !e.message.includes(SECRET));
+  });
+});
+
+const sendCall = (f: RpcFailover) => call(f, "sendTransaction");
+
+describe("rpc-failover: R153 F1 slot guard survives a long outage / a baseline-less boot", () => {
+  it("primary 429 for 120 s, then a fallback 5000 slots behind is NOT served", async () => {
+    const { f, net, tick } = mk({ [P]: { slot: 10_000 }, [F1]: { slot: 5_000, frozen: true } }, [P, F1], { slotCheckIntervalMs: 1 });
+    await call(f); // primary vetted: floor slot 10_000
+    net.hosts[P] = { status: 429 };
+    tick(120_000); // > the 60 s window in which a peer observation counts
+    await assert.rejects(call(f), /rpc-degraded/);
+    assert.equal(f.snapshot().endpoints[1].state, "down");
+    assert.match(f.snapshot().endpoints[1].lastError ?? "", /behind the highest slot seen/);
+    assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "getBalance"));
+  });
+
+  it("boot with the primary down: the baseline comes from the other endpoints; a lagging fallback is refused", async () => {
+    // F1 lags F2 by 3000 slots; the primary is dead from the first call
+    const { f, net } = mk({ [P]: { status: 429 }, [F1]: { slot: 7_000 }, [F2]: { slot: 10_000 } }, [P, F1, F2]);
+    assert.equal(await who(await call(f)), `ok:${F2}`);
+    assert.equal(f.snapshot().endpoints[1].state, "down");
+    assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "getBalance"));
+  });
+
+  it("boot with the primary down and no peer: block time anchors freshness; a stale-block node is refused", async () => {
+    const stale = mk({ [P]: { status: 429 }, [F1]: { blockAgeSec: 600 } }, [P, F1]);
+    await assert.rejects(call(stale.f), /rpc-degraded/);
+    assert.match(stale.f.snapshot().endpoints[1].lastError ?? "", /stale: block time/);
+    const fresh = mk({ [P]: { status: 429 }, [F1]: { blockAgeSec: 5 } }, [P, F1]);
+    assert.equal(await who(await call(fresh.f)), `ok:${F1}`);
+    assert.equal(await who(await sendCall(fresh.f)), `ok:${F1}`, "block-time-confirmed fallback may send");
+  });
+
+  it("unconfirmed fallback (no peer, no block time): reads are served, sends are refused; the primary stays trusted", async () => {
+    const { f, net } = mk({ [P]: { status: 429 }, [F1]: { noBlockTime: true } }, [P, F1]);
+    assert.equal(await who(await call(f)), `ok:${F1}`);
+    await assert.rejects(sendCall(f), /no slot-confirmed devnet RPC endpoint available for a write/);
+    assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "sendTransaction"));
+    const solo = mk({ [P]: { noBlockTime: true }, [F1]: {} }, [P, F1]);
+    assert.equal(await who(await sendCall(solo.f)), `ok:${P}`, "primary without block time is unchanged behaviour");
+  });
+});
+
+describe("rpc-failover: R153 F2 probes are rate limited", () => {
+  it("10 requests inside slotCheckIntervalMs cost 10 upstream calls plus one vet (+ the one-off boot baseline seed), not 20", async () => {
+    const { f, net } = mk({ [P]: {}, [F1]: {} }, [P, F1], { slotCheckIntervalMs: 10_000 });
+    for (let i = 0; i < 10; i++) await call(f);
+    const real = net.calls.filter((c) => c.method === "getBalance").length;
+    const probes = net.calls.filter((c) => c.method === "getSlot").length;
+    assert.equal(real, 10);
+    assert.equal(probes, 2, "primary vet + one-off baseline seed of the fallback; not one per request");
+  });
+  it("after slotCheckIntervalMs the next request re-checks the slot once", async () => {
+    const { f, net, tick } = mk({ [P]: {}, [F1]: {} }, [P, F1], { slotCheckIntervalMs: 10_000 });
+    await call(f);
+    tick(11_000);
+    await call(f);
+    await call(f);
+    assert.equal(net.calls.filter((c) => c.method === "getSlot").length, 3, "2 at boot, exactly 1 more after the interval");
+  });
+});
+
+describe("rpc-failover: R153 F4 the round stays on the endpoint that took the send", () => {
+  it("status polls follow the sending endpoint even after the primary recovers mid-round", async () => {
+    const { f, net, tick } = mk({ [P]: { status: 429 }, [F1]: {} }, [P, F1], { primaryRetryMs: 1_000, backoffBaseMs: 1_000, slotCheckIntervalMs: 1 });
+    assert.equal(await who(await sendCall(f)), `ok:${F1}`); // send lands on the fallback
+    net.hosts[P] = {}; // primary comes back
+    tick(5_000);
+    await call(f); // triggers the probe
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(f.snapshot().activeIndex, 0, "primary is active again for new work");
+    assert.equal(await who(await call(f, "getSignatureStatuses")), `ok:${F1}`, "but this round's status poll goes to the sender");
+    tick(120_000); // pin expired
+    assert.equal(await who(await call(f, "getSignatureStatuses")), `ok:${P}`);
+  });
+});
+
+describe("rpc-failover: R153 F7 auth failures are loud and fall back", () => {
+  it("401 on the primary: ALERT logged, endpoint parked at the max cooldown, fallback serves", async () => {
+    const { f, logs } = mk({ [P]: { status: 401, body: "Unauthorized" }, [F1]: {} }, [P, F1], { backoffMaxMs: 300_000 });
+    assert.equal(await who(await call(f)), `ok:${F1}`);
+    assert.ok(logs.some((l) => /\[ALERT\].*AUTH FAILURE/.test(l)), logs.join("\n"));
+    assert.equal(f.snapshot().endpoints[0].downForMs, 300_000);
+    assert.ok(!logs.join("\n").includes(SECRET));
+  });
+  it("403 with a quota body is a quota stop, not an auth failure", async () => {
+    const { f, logs } = mk({ [P]: { status: 403, body: "max usage reached" }, [F1]: {} }, [P, F1]);
+    await call(f);
+    assert.ok(!logs.some((l) => /AUTH FAILURE/.test(l)));
   });
 });
