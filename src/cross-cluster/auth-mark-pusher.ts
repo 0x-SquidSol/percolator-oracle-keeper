@@ -805,6 +805,19 @@ export async function fetchPushAuthMarkGenerationFields(
 // restart or another pusher is covered by the max with chain.
 const lastSentObservationSequence = new Map<string, bigint>();
 
+// ── S3-B4 (audit 2026-10-17): superseded-cycle guard ──────────────────────────────────────────────────────────────
+//
+// The push loop races each cycle against a watchdog (keeper-loop.ts timeoutAfter) but cannot cancel it: an abandoned
+// cycle keeps running and, when its stuck RPC call returns, sends the price it computed BEFORE the newer cycles. The
+// nonce above is max(chain, lastSent) + 1, so that older price gets a HIGHER observation_sequence than the newer push
+// and the program accepts it (the slot it records is the Clock's, not the cycle's): the stale mark lands on top.
+// A caller that tags its pushes with a monotonically increasing `cycle` gets them dropped once any later cycle has sent
+// for the same (market, asset). Untagged calls are unchanged.
+const lastSentCycle = new Map<string, number>();
+function supersededByLaterCycle(key: string, cycle: number | undefined): boolean {
+  return cycle !== undefined && (lastSentCycle.get(key) ?? Number.NEGATIVE_INFINITY) > cycle;
+}
+
 /** Forget nonce, quarantine and terminal-log state of every market not in `keep` (deregistered). */
 export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
   for (const m of [...quarantinedUntil.keys()]) if (!keep.has(m)) quarantinedUntil.delete(m);
@@ -815,6 +828,7 @@ export function pruneAuthMarkPusherState(keep: ReadonlySet<string>): void {
   // and whenever the previous cycle's batch had not landed by the read the two carried the same nonce; the later
   // one reverted Custom(19) on chain (~15/h on the fresh v2.2 devnet, 411 in 30 h, always "ix 1").
   for (const k of [...lastSentObservationSequence.keys()]) if (!keep.has(generationKeyMarket(k))) lastSentObservationSequence.delete(k);
+  for (const k of [...lastSentCycle.keys()]) if (!keep.has(generationKeyMarket(k))) lastSentCycle.delete(k);
   for (const m of [...terminalLogged]) if (!keep.has(m)) terminalLogged.delete(m);
   for (const m of [...soloUntil.keys()]) if (!keep.has(m)) soloUntil.delete(m);
   for (const m of [...landedRevertTimes.keys()]) if (!keep.has(m)) landedRevertTimes.delete(m);
@@ -944,6 +958,7 @@ export function resetPushLandingState(): void {
   lateDuplicatesSinceLog = 0;
   soloUntil.clear();
   landedRevertTimes.clear();
+  lastSentCycle.clear();
 }
 
 /**
@@ -1031,6 +1046,8 @@ export async function pushAuthMarkBatch(
   nowSlot: bigint,
   blockhash: { blockhash: string; lastValidBlockHeight: number },
   dryRun: boolean,
+  /** S3-B4: the caller's cycle number; pushes of a cycle older than one that already sent for the same asset are dropped. */
+  opts: { cycle?: number } = {},
 ): Promise<{
   pushed: boolean;
   signature?: string;
@@ -1105,9 +1122,14 @@ export async function pushAuthMarkBatch(
   const terminalMarkets = [...terminal];
   const pushable: AuthMarkPushItem[] = [];
   const missingGeneration: string[] = [];
+  const supersededKeys: string[] = [];
   for (const p of eligible) {
     if (terminal.has(p.marketAddress)) continue;
     if (inactive.has(pushGenerationKey(p))) continue;
+    if (supersededByLaterCycle(pushGenerationKey(p), opts.cycle)) {
+      supersededKeys.push(pushGenerationKey(p));
+      continue;
+    }
     const fields = generationFields.get(pushGenerationKey(p));
     if (!fields) {
       missingGeneration.push(p.marketAddress);
@@ -1124,6 +1146,9 @@ export async function pushAuthMarkBatch(
     // Mode 2 only for the pin made for THIS asset slot and generation; anything else stays on the attested path.
     const dex = p.dex && p.dex.assetIndex === p.assetIndex && p.dex.marketId === fields.marketId ? p.dex : undefined;
     pushable.push({ ...p, dex, marketId: fields.marketId, observationSequence: fields.observationSequence, lotExp: fields.lotExp, markE6 });
+  }
+  if (supersededKeys.length > 0) {
+    console.warn(`[push] cycle ${opts.cycle} superseded by a later cycle — not sending its older price for ${supersededKeys.length} asset(s)`);
   }
   if (missingGeneration.length > 0) {
     console.warn(
@@ -1228,7 +1253,10 @@ export async function pushAuthMarkBatch(
   };
 
   /** Submit a chunk that preflighted clean. Fire-and-forget on confirmation. */
-  const send = async (chunk: AuthMarkPushItem[]): Promise<void> => {
+  const send = async (chunkIn: AuthMarkPushItem[]): Promise<void> => {
+    // S3-B4: re-checked at send time; a later cycle may have sent while this one awaited its preflight.
+    const chunk = chunkIn.filter((p) => !supersededByLaterCycle(pushGenerationKey(p), opts.cycle));
+    if (chunk.length === 0) return;
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
     tx.sign(keeper);
     try {
@@ -1252,6 +1280,10 @@ export async function pushAuthMarkBatch(
         // …and reserves its nonce, so the NEXT cycle proposes above it even if
         // this tx has not landed/confirmed by the time that cycle reads chain.
         recordSentObservationSequence(p);
+        if (opts.cycle !== undefined) {
+          const k = pushGenerationKey(p);
+          if ((lastSentCycle.get(k) ?? Number.NEGATIVE_INFINITY) < opts.cycle) lastSentCycle.set(k, opts.cycle);
+        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

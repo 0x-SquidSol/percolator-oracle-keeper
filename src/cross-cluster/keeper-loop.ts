@@ -1150,6 +1150,9 @@ async function runCycle(
   state: LoopState,
   config: LoopConfig,
 ): Promise<void> {
+  // S3-B4: this cycle's number, captured BEFORE any await. A cycle the watchdog abandons keeps running; its pushes are
+  // dropped by the pusher once a later cycle has sent for the same asset (it would otherwise land an older price on top).
+  const cycle = state.cycleCount;
   // A market register-poll just dropped leaves /health with it.
   for (const addr of pruneDeregisteredMarkets(state, registry)) {
     console.log(`[keeper] ${addr.slice(0, 8)}… no longer registered — removed from /health`);
@@ -1478,7 +1481,7 @@ async function runCycle(
   // ── 5. One batched PushAuthMark tx, fire-and-forget ─────────────────────────
   try {
     state.cycleAttempted = pushes.length; // adjusted below for terminal markets
-    const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun);
+    const res = await pushAuthMarkBatch(devnetConn, keeper, pushes, nowSlot, cachedBlockhash, config.dryRun, { cycle });
     state.cycleAttempted = pushes.length - (res.terminalMarkets?.length ?? 0);
     state.cyclePushed = config.dryRun ? state.cycleAttempted : res.signature ? res.pushedMarkets.length : 0;
     const stamp = Date.now();

@@ -26,8 +26,12 @@ describe("#100 mint binding", () => {
     assert.deepEqual(checkMintBinding(TOKEN.toBase58(), TOKEN, USDC), { ok: true });
   });
 
-  it("accepts when it is the QUOTE mint — a WSOL/TOKEN pool is legitimate", () => {
-    assert.deepEqual(checkMintBinding(TOKEN.toBase58(), USDC, TOKEN), { ok: true });
+  // S3-B2 (audit 2026-10-17): this used to be accepted. Here TOKEN is WSOL: a USDC/WSOL pool prices USDC (quote-per-base
+  // x SOL/USD ~ $1), so the "SOL" market would publish USDC's price. The priced token is always the base.
+  it("REJECTS the market token on the QUOTE side — the pool prices the base, a different token", () => {
+    const r = checkMintBinding(TOKEN.toBase58(), USDC, TOKEN);
+    assert.equal(r.ok, false);
+    assert.match((r as { reason: string }).reason, /QUOTE/);
   });
 
   it("REJECTS a pool for an entirely different token", () => {
