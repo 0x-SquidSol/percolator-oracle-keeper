@@ -311,7 +311,7 @@ describe("rpc-failover: R153 F1 slot guard survives a long outage / a baseline-l
 
   it("boot with the primary down: the baseline comes from the other endpoints; a lagging fallback is refused", async () => {
     // F1 lags F2 by 3000 slots; the primary is dead from the first call
-    const { f, net } = mk({ [P]: { status: 429 }, [F1]: { slot: 7_000 }, [F2]: { slot: 10_000 } }, [P, F1, F2]);
+    const { f, net } = mk({ [P]: { status: 429 }, [F1]: { slot: 7_000, blockAgeSec: 1_200 }, [F2]: { slot: 10_000 } }, [P, F1, F2]);
     assert.equal(await who(await call(f)), `ok:${F2}`);
     assert.equal(f.snapshot().endpoints[1].state, "down");
     assert.ok(!net.calls.some((c) => c.url === F1 && c.method === "getBalance"));
@@ -382,5 +382,101 @@ describe("rpc-failover: R153 F7 auth failures are loud and fall back", () => {
     const { f, logs } = mk({ [P]: { status: 403, body: "max usage reached" }, [F1]: {} }, [P, F1]);
     await call(f);
     assert.ok(!logs.some((l) => /AUTH FAILURE/.test(l)));
+  });
+});
+
+describe("rpc-failover: R153 F1b the floor cannot be poisoned", () => {
+  const MAIN = GENESIS_HASH.mainnet;
+
+  it("boot: a wrong-cluster fallback (slot 4e8) is refused and contributes nothing; the primary stays healthy", async () => {
+    const { f, net } = mk({ [P]: { slot: 100_000 }, [F1]: { slot: 400_000_000, genesis: MAIN } }, [P, F1]);
+    assert.equal(await who(await call(f)), `ok:${P}`);
+    const s = f.snapshot();
+    assert.equal(s.endpoints[0].state, "ok");
+    assert.equal(s.endpoints[1].state, "refused");
+    assert.equal(s.status, "ok");
+    // the foreign slot was never even requested before its genesis was checked
+    const f1calls = net.calls.filter((c) => c.url === F1).map((c) => c.method);
+    assert.equal(f1calls[0], "getGenesisHash");
+    assert.ok(!f1calls.includes("getSlot"), "no getSlot to an endpoint that failed its genesis check");
+    for (let i = 0; i < 5; i++) assert.equal(await who(await call(f)), `ok:${P}`);
+  });
+
+  it("runtime: one 1e8 reply from a fallback is suspect-ahead; floor unchanged; the primary keeps serving; the endpoint recovers", async () => {
+    const { f, net, tick, logs } = mk({ [P]: { slot: 100_000 }, [F1]: { slot: 100_000 } }, [P, F1], { slotCheckIntervalMs: 1_000, primaryRetryMs: 1e9 });
+    await call(f);
+    // force the fallback to be re-vetted with a bogus reply
+    const snap0 = f.snapshot();
+    assert.equal(snap0.endpoints[0].state, "ok");
+    net.hosts[P] = { status: 429 };
+    tick(2_000);
+    assert.equal(await who(await call(f)), `ok:${F1}`); // now on F1
+    net.hosts[F1] = { slot: 100_000_000 }; // one bogus reply
+    net.hosts[P] = { slot: 100_000 };
+    tick(12_000);
+    await call(f).catch(() => undefined); // F1 re-vet -> suspect-ahead
+    const s1 = f.snapshot();
+    assert.equal(s1.endpoints[1].suspectAhead, true);
+    assert.equal(s1.endpoints[1].state, "down");
+    assert.ok(logs.some((l) => /suspect-ahead/.test(l)));
+    // honest endpoints, minutes later: nothing is stuck
+    net.hosts[F1] = { slot: 100_000 };
+    for (let i = 0; i < 6; i++) tick(60_000);
+    net.hosts[P] = { slot: 100_000 };
+    const r = await call(f);
+    assert.equal(r.status, 200);
+    assert.equal(f.snapshot().endpoints[0].state, "ok");
+    assert.notEqual(f.snapshot().status, undefined);
+  });
+
+  it("first boot needs corroboration: a lone endpoint disagreeing with a genesis-verified peer is decided by block time", async () => {
+    // peer says 100000, the primary says 400000000 (bogus) with a stale block -> primary down, fallback serves
+    const { f } = mk({ [P]: { slot: 400_000_000, blockAgeSec: 3_000 }, [F1]: { slot: 100_000 } }, [P, F1]);
+    assert.equal(await who(await call(f)), `ok:${F1}`);
+    assert.equal(f.snapshot().endpoints[0].state, "down");
+  });
+
+  it("escape hatch: every endpoint rejected as lagging for N minutes but agreeing -> floor re-seeded with an [ALERT]", async () => {
+    // floor gets set high (10_000) by two corroborating endpoints; the chain is then genuinely restarted at slot 100
+    const { f, net, tick, logs } = mk({ [P]: { slot: 10_000, frozen: true }, [F1]: { slot: 10_000, frozen: true } }, [P, F1], {
+      slotCheckIntervalMs: 1, floorReseedMs: 300_000, backoffBaseMs: 1_000, backoffMaxMs: 5_000, primaryRetryMs: 1,
+    });
+    await call(f);
+    net.hosts[P] = { slot: 100, frozen: true };
+    net.hosts[F1] = { slot: 100, frozen: true };
+    let ok = false;
+    for (let i = 0; i < 20 && !ok; i++) {
+      tick(30_000);
+      const r = await call(f).then((x) => x.status, () => 0);
+      ok = r === 200;
+    }
+    assert.ok(ok, "service resumed after the escape hatch");
+    assert.ok(logs.some((l) => /\[ALERT\].*re-seeding/.test(l)), logs.join("\n"));
+    // not before N minutes
+  });
+
+  it("escape hatch does NOT fire early or when the endpoints disagree with each other", async () => {
+    const { f, net, tick, logs } = mk({ [P]: { slot: 10_000, frozen: true }, [F1]: { slot: 10_000, frozen: true } }, [P, F1], {
+      slotCheckIntervalMs: 1, floorReseedMs: 300_000, backoffBaseMs: 1_000, backoffMaxMs: 5_000,
+    });
+    await call(f);
+    net.hosts[P] = { slot: 100, frozen: true };
+    net.hosts[F1] = { slot: 5_000, frozen: true }; // disagree by 4900
+    for (let i = 0; i < 30; i++) {
+      tick(30_000);
+      await call(f).catch(() => undefined);
+    }
+    assert.ok(!logs.some((l) => /re-seeding/.test(l)));
+  });
+
+  it("alive-but-useless surfaces as an [ALERT] after allDownAlertMs, then at most every 5 min", async () => {
+    const { f, tick, logs } = mk({ [P]: { status: 429 }, [F1]: { status: 429 } }, [P, F1], { allDownAlertMs: 120_000, backoffBaseMs: 1_000, backoffMaxMs: 2_000 });
+    for (let i = 0; i < 14; i++) {
+      tick(30_000);
+      await call(f).catch(() => undefined);
+    }
+    const alerts = logs.filter((l) => /\[ALERT\].*USELESS/.test(l));
+    assert.ok(alerts.length >= 1 && alerts.length <= 2, `${alerts.length} alerts: ${alerts.join("|")}`);
+    assert.ok(!alerts.join("").includes(SECRET));
   });
 });

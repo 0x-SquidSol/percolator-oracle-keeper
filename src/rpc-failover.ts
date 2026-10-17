@@ -132,6 +132,10 @@ export interface RpcFailoverOptions {
   slotsPerSecond?: number;
   /** How long after a send the sending endpoint is preferred for status/confirmation polls (F4). Default 60_000. */
   pinMs?: number;
+  /** If every endpoint has been rejected (lagging or suspect-ahead) for this long and they agree with each other, re-seed the floor. Default 300_000. */
+  floorReseedMs?: number;
+  /** Log an [ALERT] once all endpoints have been down this long (and every 5 min after). Default 120_000. */
+  allDownAlertMs?: number;
   log?: (line: string) => void;
 }
 
@@ -144,6 +148,15 @@ interface Endpoint {
   verified: boolean; // genesis checked since last outage
   /** Freshness established against a baseline (floor slot / other endpoint / block time). Writes need it (F1). */
   confirmed: boolean;
+  /** Genesis matched the expected cluster. Permanent. No slot from an endpoint reaches the floor before this. */
+  genesisOk: boolean;
+  /** Last vet reported a slot implausibly far ahead of the floor. */
+  suspectAhead: boolean;
+  /** Since when this endpoint has been consecutively rejected as lagging (null otherwise). */
+  laggingSince: number | null;
+  /** Last raw reply of a genesis-verified endpoint, kept OUT of every comparison except the escape hatch. */
+  rawSlot: number | null;
+  rawAt: number;
   refused: boolean; // wrong cluster, permanent
   consecutiveFailures: number;
   backoffExp: number;
@@ -164,6 +177,7 @@ export interface RpcFailoverSnapshot {
   endpoints: Array<{
     index: number;
     url: string; // redacted
+    suspectAhead: boolean;
     confirmed: boolean; // freshness established; unconfirmed endpoints serve reads only
     state: EpState;
     consecutiveFailures: number;
@@ -192,6 +206,8 @@ export class RpcFailover {
       | "probeTimeoutMs"
       | "slotsPerSecond"
       | "pinMs"
+      | "floorReseedMs"
+      | "allDownAlertMs"
     >
   >;
   private readonly expectedGenesis: string;
@@ -206,6 +222,9 @@ export class RpcFailover {
   private rpcId = 1;
   /** Highest slot ever observed on any endpoint. Never expires, never projected: the chain only moves forward. */
   private floorSlot: number | null = null;
+  private floorAt = 0;
+  private allDownSince: number | null = null;
+  private allDownAlertedAt = 0;
   private pin: { idx: number; until: number } | null = null;
 
   constructor(opts: RpcFailoverOptions) {
@@ -225,6 +244,8 @@ export class RpcFailover {
       probeTimeoutMs: opts.probeTimeoutMs ?? 5_000,
       slotsPerSecond: opts.slotsPerSecond ?? 2.5,
       pinMs: opts.pinMs ?? 60_000,
+      floorReseedMs: opts.floorReseedMs ?? 300_000,
+      allDownAlertMs: opts.allDownAlertMs ?? 120_000,
     };
     this.log = opts.log ?? ((l) => console.error(l));
     this.eps = opts.urls.map((url, idx) => ({
@@ -234,6 +255,11 @@ export class RpcFailover {
       // EVERY endpoint (primary included) is vetted (genesis + slot) before first use.
       verified: false,
       confirmed: false,
+      genesisOk: false,
+      suspectAhead: false,
+      laggingSince: null,
+      rawSlot: null,
+      rawAt: 0,
       refused: false,
       consecutiveFailures: 0,
       backoffExp: 0,
@@ -341,23 +367,75 @@ export class RpcFailover {
     return ep.vetting;
   }
 
-  private note(ep: Endpoint, slot: number): void {
+  /** Record an ACCEPTED slot (genesis-verified, plausible). Only here may the floor move. */
+  private accept(ep: Endpoint, slot: number): void {
+    const t = this.now();
     ep.slot = slot;
-    ep.slotAt = this.now();
-    if (this.floorSlot === null || slot > this.floorSlot) this.floorSlot = slot;
+    ep.slotAt = t;
+    if (this.floorSlot === null || slot > this.floorSlot) {
+      this.floorSlot = slot;
+      this.floorAt = t;
+    }
   }
 
-  /** Quiet getSlot on the other live endpoints, to get a baseline when none is known (boot with the primary down). */
-  private async seedBaseline(except: Endpoint): Promise<void> {
+  /** Highest slot the floor may reach from a reply now: the chain's real speed with 50% headroom, plus 2x the lag bound. */
+  private floorCeiling(): number | null {
+    if (this.floorSlot === null) return null;
+    return this.floorSlot + ((this.now() - this.floorAt) / 1000) * this.cfg.slotsPerSecond * 1.5 + 2 * this.cfg.maxSlotLag;
+  }
+
+  /**
+   * Quiet probes of the other endpoints for a first baseline. Each peer is GENESIS-checked first (a wrong-cluster
+   * peer is refused and contributes nothing); slots are returned, not stored, so nothing here can touch the floor.
+   */
+  private async peerSlots(except: Endpoint): Promise<number[]> {
     const t = this.now();
+    const out: number[] = [];
     await Promise.all(
       this.eps
         .filter((o) => o !== except && !o.refused && t >= o.downUntil)
         .map(async (o) => {
+          if (!o.genesisOk) {
+            const g = await this.rpc(o, "getGenesisHash");
+            if (g.err !== undefined || typeof g.result !== "string") return;
+            if (g.result !== this.expectedGenesis) {
+              this.refuse(o, g.result);
+              return;
+            }
+            o.genesisOk = true;
+          }
           const r = await this.rpc(o, "getSlot");
-          if (r.err === undefined && typeof r.result === "number") this.note(o, r.result);
+          if (r.err === undefined && typeof r.result === "number") out.push(r.result);
         }),
     );
+    return out;
+  }
+
+  private refuse(ep: Endpoint, genesis: string): void {
+    ep.refused = true;
+    ep.lastError = `cluster mismatch: genesis ${genesis.slice(0, 8)}... != expected ${this.expectedGenesis.slice(0, 8)}...`;
+    this.logLine(`endpoint #${ep.idx} ${ep.label} REFUSED (${ep.lastError}); it will never be used`);
+  }
+
+  /** Escape hatch: every endpoint rejected as lagging for floorReseedMs yet they agree -> the floor was wrong, re-seed. */
+  private maybeReseedFloor(): void {
+    const t = this.now();
+    const live = this.eps.filter((e) => !e.refused);
+    if (live.length < 2 || live.some((e) => e.laggingSince === null || t - e.laggingSince < this.cfg.floorReseedMs || e.rawSlot === null)) return;
+    const raws = live.map((e) => e.rawSlot as number).sort((x, y) => x - y);
+    const ats = live.map((e) => e.rawAt);
+    // replies were taken at different moments; allow the chain's own movement between them on top of maxSlotLag
+    const tolerance = this.cfg.maxSlotLag + 1.5 * this.cfg.slotsPerSecond * ((Math.max(...ats) - Math.min(...ats)) / 1000);
+    if (raws[raws.length - 1] - raws[0] > tolerance) return;
+    const proj = raws;
+    const median = raws[Math.floor(raws.length / 2)]; // unprojected: a floor slightly low is safe, one too high is the bug being repaired
+    this.logLine(`[ALERT] every endpoint has been rejected as lagging for >= ${Math.round(this.cfg.floorReseedMs / 1000)}s but they agree with each other (slots ${proj.join(",")}); the slot floor ${this.floorSlot} was wrong, re-seeding it to ${median}`);
+    this.floorSlot = median;
+    this.floorAt = t;
+    for (const e of live) {
+      e.laggingSince = null;
+      e.downUntil = 0;
+    }
   }
 
   private isAuthFailure(err: string): boolean {
@@ -372,7 +450,7 @@ export class RpcFailover {
   }
 
   private async doVet(ep: Endpoint): Promise<boolean> {
-    if (!ep.verified) {
+    if (!ep.genesisOk) {
       const g = await this.rpc(ep, "getGenesisHash");
       if (g.err !== undefined || typeof g.result !== "string") {
         const err = g.err ?? "genesis probe returned no hash";
@@ -381,11 +459,10 @@ export class RpcFailover {
         return false;
       }
       if (g.result !== this.expectedGenesis) {
-        ep.refused = true;
-        ep.lastError = `cluster mismatch: genesis ${g.result.slice(0, 8)}... != expected ${this.expectedGenesis.slice(0, 8)}...`;
-        this.logLine(`endpoint #${ep.idx} ${ep.label} REFUSED (${ep.lastError}); it will never be used`);
+        this.refuse(ep, g.result);
         return false;
       }
+      ep.genesisOk = true;
     }
     const s = await this.rpc(ep, "getSlot");
     if (s.err !== undefined || typeof s.result !== "number") {
@@ -395,47 +472,91 @@ export class RpcFailover {
       return false;
     }
     const slot = s.result;
-    if (this.floorSlot === null) await this.seedBaseline(ep); // boot / first ever vet: ask the others for a baseline
-    const t = this.now();
-    ep.lastVetAt = t;
-    // (1) lower bound: the chain never goes backwards, so this endpoint may not be more than maxSlotLag below the
-    //     highest slot ANY endpoint ever showed (no expiry: this is what still bites after a long outage).
-    const floor = this.floorSlot;
-    if (floor !== null && floor - slot > this.cfg.maxSlotLag) {
-      this.note(ep, slot);
-      this.markDown(ep, `lagging: slot ${slot} is ${floor - slot} behind the highest slot seen ${floor} (max ${this.cfg.maxSlotLag})`);
-      return false;
-    }
-    // (2) projected bound against a RECENT (<60 s) observation of another endpoint.
-    const best = this.bestOtherSlot(ep);
-    this.note(ep, slot);
-    if (best !== null && best - slot > this.cfg.maxSlotLag) {
-      this.markDown(ep, `lagging: slot ${slot} is ${best - slot} behind best ${best} (max ${this.cfg.maxSlotLag})`);
-      return false;
-    }
-    // (3) wall-clock anchor: when no other endpoint is a fresh reference, the block time of a recent slot must be
-    //     close to now. This catches a frozen/lagging node even with no peer to compare to.
-    let confirmed = best !== null;
-    if (!confirmed) {
-      const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
-      if (bt.err === undefined && typeof bt.result === "number") {
-        const ageSec = this.now() / 1000 - bt.result;
-        const maxAge = this.cfg.maxSlotLag * 0.4 + 8 + 10; // lag bound + the 20-slot offset + clock skew allowance
-        if (ageSec > maxAge) {
-          this.markDown(ep, `stale: block time of slot ${slot - 20} is ${Math.round(ageSec)}s old (max ${Math.round(maxAge)}s)`);
-          return false;
-        }
+    ep.lastVetAt = this.now();
+    ep.rawSlot = slot;
+    ep.rawAt = this.now();
+    let confirmed = false;
+
+    if (this.floorSlot === null) {
+      // First baseline: this endpoint's slot must be corroborated by another GENESIS-VERIFIED endpoint within
+      // maxSlotLag, or by a fresh block time. A lone (possibly bogus) reply never sets the floor.
+      const peers = await this.peerSlots(ep);
+      const agree = peers.filter((p) => Math.abs(p - slot) <= this.cfg.maxSlotLag);
+      if (agree.length > 0) {
+        this.accept(ep, slot);
+        const hi = Math.max(slot, ...agree);
+        if (hi > (this.floorSlot ?? 0)) this.floorSlot = hi; // corroborated by a second genesis-verified endpoint
         confirmed = true;
       } else {
-        // No peer and no block time: the operator's primary is trusted as before; an unconfirmed FALLBACK may be read
-        // from but never sent through (see doFetch).
-        confirmed = ep.idx === 0;
+        const fresh = await this.blockTimeFresh(ep, slot);
+        if (fresh === "stale") return false;
+        if (fresh === "fresh") {
+          this.accept(ep, slot);
+          confirmed = true;
+        } else {
+          // Nothing to corroborate with. The operator's primary is trusted as before (no floor is set from an
+          // unverified lone reply); an uncorroborated fallback may be read from, never sent through.
+          ep.slot = slot;
+          ep.slotAt = this.now();
+          confirmed = ep.idx === 0;
+        }
+      }
+    } else {
+      // (a) plausibility: a reply far above what the chain could have reached since the floor was set is
+      //     suspect-ahead. It is treated as down, logged, and NEVER raises the floor.
+      const ceil = this.floorCeiling() as number;
+      if (slot > ceil) {
+        ep.suspectAhead = true;
+        if (ep.laggingSince === null) ep.laggingSince = this.now();
+        this.markDown(ep, `suspect-ahead: slot ${slot} exceeds what the chain can have reached (${Math.floor(ceil)}); floor ${this.floorSlot} unchanged`);
+        this.maybeReseedFloor();
+        return false;
+      }
+      ep.suspectAhead = false;
+      // (b) lower bound: never more than maxSlotLag below the highest accepted slot (no expiry).
+      const floor = this.floorSlot;
+      if (floor - slot > this.cfg.maxSlotLag) {
+        ep.slot = slot;
+        ep.slotAt = this.now();
+        if (ep.laggingSince === null) ep.laggingSince = this.now();
+        this.markDown(ep, `lagging: slot ${slot} is ${floor - slot} behind the highest slot seen ${floor} (max ${this.cfg.maxSlotLag})`);
+        this.maybeReseedFloor();
+        return false;
+      }
+      // (c) projected bound against a RECENT (<60 s) observation of another endpoint.
+      const best = this.bestOtherSlot(ep);
+      if (best !== null && best - slot > this.cfg.maxSlotLag) {
+        ep.slot = slot;
+        ep.slotAt = this.now();
+        this.markDown(ep, `lagging: slot ${slot} is ${best - slot} behind best ${best} (max ${this.cfg.maxSlotLag})`);
+        return false;
+      }
+      this.accept(ep, slot);
+      confirmed = best !== null;
+      if (!confirmed) {
+        const fresh = await this.blockTimeFresh(ep, slot);
+        if (fresh === "stale") return false;
+        confirmed = fresh === "fresh" ? true : ep.idx === 0;
       }
     }
+    ep.laggingSince = null;
     ep.confirmed = confirmed;
     ep.verified = true;
     this.markGood(ep);
     return true;
+  }
+
+  /** Wall-clock anchor: the block time of a recent slot must be close to now. */
+  private async blockTimeFresh(ep: Endpoint, slot: number): Promise<"fresh" | "stale" | "unknown"> {
+    const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
+    if (bt.err !== undefined || typeof bt.result !== "number") return "unknown";
+    const ageSec = this.now() / 1000 - bt.result;
+    const maxAge = this.cfg.maxSlotLag * 0.4 + 8 + 10; // lag bound + the 20-slot offset + clock skew allowance
+    if (ageSec > maxAge) {
+      this.markDown(ep, `stale: block time of slot ${slot - 20} is ${Math.round(ageSec)}s old (max ${Math.round(maxAge)}s)`);
+      return "stale";
+    }
+    return "fresh";
   }
 
   private async usable(ep: Endpoint): Promise<boolean> {
@@ -517,6 +638,7 @@ export class RpcFailover {
         continue;
       }
       ep.consecutiveFailures = 0;
+      this.allDownSince = null;
       if (isWrite) this.pin = { idx: ep.idx, until: this.now() + this.cfg.pinMs };
       const pinnedServe = isStatusPoll && ep.idx === first && first !== this.active;
       // Only the request that saw the current active endpoint fail may move it (a concurrent primary recovery wins).
@@ -525,6 +647,12 @@ export class RpcFailover {
     }
     // Nothing answered: fail loudly but rate-limited, never crash.
     const t = this.now();
+    this.maybeReseedFloor();
+    if (this.allDownSince === null) this.allDownSince = t;
+    if (t - this.allDownSince >= this.cfg.allDownAlertMs && t - this.allDownAlertedAt >= 300_000) {
+      this.allDownAlertedAt = t;
+      this.logLine(`[ALERT] keeper is alive but USELESS: no usable ${this.cluster} RPC endpoint for ${Math.round((t - this.allDownSince) / 1000)}s (no reads, no pushes); fix the RPC key/quota or fallbacks`);
+    }
     if (t - this.allDownLoggedAt > 30_000) {
       this.allDownLoggedAt = t;
       this.logLine(`ALL ENDPOINTS DOWN (${this.eps.map((e) => `#${e.idx} ${e.refused ? "refused" : t < e.downUntil ? `cooldown ${Math.round((e.downUntil - t) / 1000)}s` : "failing"}`).join(", ")}); backing off`);
@@ -557,6 +685,7 @@ export class RpcFailover {
         index: e.idx,
         url: e.label,
         confirmed: e.confirmed,
+        suspectAhead: e.suspectAhead,
         state: e.refused ? "refused" : t < e.downUntil ? "down" : "ok",
         consecutiveFailures: e.consecutiveFailures,
         downForMs: Math.max(0, e.downUntil - t),
