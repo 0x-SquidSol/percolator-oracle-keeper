@@ -5,6 +5,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { Keypair } from "@solana/web3.js";
 import { decodeAssetGrowthV19, parsePortfolioV17 } from "@percolatorct/sdk";
 import type { AssetGrowthV19 } from "@percolatorct/sdk";
@@ -16,6 +17,7 @@ import {
   vaultLpEffectivePositionQ,
 } from "./p2b-hedged-lockout.ts";
 import type { HedgedLockoutInput } from "./p2b-hedged-lockout.ts";
+import { isV18MarketHeader } from "./adl-state.ts";
 import { ADL_ONE, fakeConn, fx, patchedMarket, registryBytes, snapshot, vaultLpStateBytes } from "./p2b-test-helpers.ts";
 
 const T = DEFAULT_HEDGED_LOCKOUT_THRESHOLDS;
@@ -44,7 +46,7 @@ describe("hedged lockout: truth table", () => {
     assert.equal(v.nCapQ, N);
   });
 
-  const rows: Array<[string, Parameters<typeof input>[0], "alert" | "ok" | "no-growth" | "no-capacity"]> = [
+  const rows: Array<[string, Parameters<typeof input>[0], "alert" | "ok" | "no-growth" | "no-capacity" | "r3-unsupported"]> = [
     ["both sides 95%, LP flat -> ALERT", { uLong: 9500, uShort: 9500 }, "alert"],
     ["both sides exactly 90.00%, LP flat -> ALERT (inclusive)", { uLong: 9000, uShort: 9000 }, "alert"],
     ["both sides 89.99% -> no alert", { uLong: 8999, uShort: 8999 }, "ok"],
@@ -99,6 +101,50 @@ describe("vaultLpEffectivePositionQ (real v18 LP portfolios)", () => {
   it("no leg on the asset -> 0", () => {
     const p = parsePortfolioV17(new Uint8Array(fx("cate-lp-portfolio-v18")));
     assert.equal(vaultLpEffectivePositionQ(p, 5, { aLong: ADL_ONE, aShort: ADL_ONE }), 0n);
+  });
+});
+
+describe("R3 (controller) growth records: fail closed", () => {
+  const r3 = (flags: number): AssetGrowthV19 => decodeAssetGrowthV19(patchedMarket({ growthLambdaBps: 10_000, growthFlags: flags }), 0)!;
+  it("legacy fixture (flags 0) is r3Layout=false and keeps alerting", () => {
+    const g = r3(0);
+    assert.equal(g.r3Layout, false);
+    assert.equal(evaluateHedgedLockout(input({ uLong: 9500, uShort: 9500, g }), T).status, "alert");
+  });
+  for (const flags of [1, 3]) {
+    it(`flags ${flags}: r3Layout=true -> r3-unsupported, no capacity figure, no alert even with both crowds full and the LP flat`, () => {
+      const g = r3(flags);
+      assert.equal(g.r3Layout, true);
+      const v = evaluateHedgedLockout(input({ uLong: 9900, uShort: 9900, g }), T);
+      assert.equal(v.status, "r3-unsupported");
+      assert.equal(v.nCapQ, null);
+      assert.equal(v.utilLongBps, null);
+    });
+  }
+  it("monitor: an R3 market yields a record, no alert, and one warn line per market", async () => {
+    const lp = Keypair.generate().publicKey;
+    const m = patchedMarket({ effectivePriceE6: 1_000n, growthLambdaBps: 10_000, growthFlags: 3, oiEffLong: 2_000_000_000_000n, oiEffShort: 2_000_000_000_000n });
+    const s = snapshot({ label: "R3MKT", marketData: m, registryData: registryBytes({ bound: true }), vaultLpData: vaultLpStateBytes({ lp }) });
+    const c = fakeConn({ accounts: new Map([[lp.toBase58(), new Uint8Array(fx("cate-lp-portfolio-v18"))]]) });
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => { warns.push(a.join(" ")); };
+    try {
+      const r1 = await evaluateHedgedLockouts(c.conn as never, [s], T);
+      await evaluateHedgedLockouts(c.conn as never, [s], T);
+      assert.deepEqual(r1.alerts, []);
+      assert.equal(r1.records[0].verdict.status, "r3-unsupported");
+    } finally { console.warn = orig; }
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /R3MKT.*controller \(R3\) growth record.*SKIPPED/);
+  });
+});
+
+describe("v2.2 slabs", () => {
+  it("every live v2.2 market (2026-10-17 fixture) fails the v2.1-only header gate, so evaluateHedgedLockouts never reaches them today", () => {
+    const f = JSON.parse(readFileSync(new URL("./__fixtures__/v22-live-accounts-2026-10-17.json", import.meta.url), "utf8")) as { accounts: { slab: string }[] };
+    assert.equal(f.accounts.length, 13);
+    for (const a of f.accounts) assert.equal(isV18MarketHeader(new Uint8Array(Buffer.from(a.slab, "base64"))), false);
   });
 });
 

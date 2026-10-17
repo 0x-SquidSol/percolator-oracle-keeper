@@ -85,7 +85,13 @@ export interface HedgedLockoutInput {
   lpEffQ: bigint;
 }
 
-export type HedgedLockoutStatus = "no-growth" | "no-capacity" | "ok" | "alert";
+/**
+ * "r3-unsupported": the growth record is controller-written (flags bit 0, R3 layout). `lambdaBps` is then no longer the
+ * effective capacity (G8/controller: `n_cap_g8_q_dials` = min(nCapQ(C_m, min(lambda, lambda_depth)), depth cap at kappa), with
+ * tier, smoothed dials and the sticky cap depth read from band, slot and depth state this job does not carry), so
+ * `nCapQ(cM, lambdaBps)` would OVERESTIMATE it and under-report utilisation. Fail closed: no verdict, no alert.
+ */
+export type HedgedLockoutStatus = "no-growth" | "no-capacity" | "r3-unsupported" | "ok" | "alert";
 
 export interface HedgedLockoutVerdict {
   status: HedgedLockoutStatus;
@@ -104,6 +110,7 @@ const NONE: HedgedLockoutVerdict = { status: "no-growth", nCapQ: null, usersLong
 /** The truth table. Pure. */
 export function evaluateHedgedLockout(i: HedgedLockoutInput, t: HedgedLockoutThresholds): HedgedLockoutVerdict {
   if (i.growth === null) return NONE;
+  if (i.growth.r3Layout) return { ...NONE, status: "r3-unsupported" };
   const nCap = nCapQ(i.cM, i.growth.lambdaBps, i.priceE6);
   if (nCap === null || nCap === 0n) return { ...NONE, status: "no-capacity", nCapQ: nCap };
   const usersLong = usersSideOiQ(i.oiEffLongQ, i.lpEffQ, true);
@@ -134,6 +141,9 @@ export interface HedgedLockoutRecord {
   label: string;
   verdict: HedgedLockoutVerdict;
 }
+
+/** Markets already logged as r3-unsupported (one line per market per process). */
+const r3Logged = new Set<string>();
 
 export type HedgedLockoutConnection = Pick<Connection, "getAccountInfo">;
 
@@ -174,6 +184,10 @@ export async function evaluateHedgedLockouts(
         t,
       );
       records.push({ market: s.ref.marketAddress, label: s.ref.label, verdict });
+      if (verdict.status === "r3-unsupported" && !r3Logged.has(s.ref.marketAddress)) {
+        r3Logged.add(s.ref.marketAddress);
+        console.warn(`[hedged-lockout] ${s.ref.label} (${s.ref.marketAddress}): controller (R3) growth record, lambda_bps is not the effective N_cap; hedged-lockout decision SKIPPED (fail closed)`);
+      }
       if (verdict.status === "alert") alerts.push(hedgedLockoutAlert(s.ref.marketAddress, s.ref.label, verdict, t));
     } catch {
       // a market that cannot be read this tick is simply not evaluated

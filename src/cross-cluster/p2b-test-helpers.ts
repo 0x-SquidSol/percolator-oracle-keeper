@@ -61,6 +61,8 @@ export interface MarketPatch {
   /** Growth block (asset 0): lambda bps; presence turns growth ON (version 1). */
   growthLambdaBps?: number;
   growthKinkBps?: number;
+  /** Growth record flags byte (39): 0 legacy, 1 = R3 layout (controller-written), 3 = R3 + volatility data. */
+  growthFlags?: number;
   /** Engine market mode byte (0 Live, 1 Resolved, 2 Recovery). */
   mode?: number;
 }
@@ -103,6 +105,7 @@ export function patchedMarket(p: MarketPatch = {}, base = "sol-market-v18"): Uin
     b.writeUInt16LE(1000, g + F.ceilX100);
     b.writeUInt16LE(p.growthKinkBps ?? 5000, g + F.kinkBps);
     b[g + F.version] = 1;
+    if (p.growthFlags !== undefined) b[g + F.flags] = p.growthFlags;
   }
   return new Uint8Array(b);
 }
