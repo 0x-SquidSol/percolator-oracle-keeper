@@ -18,7 +18,6 @@ import {
   decideStakeFeePush,
   pushStakeFeesOnce,
   readStakeFloorFlags,
-  stakeRealLpSupply,
 } from "./stake-fee-pusher.ts";
 import type { StakeFeeConfig, StakeFeeConnection } from "./stake-fee-pusher.ts";
 
@@ -36,6 +35,8 @@ const CFG: StakeFeeConfig = {
   confirm: { statusRetries: 1, statusRetryDelayMs: 0 },
 };
 const KEEPER = Keypair.generate();
+import { stakeRealLpSupply } from "@percolatorct/sdk";
+const realLp = (totalLpSupply: bigint, floorFlags: number): bigint => stakeRealLpSupply({ totalLpSupply, floorFlags });
 const BOTH = STAKE_FLOOR_SENIOR | STAKE_FLOOR_JUNIOR;
 const market = new PublicKey(SOL_MARKET);
 const pool = (totalLpSupply: bigint, floorFlags?: number) => ({
@@ -80,14 +81,14 @@ function patched(base: Buffer, total: bigint, flags: number): Buffer {
 
 describe("stakeRealLpSupply mirrors state.rs real_lp_supply", () => {
   it("legacy (0): total-1000 saturating; senior-only: same; junior-only / both: per-floor", () => {
-    assert.equal(stakeRealLpSupply(5000n, 0), 4000n);
-    assert.equal(stakeRealLpSupply(1000n, 0), 0n);
-    assert.equal(stakeRealLpSupply(0n, 0), 0n);
-    assert.equal(stakeRealLpSupply(5000n, STAKE_FLOOR_SENIOR), 4000n);
-    assert.equal(stakeRealLpSupply(5000n, STAKE_FLOOR_JUNIOR), 4000n);
-    assert.equal(stakeRealLpSupply(5000n, BOTH), 3000n);
-    assert.equal(stakeRealLpSupply(2000n, BOTH), 0n);
-    assert.equal(stakeRealLpSupply(1500n, BOTH), 0n);
+    assert.equal(realLp(5000n, 0), 4000n);
+    assert.equal(realLp(1000n, 0), 0n);
+    assert.equal(realLp(0n, 0), 0n);
+    assert.equal(realLp(5000n, STAKE_FLOOR_SENIOR), 4000n);
+    assert.equal(realLp(5000n, STAKE_FLOOR_JUNIOR), 4000n);
+    assert.equal(realLp(5000n, BOTH), 3000n);
+    assert.equal(realLp(2000n, BOTH), 0n);
+    assert.equal(realLp(1500n, BOTH), 0n);
   });
   it("reads the flags byte at absolute 381 (v2+)", () => {
     const b = patched(fx("sol-stake-pool-v18"), 5000n, 3);
