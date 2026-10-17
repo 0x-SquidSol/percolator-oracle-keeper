@@ -139,6 +139,8 @@ export interface RpcFailoverOptions {
   floorReseedMs?: number;
   /** Log an [ALERT] once all endpoints have been down this long (and every 5 min after). Default 120_000. */
   allDownAlertMs?: number;
+  /** Max tolerated keeper clock error (s) before block-time checks are disabled. Default 10. */
+  clockSkewAllowanceSec?: number;
   log?: (line: string) => void;
 }
 
@@ -155,6 +157,8 @@ interface Endpoint {
   genesisOk: boolean;
   /** Last vet reported a slot implausibly far ahead of the floor. */
   suspectAhead: boolean;
+  /** Overturned the floor on its own block time: unconfirmed for sends until a peer agrees (R153 round 5). */
+  needsAgreement: boolean;
   /** Since when this endpoint has been consecutively rejected as lagging (null otherwise). */
   laggingSince: number | null;
   /** Last raw reply of a genesis-verified endpoint, kept OUT of every comparison except the escape hatch. */
@@ -212,6 +216,7 @@ export class RpcFailover {
       | "pinMs"
       | "floorReseedMs"
       | "allDownAlertMs"
+      | "clockSkewAllowanceSec"
     >
   >;
   private readonly expectedGenesis: string;
@@ -231,6 +236,11 @@ export class RpcFailover {
   private floorCorroborated = false;
   private floorSource: number | null = null;
   private primaryAlertAt = 0;
+  /** Keeper wall-clock error vs the chain, measured once from an endpoint that agrees with a peer (both at head). */
+  private skewSec = 0;
+  private skewMeasured = false;
+  /** |skew| beyond the allowance: every block-time path is switched off (loudly). */
+  private blockTimeDisabled = false;
   private anchor: { slot: number; at: number } | null = null;
   private allDownSince: number | null = null;
   private allDownAlertedAt = 0;
@@ -255,6 +265,7 @@ export class RpcFailover {
       pinMs: opts.pinMs ?? 60_000,
       floorReseedMs: opts.floorReseedMs ?? 300_000,
       allDownAlertMs: opts.allDownAlertMs ?? 120_000,
+      clockSkewAllowanceSec: opts.clockSkewAllowanceSec ?? 10,
     };
     this.log = opts.log ?? ((l) => console.error(l));
     this.eps = opts.urls.map((url, idx) => ({
@@ -266,6 +277,7 @@ export class RpcFailover {
       confirmed: false,
       genesisOk: false,
       suspectAhead: false,
+      needsAgreement: false,
       laggingSince: null,
       rawSlot: null,
       rawAt: 0,
@@ -508,6 +520,7 @@ export class RpcFailover {
         this.floorCorroborated = true;
         this.floorSource = ep.idx;
         confirmed = true;
+        await this.measureSkew(ep, slot);
       } else {
         const fresh = await this.blockTimeFresh(ep, slot);
         if (fresh === "stale") return false;
@@ -558,16 +571,20 @@ export class RpcFailover {
         // block-time window can explain. Then the floor was the lie: overturn it.
         let why: string | null = null;
         let base = slot;
+        let btOverturn = false;
         if (!this.floorCorroborated && agreeing.length > 0) {
           why = "agreement of two genesis-verified endpoints below it";
           base = Math.min(slot, ...agreeing);
-        } else if (!this.floorCorroborated) {
+        } else if (!this.floorCorroborated && ep.idx === 0) {
+          // Only the operator's primary may overturn on its own block time (the "returning primary" case); a fallback can
+          // only overturn through agreement. A lying/lagging fallback that reports a fresh block time gets nothing.
           // Wall-clock arbiter: this endpoint's own block time dates its slot; the chain head cannot be further ahead
           // than (slot-20) + age*2.5. A floor beyond that by more than the lag bound (+ ~6 s of clock skew) is a lie.
           const head = await this.headEstimate(ep, slot);
-          if (head !== null && floor - Math.max(slot, head) > this.cfg.maxSlotLag + 15) {
+          if (head !== null && floor - Math.max(slot, head) > this.cfg.maxSlotLag + (this.skewMeasured ? 8 : 15)) {
             why = `this endpoint's block time (chain head ~${Math.floor(head)})`;
             base = Math.min(slot, head);
+            btOverturn = true;
           }
         }
         if (why !== null) {
@@ -576,6 +593,7 @@ export class RpcFailover {
           this.anchor = { slot: base, at: t };
           this.floorCorroborated = agreeing.length > 0;
           this.floorSource = ep.idx;
+          if (btOverturn && ep.idx !== 0) ep.needsAgreement = true; // a non-primary overturner would need a peer to agree before sending (unreachable today: only idx 0 overturns)
         } else {
           ep.slot = slot;
           ep.slotAt = t;
@@ -601,10 +619,15 @@ export class RpcFailover {
         this.floorSource = ep.idx;
       }
       confirmed = agreeing.length > 0;
+      if (agreeing.length > 0) {
+        ep.needsAgreement = false;
+        await this.measureSkew(ep, slot);
+      }
       if (!confirmed) {
         const fresh = await this.blockTimeFresh(ep, slot);
         if (fresh === "stale") return false;
-        confirmed = fresh === "fresh" ? true : ep.idx === 0;
+        // an endpoint that overturned the floor on its own block time stays send-less until a peer agrees
+        confirmed = ep.needsAgreement ? false : fresh === "fresh" ? true : ep.idx === 0;
       }
     }
     ep.laggingSince = null;
@@ -614,19 +637,46 @@ export class RpcFailover {
     return true;
   }
 
-  /** Chain-head estimate from an endpoint's own block time: (slot-20) + seconds since that block * slots/s. */
-  private async headEstimate(ep: Endpoint, slot: number): Promise<number | null> {
+  /** Block time of slot-20 as seconds-old, corrected for the measured keeper clock error. null = unavailable/disabled. */
+  private async blockAgeSec(ep: Endpoint, slot: number): Promise<number | null> {
+    if (this.blockTimeDisabled) return null;
     const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
     if (bt.err !== undefined || typeof bt.result !== "number") return null;
-    return Math.max(0, slot - 20) + (this.now() / 1000 - bt.result) * this.cfg.slotsPerSecond;
+    return this.now() / 1000 - bt.result - this.skewSec;
+  }
+
+  /**
+   * Measure the keeper's clock error ONCE, from an endpoint that agrees with a peer (so it is at the chain head):
+   * the block 20 slots back should be ~8 s old. Beyond the allowance every block-time path is disabled with an [ALERT]
+   * (a skewed clock would let a lagging node pass as fresh, or a fresh one look stale).
+   */
+  private async measureSkew(ep: Endpoint, slot: number): Promise<void> {
+    if (this.skewMeasured || this.blockTimeDisabled) return;
+    const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
+    if (bt.err !== undefined || typeof bt.result !== "number") return;
+    const skew = this.now() / 1000 - bt.result - 8;
+    this.skewMeasured = true;
+    this.logLine(`keeper clock vs chain: ${skew.toFixed(1)}s (allowance ${this.cfg.clockSkewAllowanceSec}s)`);
+    if (Math.abs(skew) > this.cfg.clockSkewAllowanceSec) {
+      this.blockTimeDisabled = true;
+      this.logLine(`[ALERT] keeper clock is ${skew.toFixed(0)}s off the chain: block-time freshness checks are DISABLED (sends need peer agreement); fix NTP`);
+    } else {
+      this.skewSec = skew;
+    }
+  }
+
+  /** Chain-head estimate from an endpoint's own block time: (slot-20) + seconds since that block * slots/s. */
+  private async headEstimate(ep: Endpoint, slot: number): Promise<number | null> {
+    if (!this.skewMeasured || this.blockTimeDisabled) return null;
+    const age = await this.blockAgeSec(ep, slot);
+    return age === null ? null : Math.max(0, slot - 20) + age * this.cfg.slotsPerSecond;
   }
 
   /** Wall-clock anchor: the block time of a recent slot must be close to now. */
   private async blockTimeFresh(ep: Endpoint, slot: number, markStale = true): Promise<"fresh" | "stale" | "unknown"> {
-    const bt = await this.rpc(ep, "getBlockTime", [Math.max(0, slot - 20)]);
-    if (bt.err !== undefined || typeof bt.result !== "number") return "unknown";
-    const ageSec = this.now() / 1000 - bt.result;
-    const maxAge = this.cfg.maxSlotLag * 0.4 + 8 + 10; // lag bound + the 20-slot offset + clock skew allowance
+    const ageSec = await this.blockAgeSec(ep, slot);
+    if (ageSec === null) return "unknown";
+    const maxAge = this.cfg.maxSlotLag * 0.4 + 8 + (this.skewMeasured ? 4 : 10); // lag bound + 20-slot offset + clock margin
     if (ageSec > maxAge) {
       if (!markStale) return "stale";
       this.markDown(ep, `stale: block time of slot ${slot - 20} is ${Math.round(ageSec)}s old (max ${Math.round(maxAge)}s)`);
