@@ -564,9 +564,10 @@ describe("K-6 v2.2 delegate: a multi-asset market a window or more behind gets c
     assert.ok(r.logs.some((l) => /\[v22\]\[sweep\].*PAIRED MERGED 1 tx \(phased plan was 2\)/.test(l)), r.logs.join("\n"));
   });
 
-  it("a single-asset row on the same lagged account keeps today's behaviour (no K-6 catch-up)", async () => {
+  it("a single-asset row on the same lagged account ALSO gets catch-up cranks (LIQ-DIAG 2026-10-17: otherwise every refresh is refused 22 and a bankrupt unrefreshed account cannot be liquidated)", async () => {
     const r = await delegate({ ...SINGLE, marketAddress: M2XHS, lpPortfolio: LP }, 2_600n);
-    assert.ok(!r.logs.some((l) => /\[v22\]\[catchup\]/.test(l)));
+    assert.ok(r.logs.some((l) => /\[v22\]\[catchup\].*1 assets.*catch-up crank\(s\)/.test(l)), r.logs.join("\n"));
+    assert.ok(r.sent.every((s) => s.tags.every((t) => t === CRANK_TAG)), "catch-up cranks only, no refresh this cycle");
   });
 });
 
