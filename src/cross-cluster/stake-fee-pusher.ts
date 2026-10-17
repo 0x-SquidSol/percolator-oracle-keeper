@@ -186,6 +186,8 @@ export interface StakeFeeState {
   pool: null | {
     slab: PublicKey;
     poolMode: number;
+    /** v5 `risk_mode` (1 FIRST_LOSS, 2 FEE_ONLY); undefined on pre-v5 pools. */
+    riskMode?: number;
     totalLpSupply: bigint;
     /** Raw `_reserved[61]` floor flags; omitted / 0 = legacy pool (total - 1000). */
     floorFlags?: number;
@@ -204,6 +206,12 @@ export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "
     return { action: "blocked", reason: `pool.percolator_program ${s.pool.percolatorProgram.toBase58()} is not the configured wrapper` };
   }
   if (s.pool.poolMode !== 0) return { action: "skip", reason: `pool mode ${s.pool.poolMode} is not an insurance pool` };
+  // Wrapper tag 87 pays the staker leg to FIRST_LOSS pools only (`owed_staker_leg`, v16_program.rs:24xxx): any other v5
+  // pool answers StakePoolModeMismatch (Custom(59)) every cycle (PENGU, audit 2026-10-17 S2-2). Same pattern as the
+  // 91bd33e stake-sync filter. A pool with no risk_mode (pre-v5) is left to the program's own answer.
+  if (s.pool.riskMode !== undefined && s.pool.riskMode !== 1) {
+    return { action: "skip", reason: `risk mode ${s.pool.riskMode} is not FIRST_LOSS — the wrapper pays the staker fee leg to FIRST_LOSS pools only` };
+  }
   const total = s.pool.totalLpSupply;
   const realShares = stakeRealLpSupply(total, s.pool.floorFlags ?? 0);
   // Dead shares = everything that is not real (1,000 legacy / non-tranche; up to 2,000 on a tranche pool).
@@ -345,6 +353,7 @@ export async function pushStakeFeesOnce(
       pool = {
         slab: p.slab,
         poolMode: p.poolMode,
+        riskMode: p.riskMode,
         totalLpSupply: p.totalLpSupply,
         floorFlags: readStakeFloorFlags(new Uint8Array(pi.data)),
         isInitialized: p.isInitialized,

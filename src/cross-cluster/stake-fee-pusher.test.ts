@@ -100,7 +100,7 @@ function stub(name: Name, opts: {
 
 describe("decideStakeFeePush — the real-staker gate (F3)", () => {
   const market = new PublicKey(MARKETS.sol.market);
-  const pool = (totalLpSupply: bigint, extra: Partial<{ poolMode: number; slab: PublicKey; percolatorProgram: PublicKey }> = {}) => ({
+  const pool = (totalLpSupply: bigint, extra: Partial<{ poolMode: number; riskMode: number; slab: PublicKey; percolatorProgram: PublicKey }> = {}) => ({
     slab: market, poolMode: 0, totalLpSupply, isInitialized: true, percolatorProgram: WRAPPER, ...extra,
   });
 
@@ -146,6 +146,14 @@ describe("decideStakeFeePush — the real-staker gate (F3)", () => {
 
   it("a mode-1 (trading) pool is not a tag-87 destination", () => {
     assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(10_000n, { poolMode: 1 }) }, CFG).action, "skip");
+    // S2-2: FEE_ONLY (risk 2) / legacy-0 v5 pools are never sent tag 87 (wrapper answers Custom(59)); FIRST_LOSS (1) still pushes.
+    for (const rm of [2, 0]) {
+      const d = decideStakeFeePush({ market, owed: 5n, pool: pool(1_000_000n, { riskMode: rm }) }, CFG);
+      assert.equal(d.action, "skip", `riskMode ${rm}`);
+      assert.match((d as { reason: string }).reason, /FIRST_LOSS/);
+    }
+    assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(1_000_000n, { riskMode: 1 }) }, CFG).action, "push");
+    assert.equal(decideStakeFeePush({ market, owed: 5n, pool: pool(1_000_000n) }, CFG).action, "push", "pre-v5 pool: unchanged");
   });
 });
 
