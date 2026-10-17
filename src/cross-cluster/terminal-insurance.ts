@@ -88,6 +88,25 @@ const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 export function creatorCollateralAta(admin: PublicKey, collateralMint: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([admin.toBuffer(), TOKEN_PROGRAM.toBuffer(), collateralMint.toBuffer()], ATA_PROGRAM)[0];
 }
+/**
+ * Associated-token-account program `CreateIdempotent` (data `[1]`): creates `pool.admin`'s collateral ATA when it is missing
+ * and is a no-op when it exists. Permissionless; the keeper pays the rent. Tag 29 on a v5 pool needs the creator account at
+ * `[9]`/`[10]` (FIRST_LOSS: NotEnoughAccountKeys without it; FEE_ONLY: Custom 46 when the settlement owes the creator).
+ */
+export function buildCreateCreatorAtaIx(payer: PublicKey, admin: PublicKey, collateralMint: PublicKey): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: ATA_PROGRAM,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: creatorCollateralAta(admin, collateralMint), isSigner: false, isWritable: true },
+      { pubkey: admin, isSigner: false, isWritable: false },
+      { pubkey: collateralMint, isSigner: false, isWritable: false },
+      { pubkey: new PublicKey("11111111111111111111111111111111"), isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from([1]),
+  });
+}
 /** Wrapper EngineLockActive, surfaced through the tag-41 CPI: cooldown or capacity. */
 export const WRAPPER_ERR_LOCK_ACTIVE = 21;
 
@@ -483,9 +502,27 @@ export async function windDownOnce(
   let v5Plan: { insuranceUnits?: PublicKey; creatorToken: PublicKey } | null = null;
   if (poolState.version === 5 && poolState.riskMode !== undefined) {
     const ata = creatorCollateralAta(poolState.admin, poolState.collateralMint);
+    const ready = (ai: Awaited<ReturnType<TerminalConnection["getAccountInfo"]>>): boolean =>
+      !!ai && ai.owner.equals(TOKEN_PROGRAM) && ai.data.length >= 165 && ai.data[108] === 1;
     try {
-      const ai = await conn.getAccountInfo(ata, "confirmed");
-      if (ai && ai.owner.equals(TOKEN_PROGRAM) && ai.data.length >= 165 && ai.data[108] === 1) {
+      let ok = ready(await conn.getAccountInfo(ata, "confirmed"));
+      if (!ok && !dryRun && state.kind === "resolved") {
+        // The creator account is REQUIRED on a v5 pool (FIRST_LOSS: NotEnoughAccountKeys without it; FEE_ONLY: Custom 46 when
+        // owed). Anyone may create it; the keeper does, once, instead of sending the legacy 9-account shape that cannot succeed.
+        try {
+          const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
+          const tx = mkTx(keeper, blockhash, buildCreateCreatorAtaIx(keeper.publicKey, poolState.admin, poolState.collateralMint));
+          const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
+          const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, cfg.confirm);
+          if (c.status === "landed") {
+            console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: created the creator collateral ATA ${ata.toBase58()} (needed by stake tag 29 on a v5 pool)`);
+            ok = ready(await conn.getAccountInfo(ata, "confirmed"));
+          }
+        } catch {
+          ok = false;
+        }
+      }
+      if (ok) {
         v5Plan = { creatorToken: ata, ...(poolState.riskMode === 1 ? { insuranceUnits: deriveInsuranceUnitsV22(cfg.wrapperProgramId, market)[0] } : {}) };
       }
     } catch {
