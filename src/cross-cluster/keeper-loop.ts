@@ -31,6 +31,8 @@ import { evaluateBandPinExpiry, evaluateMarketPush, evaluatePushCycle, getAlertS
 import type { Alert, BandPinSample, MarketPushSample } from "./alerting.ts";
 import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRefreshHealth } from "./refresh-coordination.ts";
 import { p2bHealthFields } from "./p2b-health.ts";
+import { rpcFailoverHealth } from "../rpc-failover.ts";
+import { restartHealth } from "../restart-escalation.ts";
 import { v22HealthFields } from "./v22/health.ts";
 import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
@@ -713,13 +715,22 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
     // market (free-option risk against the LPs for the whole outage) is the
     // condition the 2026-07-31 audit found completely invisible here.
     const pricingStatus = pricingHealthStatus(state, registry.markets.length, Date.now());
+    // RPC fallback: running on a fallback endpoint, or every endpoint down, is `rpc-degraded` (still HTTP 200 for
+    // the same restart-loop reason as above). A stalled-pricing verdict outranks it; fields name the active endpoint.
+    // Restart escalation: N launches in M minutes is `restart-loop` (loud counter under `restarts`).
+    const rpcFailover = rpcFailoverHealth();
+    const restarts = restartHealth();
     const payload = JSON.stringify({
       walletLow: state.wallet.low,
       walletBalanceSol: formatSol(state.wallet.balanceLamports),
       status:
         pricingStatus !== "ok"
           ? pricingStatus
-          : quarantinedMarkets.length > 0 ||
+          : rpcFailover.degraded
+            ? "rpc-degraded"
+            : restarts?.escalated
+              ? "restart-loop"
+              : quarantinedMarkets.length > 0 ||
               lossStaleMarkets.length > 0 ||
               layoutProblemMarkets.length > 0 ||
               noPushMarkets.length > 0 ||
@@ -745,6 +756,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       timeoutCount: state.timeoutCount,
       tickPublisher: state.tickPublisher.counters(),
       rpc: rpcMetrics.snapshot(),
+      ...rpcFailover.fields,
+      ...(restarts ? { restarts } : {}),
       lastCycleAgo:
         state.lastCycleAt !== null
           ? `${Math.floor((Date.now() - state.lastCycleAt) / 1000)}s`
