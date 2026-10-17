@@ -84,40 +84,33 @@ import { chainSlotOrNull, describeProgramError, formatWrapperCode, ORACLE_STALE,
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
 import { isLiveMarket } from "./market-state.ts";
-
-/** percolator-stake `state::MINIMUM_LIQUIDITY` — the dead-share floor (state.rs:25 @ e62aa4a). */
-export const STAKE_MINIMUM_LIQUIDITY = 1_000n;
+import {
+  FLOOR_JUNIOR,
+  FLOOR_SENIOR,
+  STAKE_FLOOR_FLAGS_RESERVED_INDEX,
+  STAKE_MINIMUM_LIQUIDITY as SDK_STAKE_MINIMUM_LIQUIDITY,
+  stakeRealLpSupply,
+} from "@percolatorct/sdk";
 
 /**
  * Per-sub-pool dead-share floors (percolator-stake fix/v22-stake-last-junior-residual @ aebbff6,
  * state.rs `dead_lp` / `real_lp_supply` / `has_real_lp_holders`). A tranche pool can carry 0, 1,000
  * or 2,000 dead shares, recorded in `StakePool._reserved[61]` (FLOOR_SENIOR 0x01, FLOOR_JUNIOR 0x02).
- * A byte of 0 is a LEGACY pool — every pool on the currently deployed (pre-fix) stake program — which
+ * A byte of 0 is a LEGACY pool (every pool on the currently deployed pre-fix stake program), which
  * keeps the old rule: one floor, `total_lp_supply - 1000` (saturating).
  *
- * TODO(repin): kept as a local mirror after the 343882a repin: the SDK's `stakeRealLpSupply(pool)` takes a decoded pool
- * (junior/senior split via `stakeDeadLp`), not `(totalLpSupply, floorFlags)`, so it is not the same contract. Original note: the keeper pinned @percolatorct/sdk cb444db, which has no
- * floor-flag decoding. Once the pin moves to the v2.2 SDK (percolator-sdk#406, `stakeRealLpSupply` /
- * `stakeHasRealLpHolders`), replace these with the SDK helpers and delete the mirror.
+ * The constants and `real_lp_supply` come from the SDK (`stake-dead-lp`, @percolatorct/sdk a18c199e);
+ * the former local mirror (TODO(repin)) is gone. Only the raw-byte flag read stays here, because the
+ * fee pusher reads the flags byte straight off the account data without decoding the whole pool.
  */
-export const STAKE_FLOOR_SENIOR = 0x01;
-export const STAKE_FLOOR_JUNIOR = 0x02;
-/** `_reserved[61]`; `_reserved` starts at 320 on v2+ pools (state.rs `offset_of!(_reserved) == 320`), 288 on v1. */
-const FLOOR_FLAGS_RESERVED_INDEX = 61;
+export const STAKE_MINIMUM_LIQUIDITY: bigint = SDK_STAKE_MINIMUM_LIQUIDITY;
+export const STAKE_FLOOR_SENIOR: number = FLOOR_SENIOR;
+export const STAKE_FLOOR_JUNIOR: number = FLOOR_JUNIOR;
 
-/** Raw floor-flags byte of a pool account (0 when absent / legacy). */
+/** Raw floor-flags byte of a pool account (0 when absent / legacy). `_reserved` starts at 320 on v2+ pools (state.rs `offset_of!(_reserved) == 320`), 288 on v1. */
 export function readStakeFloorFlags(data: Uint8Array): number {
   const reservedStart = data.length >= 384 ? 320 : 288;
-  return data[reservedStart + FLOOR_FLAGS_RESERVED_INDEX] ?? 0;
-}
-
-/** Mirror of `StakePool::real_lp_supply`. */
-export function stakeRealLpSupply(totalLpSupply: bigint, floorFlags: number): bigint {
-  const sat = (a: bigint, b: bigint): bigint => (a > b ? a - b : 0n);
-  if (floorFlags === 0) return sat(totalLpSupply, STAKE_MINIMUM_LIQUIDITY);
-  const sd = (floorFlags & STAKE_FLOOR_SENIOR) !== 0 ? STAKE_MINIMUM_LIQUIDITY : 0n;
-  const jd = (floorFlags & STAKE_FLOOR_JUNIOR) !== 0 ? STAKE_MINIMUM_LIQUIDITY : 0n;
-  return sat(sat(totalLpSupply, sd), jd);
+  return data[reservedStart + STAKE_FLOOR_FLAGS_RESERVED_INDEX] ?? 0;
 }
 
 const COMPUTE_UNIT_LIMIT = 200_000;
@@ -213,7 +206,7 @@ export function decideStakeFeePush(s: StakeFeeState, cfg: Pick<StakeFeeConfig, "
     return { action: "skip", reason: `risk mode ${s.pool.riskMode} is not FIRST_LOSS — the wrapper pays the staker fee leg to FIRST_LOSS pools only` };
   }
   const total = s.pool.totalLpSupply;
-  const realShares = stakeRealLpSupply(total, s.pool.floorFlags ?? 0);
+  const realShares = stakeRealLpSupply({ totalLpSupply: total, floorFlags: s.pool.floorFlags ?? 0 });
   // Dead shares = everything that is not real (1,000 legacy / non-tranche; up to 2,000 on a tranche pool).
   const deadShares = total - realShares;
   if (realShares > cfg.minRealShares && deadShares * 10_000n > cfg.maxDeadShareBps * total) {
