@@ -23,6 +23,7 @@
  * KEEPER_KEYPAIR_PATH / KEEPER_KEYPAIR (any funded signer — both cranks are
  * permissionless), WRAPPER_PROGRAM_ID / STAKE_PROGRAM_ID (see program-ids.ts).
  */
+import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import { drainFeeLegsBeforeResolve, windDownAfterResolve } from "./cross-cluster/pre-resolve.ts";
@@ -53,7 +54,8 @@ async function main(): Promise<number> {
     console.error("usage: DEVNET_RPC_URL=… npm run pre-resolve -- --market <slab> [--dry-run]");
     return 1;
   }
-  const conn = new Connection(rpc, devnetConnectionConfig(process.env));
+  const failover = failoverFromEnv("devnet", rpc, parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS), process.env, (i, init) => fetch(i, init));
+  const conn = new Connection(rpc, { ...devnetConnectionConfig(process.env), ...(failover ? { fetch: failover.fetch } : {}) });
   const keeper = loadKeypair();
   console.log(`[pre-resolve] ${describeProgramIds().join("  ")}`);
   console.log(`[pre-resolve] market=${market} signer=${keeper.publicKey.toBase58()} mode=${dryRun ? "DRY-RUN" : "LIVE"}`);

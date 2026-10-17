@@ -25,6 +25,7 @@ import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-u
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { devnetConnectionConfig } from "./rpc-headers.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
+import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { markCadenceCheck } from "./cross-cluster/mark-smoother.ts";
 import { setHealthExtension, startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { startRegistryReloadLoop } from "./cross-cluster/registry-reload.ts";
@@ -78,8 +79,10 @@ function loadKeypair(): Keypair {
 const keeper = loadKeypair();
 const REGISTRY_PATH = process.env.REGISTRY_PATH;
 const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
-const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: countingFetch("mainnet") });
-const devnetConn = new Connection(DEVNET_RPC, { ...devnetConnectionConfig(process.env), fetch: countingFetch("devnet") });
+const mainnetFailover = failoverFromEnv("mainnet", MAINNET_RPC, parseFallbackUrls(process.env.MAINNET_RPC_FALLBACK_URLS, []), process.env, countingFetch("mainnet"));
+const devnetFailover = failoverFromEnv("devnet", DEVNET_RPC, parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS), process.env, countingFetch("devnet"));
+const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: mainnetFailover?.fetch ?? countingFetch("mainnet") });
+const devnetConn = new Connection(DEVNET_RPC, { ...devnetConnectionConfig(process.env), fetch: devnetFailover?.fetch ?? countingFetch("devnet") });
 if (DRY_RUN) {
   for (const conn of [devnetConn, mainnetConn]) {
     const refuse = (): never => {

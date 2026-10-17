@@ -121,6 +121,8 @@ import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts"
 import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
 import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
+import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
+import { readHealth, recordLaunch, restartConfig } from "./restart-escalation.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -392,10 +394,28 @@ if (registry.markets.length === 0) {
   }
 }
 
-const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: countingFetch("mainnet") });
+// Restart escalation: count this launch unless the launcher's preflight already did (<120 s ago). /health exposes it.
+{
+  const c = restartConfig(process.env);
+  if (c.path) {
+    const h = readHealth(c.path, Date.now(), c.threshold, c.windowMs);
+    if (h.lastLaunchAgoSec === null || h.lastLaunchAgoSec > 120) recordLaunch(c.path, Date.now(), c.threshold, c.windowMs);
+  }
+}
+
+// Ordered RPC fallback (audit 2026-10-17 S2 + FIX-KEEPER): a single exhausted key must degrade the keeper, not stop it.
+//   DEVNET_RPC_FALLBACK_URLS (alias RPC_FALLBACK_URLS): comma-separated https; unset = public devnet; `off` disables.
+//   MAINNET_RPC_FALLBACK_URLS: comma-separated https; unset = none (mainnet is only read for DEX pool prices).
+// Every endpoint passes a genesis-hash cluster check and a slot-lag check before it carries traffic; the primary is
+// re-probed and restored on recovery; /health reports `rpc-degraded` + the (redacted) active endpoint. See rpc-failover.ts.
+const DEVNET_FALLBACKS = parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS);
+const MAINNET_FALLBACKS = parseFallbackUrls(process.env.MAINNET_RPC_FALLBACK_URLS, []);
+const mainnetFailover = failoverFromEnv("mainnet", MAINNET_RPC, MAINNET_FALLBACKS, process.env, countingFetch("mainnet"));
+const devnetFailover = failoverFromEnv("devnet", DEVNET_RPC, DEVNET_FALLBACKS, process.env, countingFetch("devnet"));
+const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: mainnetFailover?.fetch ?? countingFetch("mainnet") });
 // DEVNET_RPC_ORIGIN replaces the uncommitted `httpHeaders: { Origin }` edit the
 // live machine carried here (Origin-restricted Helius key; see rpc-headers.ts).
-const devnetConn = new Connection(DEVNET_RPC, { ...DEVNET_CONN_CONFIG, fetch: countingFetch("devnet") });
+const devnetConn = new Connection(DEVNET_RPC, { ...DEVNET_CONN_CONFIG, fetch: devnetFailover?.fetch ?? countingFetch("devnet") });
 
 // Dry-run hard stop. Every write path is meant to honour `dryRun` on its own,
 // but there are a dozen send sites; a standby keeper that signs even one tx

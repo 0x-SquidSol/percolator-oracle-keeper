@@ -7,11 +7,37 @@
  */
 import { Connection, PublicKey } from "@solana/web3.js";
 import fs from "fs";
+import crypto from "crypto";
+import { failoverFromEnv, isTransientRpcError, parseFallbackUrls, preflightOutageDecision, preflightStampSha, redactText, GENESIS_HASH } from "../src/rpc-failover.ts";
+import { alertText, recordLaunch, restartConfig } from "../src/restart-escalation.ts";
 
 const DEVNET_RPC = process.env.DEVNET_RPC_URL ?? "";
 const WRAPPER = process.env.WRAPPER_PROGRAM_ID ?? "";
 const REGISTRY_PATH = process.env.REGISTRY_PATH ?? "";
 const DEX = new Set(["raydium-clmm", "meteora-dlmm", "pumpswap"]);
+
+/** Error text with any endpoint URL / api-key scrubbed (the primary URL carries the key). */
+function safe(e: unknown): string {
+  return redactText(e instanceof Error ? e.message : String(e), [DEVNET_RPC, ...(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS ?? "").split(",")]);
+}
+
+/** Restart escalation: count this launch; N launches in M minutes -> loud [ALERT] line + optional https webhook. */
+async function noteLaunch(): Promise<void> {
+  const c = restartConfig(process.env);
+  if (!c.path) return;
+  const { health, alertDue } = recordLaunch(c.path, Date.now(), c.threshold, c.windowMs);
+  if (!health.escalated) return;
+  const text = alertText(health, "v2.2 keeper");
+  console.error(text);
+  const hook = process.env.KEEPER_ALERT_WEBHOOK_URL?.trim();
+  if (alertDue && hook && hook.startsWith("https://")) {
+    try {
+      await fetch(hook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, alert: health }), signal: AbortSignal.timeout(5_000) });
+    } catch (e) {
+      console.error(`[preflight] alert webhook failed: ${e instanceof Error ? e.name : "error"}`);
+    }
+  }
+}
 
 function fail(msg: string): never {
   console.error(`[preflight] REFUSE: ${msg}`);
@@ -44,6 +70,7 @@ function checkAssets(m: Entry): void {
 }
 
 async function main(): Promise<void> {
+  await noteLaunch();
   if (!DEVNET_RPC || !WRAPPER || !REGISTRY_PATH) fail("DEVNET_RPC_URL, WRAPPER_PROGRAM_ID and REGISTRY_PATH are required");
   if (!fs.existsSync(REGISTRY_PATH)) {
     if (process.env.PREFLIGHT_ALLOW_EMPTY === "1") { console.log(`[preflight] ok (no registry at ${REGISTRY_PATH}; empty boot allowed)`); return; }
@@ -70,13 +97,31 @@ async function main(): Promise<void> {
     seen.add(m.marketAddress);
     new PublicKey(m.marketAddress);
   }
-  const conn = new Connection(DEVNET_RPC, "confirmed");
-  const infos = await conn.getMultipleAccountsInfo(markets.map((m) => new PublicKey(m.marketAddress as string)));
+  // F3: the stamp binds registry + wrapper program id + cluster genesis, not the registry alone.
+  const registrySha = preflightStampSha(fs.readFileSync(REGISTRY_PATH), WRAPPER, GENESIS_HASH.devnet);
+  const stampPath = process.env.PREFLIGHT_STAMP_PATH ?? `${REGISTRY_PATH}.preflight-ok`;
+  const fallbacks = parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS);
+  // Each endpoint passes the genesis-hash cluster check + slot-lag check before it answers (rpc-failover.ts).
+  const failover = failoverFromEnv("devnet", DEVNET_RPC, fallbacks, process.env, (i, init) => fetch(i, init));
+  const conn = new Connection(DEVNET_RPC, { commitment: "confirmed", ...(failover ? { fetch: failover.fetch } : {}) });
+  let infos;
+  try {
+    infos = await conn.getMultipleAccountsInfo(markets.map((m) => new PublicKey(m.marketAddress as string)));
+  } catch (e) {
+    if (!isTransientRpcError(e)) throw e;
+    const stamp = fs.existsSync(stampPath) ? fs.readFileSync(stampPath, "utf8") : undefined;
+    if (preflightOutageDecision(registrySha, stamp) === "refuse") {
+      fail(`RPC unavailable (${safe(e)}) and this registry has not passed the ownership check before`);
+    }
+    console.warn(`[preflight] WARN: RPC unavailable (${safe(e)}); registry unchanged since the last passing check, starting degraded instead of exiting`);
+    return;
+  }
   infos.forEach((info, i) => {
     const m = markets[i] as Entry;
     if (!info) fail(`${m.label}: market ${m.marketAddress} does not exist on devnet`);
     if (info.owner.toBase58() !== WRAPPER) fail(`${m.label}: market ${m.marketAddress} is owned by ${info.owner.toBase58()}, not the fresh wrapper ${WRAPPER}`);
   });
+  try { fs.writeFileSync(stampPath, registrySha + "\n"); } catch { /* read-only checkout: the stamp is an optimisation */ }
   console.log(`[preflight] ok: ${markets.length} market(s), all owned by wrapper ${WRAPPER}`);
 }
 main().catch((e: unknown) => fail(e instanceof Error ? e.message : String(e)));
