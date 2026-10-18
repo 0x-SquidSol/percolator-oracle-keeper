@@ -155,12 +155,14 @@ describe("R3.24 (a) mark smoother: peek / status", () => {
     const s = createMarkSmoother({ windowMs: 15_000 });
     assert.equal(s.peek("P"), null);
     assert.equal(s.smooth("P", 2_546n, 0), null);
-    assert.equal(s.peek("P"), 2_546n);
+    assert.equal(s.peek("P"), null); // S3-B6: one read is never a bypass price
     assert.deepEqual(s.status("P"), { samples: 1, spanMs: 0, minSamples: 3, minSpanMs: 12_500 });
     assert.equal(s.smooth("P", 2_550n, 3_000), null);
-    assert.equal(s.peek("P"), 2_548n); // even count: average of the two
+    assert.equal(s.peek("P"), null); // S3-B6: nor are two
     assert.equal(s.status("P").samples, 2);
     assert.match(primingMessage(s.status("P")), /^mark smoother re-priming — withholding push until minSamples \(window holds 2 sample\(s\) over 3\.0 s; needs 3 over 12\.5 s\)$/);
+    assert.equal(s.smooth("P", 2_560n, 6_000), null); // span 6 s < 12.5 s: smooth() still withholds
+    assert.equal(s.peek("P"), 2_555n); // 3 reads (minSamples): odd count drops the oldest, average of 2_550 and 2_560
   });
 
   it("deadlineBypass: only for a Live, urgent market with a window price", () => {
@@ -174,11 +176,13 @@ describe("R3.24 (a) mark smoother: peek / status", () => {
   });
 });
 
-describe("R3.24 (a) replay: boot near/after pin expiry -> a push on cycle 0", () => {
+describe("R3.24 (a) replay: boot near/after pin expiry -> a push once minSamples reads are in (S3-B6)", () => {
   // The runCycle decision chain, in runCycle's order, with the real bytes:
   //   cranker boot crank read -> recordPushDeadline; deadlineReadsNeeded; samplePoolsForCycle; smoother withholds;
   //   deadlineBypass(getPushDeadline(…, DEADLINE_FRESH_MS), peek) -> the price that goes into the batch.
-  function cycle0(data: Uint8Array, readSlot: bigint, viaPushLoopRead: boolean): Promise<bigint | null> {
+  // `reads` = how many cycles' pool reads the window holds when the deadline decision is made (the last one at t0).
+  // S3-B6: one read (cycle 0 right after a restart) must never be published, even with the deadline urgent.
+  function cycle0(data: Uint8Array, readSlot: bigint, viaPushLoopRead: boolean, reads = 1): Promise<bigint | null> {
     return (async () => {
       const t0 = 1_792_000_000_000;
       const units = [{ key: C4, marketAddress: C4, poolAddress: POOL, source: "pool" as const }];
@@ -195,29 +199,44 @@ describe("R3.24 (a) replay: boot near/after pin expiry -> a push on cycle 0", ()
       const e12 = createMarkSmoother({ windowMs: 15_000 });
       const smoothed = new Map<string, bigint | null>();
       const smoothedE12 = new Map<string, bigint | null>();
-      samplePoolsForCycle(units, () => false, new Map([[POOL, 2_546n]]), new Map(), { e6, e12 }, t0, smoothed, smoothedE12, new Set());
-      assert.equal(smoothed.get(POOL), null, "cycle 0: the smoother is still priming");
+      for (let i = reads - 1; i >= 0; i--) {
+        smoothed.clear();
+        smoothedE12.clear();
+        samplePoolsForCycle(units, () => false, new Map([[POOL, 2_546n]]), new Map(), { e6, e12 }, t0 - i * 5_000, smoothed, smoothedE12, new Set());
+      }
+      assert.equal(smoothed.get(POOL), null, "the smoother is still priming (span gate)");
       const b = deadlineBypass(getPushDeadline(C4, t0, DEADLINE_FRESH_MS), e6.peek(POOL));
       return b ? b.priceE6 : null;
     })();
   }
 
-  it("deadline known from the cranker's boot read: cycle 0 publishes the pool price", async () => {
-    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, false), 2_546n);
+  it("S3-B6: deadline known from the cranker's boot read, ONE read: cycle 0 withholds", async () => {
+    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, false, 1), null);
+    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, false, 2), null);
   });
 
-  it("deadline unknown at cycle 0: the push loop reads it itself and still publishes on cycle 0", async () => {
-    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, true), 2_546n);
+  it("deadline known from the cranker's boot read: publishes the pool price once minSamples reads are in", async () => {
+    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, false, 3), 2_546n);
   });
 
-  it("pin 4,000 slots from expiry (the case a push CAN still help): cycle 0 publishes", async () => {
+  it("S3-B6: deadline unknown at cycle 0, the push loop reads it itself, ONE read: withholds", async () => {
+    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, true, 1), null);
+  });
+
+  it("deadline unknown: the push loop reads it itself and publishes once minSamples reads are in", async () => {
+    assert.equal(await cycle0(c4AtBoot(), BOOT_SLOT, true, 3), 2_546n);
+  });
+
+  it("pin 4,000 slots from expiry (the case a push CAN still help): publishes on the third read, not the first", async () => {
     const read = PIN_SINCE_C4 + 5_000n;
-    assert.equal(await cycle0(c4AtBoot(read - 10n), read, false), 2_546n);
+    assert.equal(await cycle0(c4AtBoot(read - 10n), read, false, 1), null);
+    assert.equal(await cycle0(c4AtBoot(read - 10n), read, false, 3), 2_546n);
   });
 
-  it("no deadline close: cycle 0 still withholds (unchanged behaviour)", async () => {
+  it("no deadline close: still withholds while priming (unchanged behaviour)", async () => {
     const read = PIN_SINCE_C4 + 1_000n;
-    assert.equal(await cycle0(c4AtBoot(read - 10n), read, false), null);
+    assert.equal(await cycle0(c4AtBoot(read - 10n), read, false, 1), null);
+    assert.equal(await cycle0(c4AtBoot(read - 10n), read, false, 3), null);
   });
 });
 

@@ -1325,7 +1325,8 @@ async function runCycle(
     let smoothedE12: bigint | null | undefined = smoothedE12ThisCycle.get(entry.poolAddress);
     if (priceE6 === null) {
       // R3.24 (a): the priming gate is only safe while no fail-closed deadline is close. When one is, publish the
-      // median of what the window already holds (bounded by the breaker below, the band and the engine step cap).
+      // median of what the window already holds, waiving only the SPAN gate. S3-B6: peek() still requires minSamples
+      // reads, because right after a restart the breaker below is unseeded and bounds nothing.
       const bypass = deadlineBypass(getPushDeadline(entry.marketAddress, smoothNowMs, DEADLINE_FRESH_MS), markSmoother.peek(entry.poolAddress));
       if (bypass === null) {
         stat.totalErrors++;

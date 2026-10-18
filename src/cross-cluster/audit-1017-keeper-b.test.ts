@@ -282,20 +282,28 @@ describe("S3-B5 RPC api-key never reaches the log", () => {
   });
 });
 
-// ── S3-B6 (todo: design decision, not fixed here) ─────────────────────────────────────────────────────────────────
-describe("S3-B6 deadline bypass at cycle 0 is not bounded by the breaker", () => {
-  it(
-    "after a restart, an urgent deadline publishes one raw pool read and the unseeded breaker accepts any price",
-    { todo: "R3.24 design: require >= minSamples for the bypass and/or seed the breaker from the on-chain mark" },
-    () => {
-      const s = createMarkSmoother({ windowMs: 17_000 });
-      assert.equal(s.smooth("P", 50_000_000n, 0), null); // ONE manipulated read (on-chain mark was ~100)
-      const urgent = { terminal: null, readSlot: 0n, stale: null, pin: null, urgent: true, urgentReason: "test" };
-      const bypass = deadlineBypass(urgent, s.peek("P"));
-      const fresh = { symbol: "X", lastPrice: 0, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0 };
-      const accepted = bypass ? checkCircuitBreaker(fresh, Number(bypass.priceE6) / 1e6, { maxMovePct: 10, confirmTrips: 3, log: () => {} }) : null;
-      // The claim in keeper-loop.ts (R3.24 (a)): "bounded by the breaker below". It is not: a -50% read is published.
-      assert.equal(accepted, null);
-    },
-  );
+// ── S3-B6 (fixed 2026-10-18): the deadline bypass needs the normal multi-read confirmation ──────────────────────────
+describe("S3-B6 deadline bypass at cycle 0 never publishes a single read", () => {
+  const urgent = { terminal: null, readSlot: 0n, stale: null, pin: null, urgent: true, urgentReason: "test" };
+
+  it("after a restart, an urgent deadline with ONE manipulated pool read publishes nothing", () => {
+    const s = createMarkSmoother({ windowMs: 17_000 });
+    assert.equal(s.smooth("P", 50_000_000n, 0), null); // ONE manipulated read (on-chain mark was ~100)
+    assert.equal(s.peek("P"), null);
+    assert.equal(deadlineBypass(urgent, s.peek("P")), null);
+  });
+
+  it("two reads are still not enough; the third (minSamples) read is", () => {
+    const s = createMarkSmoother({ windowMs: 17_000 });
+    s.smooth("P", 100_000_000n, 0);
+    s.smooth("P", 100_000_000n, 7_000);
+    assert.equal(deadlineBypass(urgent, s.peek("P")), null);
+    assert.equal(s.smooth("P", 101_000_000n, 14_000), null); // span 14 s < the 14.1 s span gate: smooth() still withholds
+    assert.ok(deadlineBypass(urgent, s.peek("P")) !== null);
+  });
+
+  it("a one-read median would have been accepted by the unseeded breaker (why the count gate is required)", () => {
+    const fresh = { symbol: "X", lastPrice: 0, circuitBreakerTrips: 0, cbTripPrice: 0, cbConsecutiveTrips: 0 };
+    assert.equal(checkCircuitBreaker(fresh, 50, { maxMovePct: 10, confirmTrips: 3, log: () => {} }), 50);
+  });
 });
