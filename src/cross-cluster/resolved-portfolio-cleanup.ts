@@ -336,17 +336,16 @@ export function decodePositionNft(d: Uint8Array): PositionNftRecord | null {
  * The escrowed portfolio's NFT record (mint + current holder). null if not found. Never throws.
  *
  * S1-2: a portfolio keypair can be closed and re-created, leaving an NFT of the EARLIER incarnation behind with the same
- * `portfolio_account`. That NFT is not the holder of the live escrow, so when `live` (the portfolio's market group and
- * permanent portfolio id) is given, a v3 record is accepted only if its (market group, id) match it. Stale v3 records are
- * skipped. If no v3 record matches, a legacy 199 B record (no incarnation to compare; a pre-S1-2 program) is used as a
- * fallback; otherwise null (holder unknown). The escrow itself is identified by the portfolio's owner being the NFT
+ * `portfolio_account`. That NFT is not the holder of the live escrow, so (`live` is REQUIRED: omitting it would accept a stale v3 record) a v3 record is accepted only if its (market group, id) match it. Stale v3 records are
+ * skipped. A legacy 199 B record (no incarnation to compare) is used only when NO v3 record exists for the portfolio (a
+ * pre-S1-2 program); once any v3 record names it, legacy is a dead NFT and the holder is unknown (null). The escrow itself is identified by the portfolio's owner being the NFT
  * program's `["mint_authority"]` PDA ({@link pdaOwnerKind}), which does not depend on this record.
  */
 export async function positionNftFor(
   conn: Pick<Connection, "getProgramAccounts">,
   nftProgramId: PublicKey,
   portfolio: PublicKey,
-  live?: { marketGroup: PublicKey; portfolioId: bigint },
+  live: { marketGroup: PublicKey; portfolioId: bigint },
 ): Promise<{ nftMint: string; holder: string } | null> {
   try {
     const [v3, legacy] = await Promise.all(
@@ -357,9 +356,13 @@ export async function positionNftFor(
     for (const r of v3) {
       const d = decodePositionNft(new Uint8Array(r.account.data));
       if (!d || !d.portfolio.equals(portfolio)) continue;
-      if (live && !(d.portfolioIdAtMint === live.portfolioId && live.portfolioId !== 0n && d.marketGroup?.equals(live.marketGroup))) continue;
+      if (!(d.portfolioIdAtMint === live.portfolioId && live.portfolioId !== 0n && d.marketGroup?.equals(live.marketGroup))) continue;
       return { nftMint: d.nftMint.toBase58(), holder: d.holder.toBase58() };
     }
+    // K-2: any v3 record naming this portfolio proves the program is the S1-2 build, where a legacy 199 B record is a dead
+    // NFT (rejected by Burn/EmergencyBurn/Reconcile and by the wrapper). Its last_holder must not be named as the party to
+    // wait on, so the holder is unknown. A legacy record is used only when NO v3 record exists for the portfolio.
+    if (v3.some((r) => decodePositionNft(new Uint8Array(r.account.data))?.portfolio.equals(portfolio))) return null;
     for (const r of legacy) {
       const d = decodePositionNft(new Uint8Array(r.account.data));
       if (d && d.portfolio.equals(portfolio)) return { nftMint: d.nftMint.toBase58(), holder: d.holder.toBase58() };

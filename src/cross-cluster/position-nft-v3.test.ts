@@ -62,16 +62,21 @@ describe("PositionNft v3 (239 B)", () => {
     assert.equal(await positionNftFor(onlyStale, NFT, PF, { marketGroup: GROUP, portfolioId: 7n }), null, "no live NFT -> holder unknown (escrow owner path only)");
     assert.equal(await positionNftFor(conn([v3Record(GROUP, 0n)]), NFT, PF, { marketGroup: GROUP, portfolioId: 0n }), null, "id 0 never binds");
   });
-  it("positionNftFor: a legacy 199 B record is the fallback when no v3 record matches; never throws", async () => {
+  it("K-2: once any v3 record names the portfolio, a legacy record is a dead NFT: holder unknown, not its last_holder", async () => {
+    const stale = new PublicKey(new Uint8Array(32).fill(9));
+    const c = conn([v3Record(GROUP, 6n, stale), legacyRecord()]);
+    assert.equal(await positionNftFor(c, NFT, PF, { marketGroup: GROUP, portfolioId: 7n }), null);
+  });
+  it("positionNftFor: a legacy 199 B record is the fallback only when no v3 record exists (pre-S1-2 program); never throws", async () => {
     const r = await positionNftFor(conn([legacyRecord()]), NFT, PF, { marketGroup: GROUP, portfolioId: 7n });
     assert.equal(r?.holder, legacy.holder.toBase58());
     const boom = { getProgramAccounts: async () => { throw new Error("429"); } } as unknown as Pick<Connection, "getProgramAccounts">;
-    assert.equal(await positionNftFor(boom, NFT, PF), null);
+    assert.equal(await positionNftFor(boom, NFT, PF, { marketGroup: GROUP, portfolioId: 7n }), null);
   });
   it("positionNftFor queries BOTH dataSizes (239 and 199) with portfolio_account @10", async () => {
     const seen: Array<unknown[]> = [];
     const spy = { getProgramAccounts: (async (_p: PublicKey, cfg: { filters: unknown[] }) => { seen.push(cfg.filters); return []; }) as unknown as Connection["getProgramAccounts"] };
-    await positionNftFor(spy, NFT, PF);
+    await positionNftFor(spy, NFT, PF, { marketGroup: GROUP, portfolioId: 7n });
     assert.deepEqual(seen.map((f) => (f[0] as { dataSize: number }).dataSize).sort(), [199, 239]);
     for (const f of seen) assert.deepEqual(f[1], { memcmp: { offset: 10, bytes: PF.toBase58() } });
   });
