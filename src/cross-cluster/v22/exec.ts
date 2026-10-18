@@ -17,6 +17,7 @@ import type { ConfirmOptions } from "../tx-confirm.ts";
 import { BAND_EXPECTED_CODES, errorCodeOf, formatProgramError } from "./errors.ts";
 import type { ProgramKind } from "./errors.ts";
 import { parseInstructionError } from "../positioned-refresh.ts";
+import { addKeeperPriorityFee } from "../priority-fee.ts";
 import { redactErrorText } from "./redact.ts";
 
 /** Compute-budget instructions buildTx puts in front of the caller's list (heap frame + unit limit). */
@@ -135,6 +136,9 @@ function buildTx(keeper: Keypair, ixs: readonly TransactionInstruction[], o: Exe
     tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: o.priorityMicroLamportsPerCu }));
   }
   for (const ix of ixs) tx.add(ix);
+  // S3-A2: the env-configured price (OFF by default) when no explicit per-call price is set, appended LAST so the refusal
+  // index arithmetic above (COMPUTE_IX_COUNT prelude) is unchanged.
+  addKeeperPriorityFee(tx);
   tx.recentBlockhash = blockhash;
   tx.feePayer = keeper.publicKey;
   return tx;

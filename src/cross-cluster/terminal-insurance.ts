@@ -126,6 +126,7 @@ export { decodeTerminalState, isTerminalFlat, isTerminalMarket } from "./market-
 export type { TerminalState } from "./market-state.ts";
 import { decodeTerminalState, isTerminalFlat } from "./market-state.ts";
 import type { TerminalState } from "./market-state.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 /** Asset-0 insurance authority, via the VERSION-gated profile offset. null if unreadable. */
 export function asset0InsuranceAuthority(d: Uint8Array): PublicKey | null {
@@ -304,6 +305,7 @@ function mkTx(keeper: Keypair, blockhash: string, ix: TransactionInstruction): T
   tx.add(ix);
   tx.recentBlockhash = blockhash;
   tx.feePayer = keeper.publicKey;
+  addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
   tx.sign(keeper);
   return tx;
 }

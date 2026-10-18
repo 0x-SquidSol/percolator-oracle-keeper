@@ -88,6 +88,7 @@ import { parseInstructionError } from "./positioned-refresh.ts";
 import { confirmBySignature } from "./tx-confirm.ts";
 import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 export const WRAPPER_TAG_CLOSE_PORTFOLIO = 8;
 export const WRAPPER_TAG_CLOSE_RESOLVED = 30;
@@ -548,6 +549,7 @@ export async function cleanupResolvedPortfolios(
     for (const ix of ixs) tx.add(ix);
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     return tx;
   };
@@ -562,6 +564,7 @@ export async function cleanupResolvedPortfolios(
     for (const ix of ixs) tx.add(ix);
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     return tx;
   };
@@ -993,6 +996,7 @@ export async function closeFinalizedReceiptPortfolios(
       }));
       tx.recentBlockhash = blockhash;
       tx.feePayer = keeper.publicKey;
+      addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
       tx.sign(keeper);
       const s = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
       if (s.value.err) {

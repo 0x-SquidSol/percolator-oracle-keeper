@@ -174,6 +174,7 @@ import { crankHealthRecord, evaluateCrankHealth, freshStreaks, getAlertSink } fr
 import type { Alert, AlertSink, CrankHealthSample, CrankHealthStreaks } from "./alerting.ts";
 
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 const COMPUTE_UNIT_LIMIT = 250_000;
 
 // ── v17 portfolio account discriminator (verified against live devnet data) ──
@@ -753,6 +754,7 @@ export async function crankOneMarket(
       for (const c of plan.cranks) tx.add(c.ix);
       tx.recentBlockhash = bh.blockhash;
       tx.feePayer = keeper.publicKey;
+      addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
       tx.sign(keeper);
       return tx;
     };
@@ -915,6 +917,7 @@ export async function crankOneMarket(
             for (const c of p.cranks) t.add(c.ix);
             t.recentBlockhash = fuBh.blockhash;
             t.feePayer = keeper.publicKey;
+            addKeeperPriorityFee(t); // S3-A2: optional CU price, appended last (OFF by default)
             t.sign(keeper);
             return t;
           };
@@ -968,6 +971,7 @@ export async function crankOneMarket(
           for (const c of p.cranks) t.add(c.ix);
           t.recentBlockhash = ovBh.blockhash;
           t.feePayer = keeper.publicKey;
+          addKeeperPriorityFee(t); // S3-A2: optional CU price, appended last (OFF by default)
           t.sign(keeper);
           return t;
         };

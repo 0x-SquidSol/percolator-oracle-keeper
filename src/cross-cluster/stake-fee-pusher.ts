@@ -91,6 +91,7 @@ import {
   STAKE_MINIMUM_LIQUIDITY as SDK_STAKE_MINIMUM_LIQUIDITY,
   stakeRealLpSupply,
 } from "@percolatorct/sdk";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 /**
  * Per-sub-pool dead-share floors (percolator-stake fix/v22-stake-last-junior-residual @ aebbff6,
@@ -391,6 +392,7 @@ export async function pushStakeFeesOnce(
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
 
     // Simulate first: the codes tell "not bound" (operator work) apart from

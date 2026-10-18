@@ -76,6 +76,7 @@ import { bondFeeDelegated } from "./v22/delegation.ts";
 import { lpVaultRegistryBondFlag } from "./v22/market.ts";
 
 import { lpVaultRegistryBound, lpVaultRegistryExtFlag } from "./registry-flags.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 export { LP_VAULT_REGISTRY_BOUND_FLAG_OFF, lpVaultRegistryBound } from "./registry-flags.ts";
 
 /**
@@ -352,6 +353,7 @@ async function sendCrankFeesOnce(
     const { blockhash, lastValidBlockHeight } = await devnetConn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     if (resolvedHarvest) {
       // P3 FINAL 58e379f1: a terminal harvest with nothing pending is a no-op SUCCESS (no

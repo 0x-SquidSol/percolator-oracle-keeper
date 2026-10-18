@@ -40,6 +40,7 @@ import { classifyProbeError } from "./p2b-feature.ts";
 import { VAULT_LP_ALLOCATE_REFUSED } from "./lock-codes.ts";
 import type { VaultMarketSnapshot } from "./p2b-markets.ts";
 import { lpVaultRegistryBondFlag } from "./v22/market.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 export interface AllocateConfig {
   /** Mean pacing per market. */
@@ -240,6 +241,7 @@ export class VaultLpAllocator {
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     this.stats.sims++;
     const sim = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });

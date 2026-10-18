@@ -79,6 +79,7 @@ export function resetTerminalPushLogForTests(): void {
  */
 export { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 const COMPUTE_UNIT_LIMIT = 200_000;
 
@@ -481,6 +482,7 @@ export async function pushAuthMark(
     simTx.add(ix);
     simTx.recentBlockhash = bh.blockhash;
     simTx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(simTx); // S3-A2: optional CU price, appended last (OFF by default)
     simTx.sign(keeper);
 
     // Pass the already-signed Transaction without re-supplying signers so the
@@ -501,6 +503,7 @@ export async function pushAuthMark(
   sendTx.add(ix);
   sendTx.recentBlockhash = bh.blockhash;
   sendTx.feePayer = keeper.publicKey;
+  addKeeperPriorityFee(sendTx); // S3-A2: optional CU price, appended last (OFF by default)
   sendTx.sign(keeper);
 
   const signature = await devnetConn.sendRawTransaction(sendTx.serialize(), {
@@ -624,6 +627,8 @@ function buildPushTx(
       ),
     );
   }
+  // S3-A2: the optional CU price goes in BEFORE the size probe, so chunking accounts for its bytes.
+  addKeeperPriorityFee(tx);
   tx.recentBlockhash = blockhash.blockhash;
   tx.feePayer = keeper.publicKey;
   // web3.js's serialize() THROWS ("Transaction too large: N > 1232") instead of
@@ -1215,6 +1220,7 @@ export async function pushAuthMarkBatch(
    */
   const preflight = async (chunk: AuthMarkPushItem[]): Promise<unknown> => {
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     let simErr: unknown = null;
     try {
@@ -1258,6 +1264,7 @@ export async function pushAuthMarkBatch(
     const chunk = chunkIn.filter((p) => !supersededByLaterCycle(pushGenerationKey(p), opts.cycle));
     if (chunk.length === 0) return;
     const { tx } = buildPushTx(keeper, chunk, nowSlot, blockhash);
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     try {
       const signature = await devnetConn.sendRawTransaction(tx.serialize(), PUSH_SEND_OPTIONS);

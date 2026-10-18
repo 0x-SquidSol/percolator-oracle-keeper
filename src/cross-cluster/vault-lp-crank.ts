@@ -28,6 +28,7 @@ import type { StaleResolveWindow } from "./market-state.ts";
 import { exhaustedAlert, getExhaustedRegistry } from "./p3-exhausted-resolve.ts";
 import type { ExhaustedRegistry } from "./p3-exhausted-resolve.ts";
 import { loneLpCrankSuppressedFor, triggerProtectiveRound } from "./v22/delegation.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 export type SeniorDrawEvent =
   | { kind: "draw"; deficit: bigint; moved: bigint; unfunded: bigint }
@@ -196,6 +197,7 @@ export class VaultLpCranker {
       tx.add(buildObservationCrankIx(this.keeper.publicKey, market, vaultLp));
       tx.recentBlockhash = blockhash;
       tx.feePayer = this.keeper.publicKey;
+      addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
       tx.sign(this.keeper);
       const sim = await this.conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "processed" });
       if (sim.value.err) {
