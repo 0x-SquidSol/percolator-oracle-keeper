@@ -348,11 +348,12 @@ export async function positionNftFor(
   live: { marketGroup: PublicKey; portfolioId: bigint },
 ): Promise<{ nftMint: string; holder: string } | null> {
   try {
-    const [v3, legacy] = await Promise.all(
+    const [v3All, legacy] = await Promise.all(
       [POSITION_NFT_LEN, POSITION_NFT_LEN_LEGACY].map((dataSize) =>
         conn.getProgramAccounts(nftProgramId, { filters: [{ dataSize }, { memcmp: { offset: 10, bytes: portfolio.toBase58() } }] }),
       ),
     );
+    const v3 = v3All.filter((r) => r.account.data.length === POSITION_NFT_LEN);
     for (const r of v3) {
       const d = decodePositionNft(new Uint8Array(r.account.data));
       if (!d || !d.portfolio.equals(portfolio)) continue;
