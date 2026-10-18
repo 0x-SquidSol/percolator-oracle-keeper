@@ -83,6 +83,15 @@ export const STAKE_ERR_NOTHING_TO_RECOVER = 31;
 export const STAKE_ERR_INVALID_ACCOUNT = 16;
 /** Stake S1: the terminal settlement owes the creator and no creator token account was passed. */
 export const STAKE_ERR_CREATOR_ACCOUNT_REQUIRED = 46;
+/** Creator-ATA create attempts allowed per market per process, and the first backoff (doubles per attempt). */
+export const CREATOR_ATA_MAX_ATTEMPTS = 3;
+export const CREATOR_ATA_BACKOFF_MS = 10 * 60_000;
+
+/** An initialized classic-token account of `mint` owned by `owner`: what the program accepts as the creator account. */
+export function isCreatorTokenAccount(ai: { owner: PublicKey; data: Uint8Array } | null | undefined, mint: PublicKey, owner: PublicKey): boolean {
+  return !!ai && ai.owner.equals(TOKEN_PROGRAM) && ai.data.length >= 165 && ai.data[108] === 1
+    && Buffer.from(ai.data.subarray(0, 32)).equals(mint.toBuffer()) && Buffer.from(ai.data.subarray(32, 64)).equals(owner.toBuffer());
+}
 const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 /** pool.admin's classic-token collateral ATA (SDK `creatorCollateralAtaV5`). */
 export function creatorCollateralAta(admin: PublicKey, collateralMint: PublicKey): PublicKey {
@@ -270,6 +279,10 @@ export class TerminalInsuranceState {
   shape: { value: "v5" | "legacy"; at: number } | null = null;
   /** Markets already logged for stake error 46 (log once, not per cycle). */
   readonly creatorWarned = new Set<string>();
+  /** Markets whose tag 29 was refused for want of the creator account (46, or NotEnoughAccountKeys on the legacy list of a v5 pool). Only these get an ATA create. */
+  readonly creatorAtaNeeded = new Set<string>();
+  /** Per-market ATA-create attempts, bounded: a hostile pool.admin that closes its 0-balance ATA every cycle must not drain the keeper (~0.002 SOL a time). */
+  readonly creatorAtaAttempts = new Map<string, { n: number; nextAtMs: number }>();
 }
 
 /**
@@ -502,13 +515,21 @@ export async function windDownOnce(
   let v5Plan: { insuranceUnits?: PublicKey; creatorToken: PublicKey } | null = null;
   if (poolState.version === 5 && poolState.riskMode !== undefined) {
     const ata = creatorCollateralAta(poolState.admin, poolState.collateralMint);
+    // Mint AND owner are checked: an ATA reassigned (SetAuthority) to someone else is refused on chain by tag 29 forever.
     const ready = (ai: Awaited<ReturnType<TerminalConnection["getAccountInfo"]>>): boolean =>
-      !!ai && ai.owner.equals(TOKEN_PROGRAM) && ai.data.length >= 165 && ai.data[108] === 1;
+      isCreatorTokenAccount(ai, poolState!.collateralMint, poolState!.admin);
     try {
-      let ok = ready(await conn.getAccountInfo(ata, "confirmed"));
-      if (!ok && !dryRun && state.kind === "resolved") {
-        // The creator account is REQUIRED on a v5 pool (FIRST_LOSS: NotEnoughAccountKeys without it; FEE_ONLY: Custom 46 when
-        // owed). Anyone may create it; the keeper does, once, instead of sending the legacy 9-account shape that cannot succeed.
+      const existing = await conn.getAccountInfo(ata, "confirmed");
+      let ok = ready(existing);
+      const nowMs0 = (cfg.now ?? Date.now)();
+      const tries = st.creatorAtaAttempts.get(marketAddress);
+      // An account already at the ATA address that is not usable (reassigned owner, wrong mint, frozen) cannot be fixed by a create.
+      if (!ok && !existing && !dryRun && state.kind === "resolved" && st.creatorAtaNeeded.has(marketAddress)
+        && (!tries || (tries.n < CREATOR_ATA_MAX_ATTEMPTS && nowMs0 >= tries.nextAtMs))) {
+        // Only after the program REFUSED for want of the creator account (see creatorAtaNeeded), never pre-emptively, and bounded
+        // per market with backoff. Anyone may create the ATA; the keeper pays the rent.
+        const n = (tries?.n ?? 0) + 1;
+        st.creatorAtaAttempts.set(marketAddress, { n, nextAtMs: nowMs0 + CREATOR_ATA_BACKOFF_MS * 2 ** (n - 1) });
         try {
           const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
           const tx = mkTx(keeper, blockhash, buildCreateCreatorAtaIx(keeper.publicKey, poolState.admin, poolState.collateralMint));
@@ -565,6 +586,7 @@ export async function windDownOnce(
   // Stake error 46 CreatorAccountRequired: retryable once the creator's collateral ATA exists / the S1 shape is used. Logged
   // once per market (not per cycle) and never an alert by itself; the unbooked-budget streak still escalates if it persists.
   const creatorRequired = (amount: bigint): WindDownStep => {
+    if (poolState!.version === 5) st.creatorAtaNeeded.add(marketAddress);
     if (!st.creatorWarned.has(marketAddress)) {
       st.creatorWarned.add(marketAddress);
       console.warn(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: stake Custom(46) CreatorAccountRequired — the terminal settlement owes the creator; ${v5Plan ? "retrying with the creator ATA" : `create ${poolState!.version === 5 ? creatorCollateralAta(poolState!.admin, poolState!.collateralMint).toBase58() : "pool.admin's collateral ATA"} (pool.admin's collateral ATA) to unblock`}`);
@@ -586,6 +608,8 @@ export async function windDownOnce(
         if (code === WRAPPER_ERR_LOCK_ACTIVE) return { amount, outcome: "cooldown", detail: "Custom(21): insurance-withdraw cooldown or capacity — retry later" };
         if (code === STAKE_ERR_MARKET_NOT_TERMINAL) return { amount, outcome: "not-terminal", detail: "Custom(30) MarketNotTerminal" };
         if (code === STAKE_ERR_CREATOR_ACCOUNT_REQUIRED) return creatorRequired(amount);
+        // FIRST_LOSS pool without the creator ATA: the legacy 9-account list answers NotEnoughAccountKeys at the stake ix.
+        if (!(useV5 && v5Plan) && poolState!.version === 5 && isLegacyShapeRefusal(sim.err) && !(typeof ie?.custom === "number")) return creatorRequired(amount);
         return { amount, outcome: "failed", detail: `sim ${JSON.stringify(sim.err)} ${(sim.logs ?? []).filter((l) => /Error|failed/i.test(l)).slice(-1).join("")}`.slice(0, 200) };
       }
       if (dryRun) return { amount, outcome: "dry-run", detail: "simulated clean; not sent" };
