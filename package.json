@@ -1,7 +1,7 @@
 {
   "name": "percolator-oracle-keeper",
   "version": "1.0.0",
-  "description": "Oracle keeper service for Percolator — mirrors price feeds to Percolator devnet markets via PushOraclePrice + KeeperCrank",
+  "description": "Oracle keeper service for Percolator \u2014 mirrors price feeds to Percolator devnet markets via PushOraclePrice + KeeperCrank",
   "private": true,
   "type": "module",
   "scripts": {
@@ -27,5 +27,15 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "overrides": {
+    "ws@>=7.0.0 <7.5.11": "7.5.13",
+    "ws@>=8.0.0 <8.20.2": "8.22.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "ws@>=7.0.0 <7.5.11": "7.5.13",
+      "ws@>=8.0.0 <8.20.2": "8.22.0"
+    }
   }
 }
