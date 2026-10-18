@@ -40,7 +40,7 @@ import type { FlaggedAccount, MarginParams } from "./liquidation.ts";
 import { holdPushes as realHold, releasePushes as realRelease } from "../refresh-coordination.ts";
 import { BAND_EXPECTED_CODES } from "./errors.ts";
 import { COMPUTE_IX_COUNT, simulateAndSend, simulateOnly } from "./exec.ts";
-import { keeperPriorityFeeIxs } from "../priority-fee.ts";
+import { addKeeperPriorityFee } from "../priority-fee.ts";
 import type { ExecContext, ExecOptions, ExecOutcome } from "./exec.ts";
 import { DEFAULT_MAX_GAP_SLOTS, DEFAULT_MAX_TXS_PER_ROUND, DEFAULT_WEIGHT_BUDGET, legAwareTxUnits, planSettleRound } from "./settle-pairing.ts";
 import type { PlannedTx, RoundPlan } from "./settle-pairing.ts";
@@ -713,7 +713,7 @@ function packetFits(owner: PublicKey, ixs: ReadonlyArray<TransactionInstruction>
     const t = new Transaction({ feePayer: owner, recentBlockhash: "11111111111111111111111111111111" });
     t.add(ComputeBudgetProgram.requestHeapFrame({ bytes: 131_072 }), ComputeBudgetProgram.setComputeUnitLimit({ units: SWEEP_TX_UNITS }));
     for (const i of ixs) t.add(i);
-    t.add(...keeperPriorityFeeIxs()); // S3-A2: the executor appends it when configured; size it in
+    addKeeperPriorityFee(t); // S3-A2: the executor appends it when configured; size it in
     return t.serialize({ requireAllSignatures: false, verifySignatures: false }).length + 64 <= PACKET_LIMIT;
   } catch {
     return false;

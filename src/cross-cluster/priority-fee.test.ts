@@ -15,6 +15,7 @@ import {
   resetKeeperPriorityFeeCache,
 } from "./priority-fee.ts";
 import { simulateAndSend } from "./v22/exec.ts";
+import { serializedTxSize } from "./v22/liquidation.ts";
 import { execCtx, fakeExecConn } from "./v22/test-helpers.ts";
 
 const PROG = new PublicKey("11111111111111111111111111111112");
@@ -108,5 +109,24 @@ describe("S3-A2 addKeeperPriorityFee", () => {
     assert.deepEqual(seen, [1234]);
     assert.equal(out.kind, "refused");
     assert.equal(out.kind === "refused" ? out.index : -1, 1);
+  });
+
+  it("OFF: the size probes never throw (web3.js Transaction.add() with no instructions throws 'No instructions')", () => {
+    assert.equal(keeperPriorityFeeMicroLamports(), 0);
+    const kp = Keypair.generate();
+    const t = new Transaction();
+    t.add(ix(7));
+    assert.doesNotThrow(() => addKeeperPriorityFee(t));
+    assert.equal(t.instructions.length, 1);
+    assert.ok(Number.isFinite(serializedTxSize(kp.publicKey, [ix(7), ix(8)])));
+  });
+
+  it("ON: the size probe counts the price instruction's bytes", () => {
+    const kp = Keypair.generate();
+    const off = serializedTxSize(kp.publicKey, [ix(7), ix(8)]);
+    process.env[KEEPER_PRIORITY_FEE_ENV] = "5000";
+    resetKeeperPriorityFeeCache();
+    const on = serializedTxSize(kp.publicKey, [ix(7), ix(8)]);
+    assert.ok(on > off, `${on} > ${off}`);
   });
 });
