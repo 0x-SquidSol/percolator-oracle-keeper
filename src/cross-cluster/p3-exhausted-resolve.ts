@@ -34,6 +34,7 @@ import { confirmBySignature } from "./tx-confirm.ts";
 import type { ConfirmOptions } from "./tx-confirm.ts";
 import type { Alert } from "./alerting.ts";
 import type { FeeJob, FeeJobOutcome } from "./fee-jobs.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 export const WRAPPER_TAG_RESOLVE_STALE_PERMISSIONLESS = 39;
 
@@ -213,6 +214,7 @@ export function makeExhaustedResolveJob(cfg: ExhaustedJobConfig): FeeJob {
       tx.add(ix);
       tx.recentBlockhash = blockhash;
       tx.feePayer = ctx.keeper.publicKey;
+      addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
       tx.sign(ctx.keeper);
       const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
       const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, cfg.confirmOpts);

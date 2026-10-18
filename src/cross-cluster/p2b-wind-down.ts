@@ -68,6 +68,7 @@ import {
   WIND_DOWN_ORACLE_STALE,
   WIND_DOWN_STALE_BINDING,
 } from "./lock-codes.ts";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 const AS_MARKET_ID = 0;
 const AS_EFFECTIVE_PRICE = 25;
@@ -488,6 +489,7 @@ export class AdlWindDownRunner {
     const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed");
     tx.recentBlockhash = blockhash;
     tx.feePayer = keeper.publicKey;
+    addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
     tx.sign(keeper);
     const sim = await conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
     if (sim.value.err) {

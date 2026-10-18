@@ -27,6 +27,7 @@ import { LIQUIDATE_CRANK_CU, V22_CU_PER_WEIGHT, V22_LEG_COST } from "../position
 import type { PositionedPortfolio, RiskSnap } from "../positioned-refresh.ts";
 import { engineSlotBase } from "../market-layout.ts";
 import type { MarketLayout } from "../market-layout.ts";
+import { keeperPriorityFeeIxs } from "../priority-fee.ts";
 
 /** Engine POS_SCALE (position units per token): sim/engine-offsets.json, verified against live v2.2 accounts. */
 export const POS_SCALE = 1_000_000n;
@@ -257,6 +258,7 @@ export function serializedTxSize(feePayer: PublicKey, ixs: ReadonlyArray<Transac
   tx.add(ComputeBudgetProgram.requestHeapFrame({ bytes: 131_072 }));
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: LIQ_TX_MAX_CU }));
   for (const ix of ixs) tx.add(ix);
+  tx.add(...keeperPriorityFeeIxs()); // S3-A2: the executor appends it when configured; size it in
   tx.recentBlockhash = "11111111111111111111111111111111";
   tx.feePayer = feePayer;
   try {

@@ -43,6 +43,7 @@ import { lpVaultRegistryBound } from "./registry-flags.ts";
 import { decodeVaultLpState, deriveVaultLpState } from "./resolved-portfolio-cleanup.ts";
 import { parseInstructionError } from "./positioned-refresh.ts";
 import { parseLpVaultRegistry } from "@percolatorct/sdk";
+import { addKeeperPriorityFee } from "./priority-fee.ts";
 
 export type P2bMode = "auto" | "on" | "off";
 export type P2bProbeResult = "supported" | "unsupported" | "unknown" | "no-candidate";
@@ -242,6 +243,7 @@ export function makeTag103Probe(deps: {
       const { blockhash } = await deps.conn.getLatestBlockhash("confirmed");
       tx.recentBlockhash = blockhash;
       tx.feePayer = deps.keeper.publicKey;
+      addKeeperPriorityFee(tx); // S3-A2: optional CU price, appended last (OFF by default)
       tx.sign(deps.keeper);
       const sim = await deps.conn.simulateTransaction(new VersionedTransaction(tx.compileMessage()), { sigVerify: false, commitment: "confirmed" });
       // instruction index 1 (0 is the compute-budget ix); a failure at index 0 would be a runtime problem, not an answer
