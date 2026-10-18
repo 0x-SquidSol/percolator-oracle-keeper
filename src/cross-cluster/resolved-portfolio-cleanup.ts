@@ -43,7 +43,7 @@
  *     PDA would burn the funds). Never attempted; reported as "insurance
  *     recovery waiting on NFT holder X" with the portfolio, NFT mint (from the
  *     NFT program's PositionNftV16 record: portfolio_account @10, nft_mint @42,
- *     last_holder @167, 199 B, nft db4aa09 state_v16.rs) and claim size. An
+ *     last_holder @167; 239 B at layout v3 = nft 95dcece, 199 B legacy v2) and claim size. An
  *     accepted devnet limitation. (Devnet 2026-09-30: 6 such portfolios exist.)
  *
  * F-14 (P3 WIP 31efd250): tag 101 moves NO SPL — the whole vault-LP payout goes back
@@ -305,28 +305,62 @@ export function nftEscrowAuthority(nftProgramId: PublicKey): PublicKey {
 
 export type PdaOwnerKind = "lp-registry" | "nft-escrow";
 
-/** PositionNftV16 (nft db4aa09 state_v16.rs, 199 B): portfolio_account @10, nft_mint @42, last_holder @167. */
-export const POSITION_NFT_LEN = 199;
-export function decodePositionNft(d: Uint8Array): { portfolio: PublicKey; nftMint: PublicKey; holder: PublicKey } | null {
-  if (d.length !== POSITION_NFT_LEN) return null;
+/**
+ * PositionNftV16 (nft state_v16.rs): portfolio_account @10, nft_mint @42, last_holder @167. Layout v3 (S1-2, nft 95dcece)
+ * is 239 B and appends the portfolio INCARNATION: portfolio_market_group @199..231, portfolio_id_at_mint @231..239 (u64 LE).
+ * Legacy v2 (pre-S1-2) is 199 B with no incarnation.
+ */
+export const POSITION_NFT_LEN = 239;
+export const POSITION_NFT_LEN_LEGACY = 199;
+export interface PositionNftRecord {
+  portfolio: PublicKey;
+  nftMint: PublicKey;
+  holder: PublicKey;
+  /** null for a legacy 199 B record (no incarnation binding). */
+  marketGroup: PublicKey | null;
+  portfolioIdAtMint: bigint | null;
+}
+export function decodePositionNft(d: Uint8Array): PositionNftRecord | null {
+  if (d.length !== POSITION_NFT_LEN && d.length !== POSITION_NFT_LEN_LEGACY) return null;
+  const v3 = d.length === POSITION_NFT_LEN;
   return {
     portfolio: new PublicKey(d.subarray(10, 42)),
     nftMint: new PublicKey(d.subarray(42, 74)),
     holder: new PublicKey(d.subarray(167, 199)),
+    marketGroup: v3 ? new PublicKey(d.subarray(199, 231)) : null,
+    portfolioIdAtMint: v3 ? new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(231, true) : null,
   };
 }
 
-/** The escrowed portfolio's NFT record (mint + current holder). null if not found. Never throws. */
+/**
+ * The escrowed portfolio's NFT record (mint + current holder). null if not found. Never throws.
+ *
+ * S1-2: a portfolio keypair can be closed and re-created, leaving an NFT of the EARLIER incarnation behind with the same
+ * `portfolio_account`. That NFT is not the holder of the live escrow, so when `live` (the portfolio's market group and
+ * permanent portfolio id) is given, a v3 record is accepted only if its (market group, id) match it. Stale v3 records are
+ * skipped. If no v3 record matches, a legacy 199 B record (no incarnation to compare; a pre-S1-2 program) is used as a
+ * fallback; otherwise null (holder unknown). The escrow itself is identified by the portfolio's owner being the NFT
+ * program's `["mint_authority"]` PDA ({@link pdaOwnerKind}), which does not depend on this record.
+ */
 export async function positionNftFor(
   conn: Pick<Connection, "getProgramAccounts">,
   nftProgramId: PublicKey,
   portfolio: PublicKey,
+  live?: { marketGroup: PublicKey; portfolioId: bigint },
 ): Promise<{ nftMint: string; holder: string } | null> {
   try {
-    const recs = await conn.getProgramAccounts(nftProgramId, {
-      filters: [{ dataSize: POSITION_NFT_LEN }, { memcmp: { offset: 10, bytes: portfolio.toBase58() } }],
-    });
-    for (const r of recs) {
+    const [v3, legacy] = await Promise.all(
+      [POSITION_NFT_LEN, POSITION_NFT_LEN_LEGACY].map((dataSize) =>
+        conn.getProgramAccounts(nftProgramId, { filters: [{ dataSize }, { memcmp: { offset: 10, bytes: portfolio.toBase58() } }] }),
+      ),
+    );
+    for (const r of v3) {
+      const d = decodePositionNft(new Uint8Array(r.account.data));
+      if (!d || !d.portfolio.equals(portfolio)) continue;
+      if (live && !(d.portfolioIdAtMint === live.portfolioId && live.portfolioId !== 0n && d.marketGroup?.equals(live.marketGroup))) continue;
+      return { nftMint: d.nftMint.toBase58(), holder: d.holder.toBase58() };
+    }
+    for (const r of legacy) {
       const d = decodePositionNft(new Uint8Array(r.account.data));
       if (d && d.portfolio.equals(portfolio)) return { nftMint: d.nftMint.toBase58(), holder: d.holder.toBase58() };
     }
@@ -698,7 +732,7 @@ export async function cleanupResolvedPortfolios(
       const hasClaim = c.capital !== 0n || c.pnl !== 0n || c.reservedPnl !== 0n || c.activeLegs > 0 || c.cancelDepositEscrow !== 0n;
       if (hasClaim) {
         // GH#496: never attempted — only the holder can settle an escrowed payout.
-        const nft = await positionNftFor(conn, cfg.nftProgramId, p.pubkey);
+        const nft = await positionNftFor(conn, cfg.nftProgramId, p.pubkey, { marketGroup: market, portfolioId: p.portfolioId });
         out.waitingOnHolder.push({ portfolio: p.pubkey.toBase58(), nftMint: nft?.nftMint ?? null, holder: nft?.holder ?? null, capital: c.capital, pnl: c.pnl, reservedPnl: c.reservedPnl, activeLegs: c.activeLegs });
         out.remaining.push({
           portfolio: p.pubkey.toBase58(),
