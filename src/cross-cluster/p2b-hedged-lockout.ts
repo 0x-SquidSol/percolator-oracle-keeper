@@ -25,14 +25,24 @@
  * market account, and the bound vault LP portfolio (capital, pnl, fee credits, its ADL-effective
  * leg = `basis * A_side / a_basis`, floor: exact to +-1 unit, irrelevant at a few-percent
  * threshold).
+ *
+ * v2.2 (G8 / controller / continuous leverage, percolator-prog e699d7da): on a v2.2 market the
+ * capacity is the program's `n_cap_g8_q_dials`, computed by the SDK exactly as the gate does
+ * (`growthCeilingView` -> clamp, tier, cap depth and the continuous-curve dials κ / λ_depth at
+ * min(venue, book) depth; then `nCapG8Q`). That needs the market's `band_bps` and the read slot,
+ * which `evaluateHedgedLockouts` takes from the market bytes and the RPC context slot. Without
+ * them (a v2.1 market) a controller-written record still fails closed (`r3-unsupported`).
  */
 import type { Connection } from "@solana/web3.js";
 import {
+  STRESS_NONE,
   V17_MARKET_ASSET_SLOT_LEN,
   V17_MARKET_GROUP_LEN,
   V17_MARKET_GROUP_OFF,
   conservativeEquity,
   decodeAssetGrowthV19,
+  growthCeilingView,
+  nCapG8Q,
   nCapQ,
   parsePortfolioV17,
   usersSideOiQ,
@@ -41,6 +51,8 @@ import {
 import type { AssetGrowthV19, PortfolioV17 } from "@percolatorct/sdk";
 import { decodeAdlState, isV18MarketHeader } from "./adl-state.ts";
 import type { Alert } from "./alerting.ts";
+import { detectLayout, engineSlotBase } from "./market-layout.ts";
+import { V22_CONFIG_OFF } from "./v22/market.ts";
 import { readU64 } from "./p2b-markets.ts";
 import type { VaultMarketSnapshot } from "./p2b-markets.ts";
 
@@ -83,13 +95,20 @@ export interface HedgedLockoutInput {
   oiEffShortQ: bigint;
   /** The vault LP's ADL-effective signed position (Q; positive = long). */
   lpEffQ: bigint;
+  /**
+   * v2.2: the market's engine `band_bps` and the slot of the read. Given, N_cap is the program's G8 capacity on the continuous
+   * curve (`growthCeilingView` + `nCapG8Q`, SDK); omitted (v2.1), the growth-1 `nCapQ(C_m, lambda)` and a controller (R3)
+   * record fails closed.
+   */
+  v22?: { bandBps: number; nowSlot: bigint };
 }
 
 /**
- * "r3-unsupported": the growth record is controller-written (flags bit 0, R3 layout). `lambdaBps` is then no longer the
- * effective capacity (G8/controller: `n_cap_g8_q_dials` = min(nCapQ(C_m, min(lambda, lambda_depth)), depth cap at kappa), with
- * tier, smoothed dials and the sticky cap depth read from band, slot and depth state this job does not carry), so
- * `nCapQ(cM, lambdaBps)` would OVERESTIMATE it and under-report utilisation. Fail closed: no verdict, no alert.
+ * "r3-unsupported": the growth record is controller-written (flags bit 0, R3 layout) and the input carries no `v22` band / slot
+ * state. `lambdaBps` is then no longer the effective capacity (G8/controller: `n_cap_g8_q_dials` = min(nCapQ(C_m, min(lambda,
+ * lambda_depth)), depth cap at kappa), with tier, curve dials and the sticky cap depth read from band, slot and depth state), so
+ * `nCapQ(cM, lambdaBps)` would OVERESTIMATE it and under-report utilisation. Fail closed: no verdict, no alert. With `v22`
+ * state the exact G8 capacity is used instead (never this status).
  */
 export type HedgedLockoutStatus = "no-growth" | "no-capacity" | "r3-unsupported" | "ok" | "alert";
 
@@ -110,8 +129,8 @@ const NONE: HedgedLockoutVerdict = { status: "no-growth", nCapQ: null, usersLong
 /** The truth table. Pure. */
 export function evaluateHedgedLockout(i: HedgedLockoutInput, t: HedgedLockoutThresholds): HedgedLockoutVerdict {
   if (i.growth === null) return NONE;
-  if (i.growth.r3Layout) return { ...NONE, status: "r3-unsupported" };
-  const nCap = nCapQ(i.cM, i.growth.lambdaBps, i.priceE6);
+  if (i.growth.r3Layout && i.v22 === undefined) return { ...NONE, status: "r3-unsupported" };
+  const nCap = i.v22 === undefined ? nCapQ(i.cM, i.growth.lambdaBps, i.priceE6) : g8NCapQ(i.growth, i.v22.bandBps, i.v22.nowSlot, i.cM, i.priceE6);
   if (nCap === null || nCap === 0n) return { ...NONE, status: "no-capacity", nCapQ: nCap };
   const usersLong = usersSideOiQ(i.oiEffLongQ, i.lpEffQ, true);
   const usersShort = usersSideOiQ(i.oiEffShortQ, i.lpEffQ, false);
@@ -121,6 +140,16 @@ export function evaluateHedgedLockout(i: HedgedLockoutInput, t: HedgedLockoutThr
   const lpBps = utilizationBps(lpAbs, nCap);
   const alert = uL !== null && uS !== null && lpBps !== null && uL >= BigInt(t.utilBps) && uS >= BigInt(t.utilBps) && lpBps <= BigInt(t.flatBps);
   return { status: alert ? "alert" : "ok", nCapQ: nCap, usersLongQ: usersLong, usersShortQ: usersShort, utilLongBps: uL, utilShortBps: uS, lpNetBps: lpBps };
+}
+
+/**
+ * The program's G8 `N_cap` (Q) of a growth asset: `growthCeilingView` (clamp from band / r_gap, usable and cap depth at
+ * `nowSlot`, tier = min(venue, book), the continuous-curve dials at min(venue, book) depth) then `nCapG8Q` with those dials,
+ * i.e. `n_cap_g8_q_dials` as the gate, the TradeCpi clip and the rent snapshot read it. Stress does not enter N_cap. Pure.
+ */
+export function g8NCapQ(growth: AssetGrowthV19, bandBps: number, nowSlot: bigint, cM: bigint, priceE6: bigint): bigint | null {
+  const view = growthCeilingView(growth, bandBps, nowSlot, cM, STRESS_NONE);
+  return nCapG8Q({ clamp: view.clampEnforced, cM, lambdaBps: growth.lambdaBps, tier: view.tier, capDepth: view.capDepthE6, priceE6, dials: view.dials });
 }
 
 /** The vault LP's ADL-effective signed position on `assetIndex` (`basis * A_side / a_basis`, floor; 0 when flat). Pure. */
@@ -140,6 +169,25 @@ export interface HedgedLockoutRecord {
   market: string;
   label: string;
   verdict: HedgedLockoutVerdict;
+}
+
+/**
+ * Where the asset state lives and, on v2.2, the band / slot state for the G8 N_cap. v2.1 (VERSION 18): the fixed v2.1 geometry, no
+ * `v22`. A known v2.2 layout: `engineSlotBase` of the detected layout, `band_bps` from the config, `nowSlot` = the read's context
+ * slot. Anything else (not a market, unknown layout, a v17 market): null, not evaluated. Pure.
+ */
+export function hedgedLockoutPlacement(data: Uint8Array, assetIndex: number, readSlot: number): { assetStateOff: number; v22?: { bandBps: number; nowSlot: bigint } } | null {
+  if (isV18MarketHeader(data)) {
+    return { assetStateOff: V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + assetIndex * V17_MARKET_ASSET_SLOT_LEN + ASSET_WRAPPER_LEN };
+  }
+  const det = detectLayout(data);
+  if (!det.known || det.layout.wrapperVersion < 19) return null;
+  const l = det.layout;
+  const off = engineSlotBase(l, assetIndex);
+  const bandOff = l.groupOff + V22_CONFIG_OFF.bandBps;
+  if (data.length < off + AS_EFFECTIVE_PRICE + 8 || data.length < bandOff + 8) return null;
+  const band = readU64(data, bandOff);
+  return { assetStateOff: off, v22: { bandBps: band > 0xffff_ffffn ? Number.MAX_SAFE_INTEGER : Number(band), nowSlot: BigInt(readSlot) } };
 }
 
 /** Markets already logged as r3-unsupported (one line per market per process). */
@@ -164,14 +212,16 @@ export async function evaluateHedgedLockouts(
       if (!s.bound || !s.vaultLp || !s.marketData) continue;
       const growth = decodeAssetGrowthV19(s.marketData, s.ref.assetIndex);
       if (growth === null) continue;
-      // K-9: the offsets below are v2.1; keep this check v2.1-only (decodeAdlState used to be the gate).
-      if (!isV18MarketHeader(s.marketData)) continue;
+      // v2.1 (VERSION 18): the fixed v2.1 offsets and growth-1 N_cap. v2.2: the asset state through the detected layout (the
+      // AssetStateV16Account prefix, effective price @25, is unchanged; K-9) and the G8 N_cap on the continuous curve.
+      const place = hedgedLockoutPlacement(s.marketData, s.ref.assetIndex, s.slot);
+      if (place === null) continue;
       const adl = decodeAdlState(s.marketData, s.ref.assetIndex);
       if (!adl) continue;
       const info = await conn.getAccountInfo(s.vaultLp.lpPortfolio, "confirmed");
       if (!info) continue;
       const lp = parsePortfolioV17(new Uint8Array(info.data));
-      const a = V17_MARKET_GROUP_OFF + V17_MARKET_GROUP_LEN + s.ref.assetIndex * V17_MARKET_ASSET_SLOT_LEN + ASSET_WRAPPER_LEN;
+      const a = place.assetStateOff;
       const verdict = evaluateHedgedLockout(
         {
           growth,
@@ -180,6 +230,7 @@ export async function evaluateHedgedLockouts(
           oiEffLongQ: adl.oiEffLong,
           oiEffShortQ: adl.oiEffShort,
           lpEffQ: vaultLpEffectivePositionQ(lp, s.ref.assetIndex, adl),
+          ...(place.v22 === undefined ? {} : { v22: place.v22 }),
         },
         t,
       );
