@@ -479,7 +479,10 @@ function maybeResetAuthorityLatches(): void {
 // NOTE (mainnet): a real-money deployment should keep a longer window OR move to a
 // pull oracle (Pyth) that prices the trade in-tx — do NOT ship this short window
 // to mainnet without that.
-const MARK_WINDOW_MS = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+// GH#165: validated rather than raw. `cross-cluster.ts` boots first and exits on a
+// bad cadence, so this read was protected by sequence rather than by validation --
+// which stops being true the moment this module is used from anywhere else.
+const MARK_WINDOW_MS = parseCrossClusterPositiveNumberEnv("CC_MARK_WINDOW_MS", 15_000);
 const markSmoother = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
 
 function parseCrossClusterPositiveNumberEnv(
