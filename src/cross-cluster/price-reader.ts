@@ -52,12 +52,27 @@ export type DecimalsCache = Map<string, { base: number; quote: number }>;
  *
  * Matches on `symbol === "SOL/USDC"` / `"SOL/USDT"` (the convention used by
  * every pre-seeded registry.json entry and by register-poll.ts), falling
- * back to a `label` prefix check for entries that lack `symbol`.
+ * back to a `label` prefix check ONLY for entries that lack `symbol`.
+ *
+ * The precedence is load-bearing, not cosmetic (GH#163): the label is
+ * synthesised from the creator-supplied symbol, so an entry that has a symbol
+ * must never be judged on its label.
  */
 export function isSolUsdEntry(entry: Pick<MarketEntry, "dexType" | "label" | "symbol">): boolean {
   if (entry.dexType !== "raydium-clmm" && entry.dexType !== "meteora-dlmm") return false;
-  const sym = (entry.symbol ?? "").toUpperCase();
-  if (sym === "SOL/USDC" || sym === "SOL/USDT") return true;
+  const sym = (entry.symbol ?? "").trim();
+  if (sym) {
+    // GH#163: an entry that HAS a symbol is judged on the symbol alone. The label is
+    // SYNTHESISED from that symbol -- `${symbol}/USDC - ${dexType}` (db-markets.ts:91-93)
+    // -- so falling through to the prefix check let a creator-supplied symbol of "SOL"
+    // nominate its own market as the cycle's SOL/USD reference, which then denominates
+    // every pumpswap and WSOL-quoted mark. `SYMBOL_RE` forbids "/", so the canonical pair
+    // strings cannot be registered through the app.
+    const upper = sym.toUpperCase();
+    return upper === "SOL/USDC" || upper === "SOL/USDT";
+  }
+  // Only an entry with no symbol at all falls back to the label, which is what the
+  // contract above has always said: dry-run.ts:96 calls in exactly this shape.
   const label = (entry.label ?? "").toUpperCase();
   return label.startsWith("SOL/USDC") || label.startsWith("SOL/USDT");
 }
