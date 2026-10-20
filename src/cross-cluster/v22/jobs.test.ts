@@ -120,6 +120,27 @@ describe("tag 106 holding rent", () => {
     const none = await settleRentOnce(execCtx(f.conn), v22Ctx(), p, freshRentState(), { cadenceSlots: 9000, pairingActive: true });
     assert.equal(none.outcomes.length, 0);
   });
+  // AUD-S1-4 follow-up: tag 106 does ONE rent-bearing capped segment per call (wrapper 48d762ca). While the asset lags by a full
+  // window or more a lone 106 cannot reach `now` and settles only part of the gap, so the rent round waits for the crank
+  // catch-up (loop.ts runs it first; this is the same gate for the sweep-off timer path and for the planner).
+  it("rent waits for the crank catch-up: a lagging asset (gap >= max_accrual_dt) plans and sends nothing; caught up (or inside one window) it settles", async () => {
+    const lagging = v22Ctx({ rent: true, currentSlot: 5000n, slotLast: 4000n }); // gap 1000 slots, window 150
+    const p = positioned([pf(1), pf(2)]);
+    assert.equal(planRentSettles(lagging, p, freshRentState(), 9000, true, 4).due.length, 0, "no rent plan while the asset lags");
+    const f = fakeExecConn();
+    const r = await settleRentOnce(execCtx(f.conn), lagging, p, freshRentState(), { cadenceSlots: 9000, pairingActive: true });
+    assert.equal(r.outcomes.length, 0);
+    assert.equal(f.sent.length, 0, "no tag 106 sent while lagging");
+    // exactly one window behind is still a catch-up crank (catchupCrankCount = 1): hold
+    assert.equal(planRentSettles(v22Ctx({ rent: true, currentSlot: 5000n, slotLast: 4850n }), p, freshRentState(), 9000, true, 4).due.length, 0);
+    // negative controls: inside one window, and fully caught up, rent is planned and sent as before
+    assert.equal(planRentSettles(v22Ctx({ rent: true, currentSlot: 5000n, slotLast: 4851n }), p, freshRentState(), 9000, true, 4).due.length, 2);
+    const caught = v22Ctx({ rent: true, currentSlot: 5000n, slotLast: 5000n });
+    const g = fakeExecConn();
+    const r2 = await settleRentOnce(execCtx(g.conn), caught, p, freshRentState(), { cadenceSlots: 9000, pairingActive: true });
+    assert.equal(r2.outcomes.length, 2);
+    assert.ok(g.sent.every((s) => s.tags[0] === 106));
+  });
   it("a band expected state counts as visited (retry at the cadence) and as expected, not a failure", async () => {
     const ctx = v22Ctx({ rent: true });
     const p = positioned([pf(1)]);
