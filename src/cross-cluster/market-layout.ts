@@ -100,6 +100,13 @@ export interface MarketLayout {
   /** Offsets relative to the engine slot base (AssetStateV16Account is its first field). */
   asset: {
     lifecycle: number;
+    /**
+     * GH#172: `raw_oracle_target_price` — the last AuthMark PUSHED for this asset, as opposed to
+     * `effectivePrice`, which is the engine's walked mark and lags it by the per-slot step cap. This
+     * is the trusted-but-possibly-stale value the cross-cluster circuit breaker seeds its baseline
+     * from on a cold start, so a restart cannot accept an unbounded first price.
+     */
+    rawOracleTargetPrice: number;
     effectivePrice: number;
     slotLast: number;
     kfEpochLong: number;
@@ -137,6 +144,8 @@ export interface MarketLayout {
 /** AssetStateV16Account prefix: unchanged from v2.1 through v2.2 (Wave B appends after mode_short). */
 const ASSET_V21 = {
   lifecycle: 16,
+  // AssetStateV16Account: market_id 0..8, retired_slot 8..16, lifecycle 16, then the two prices.
+  rawOracleTargetPrice: 17,
   effectivePrice: 25,
   slotLast: 41,
   kfEpochLong: 145,

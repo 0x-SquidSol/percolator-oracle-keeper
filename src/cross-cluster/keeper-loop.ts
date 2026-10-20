@@ -45,7 +45,7 @@ import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth
 import { DEPTH_SOURCE_ONCHAIN_DEX, DepthSourceCache, pushDepthOnchainEnabled, type DexDepthPin } from "./depth-source.ts";
 import { WRAPPER_PROGRAM_ID as DEPTH_WRAPPER_PROGRAM_ID } from "../program-ids.ts";
 import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, pruneMarketAccrual } from "./multi-asset.ts";
-import { DEADLINE_FRESH_MS, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
+import { DEADLINE_FRESH_MS, getOnChainMarkE6, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
 import type { PriceUnit } from "./multi-asset.ts";
 import { pushGenerationKey } from "./auth-mark-pusher.ts";
@@ -923,6 +923,11 @@ export function samplePoolsForCycle(
 }
 
 /** Test hook: forget which pools are primed (the smoothers themselves are module-private). */
+/** GH#172 test seam: forget every breaker baseline, so a test can simulate a fresh process. */
+export function resetCrossClusterCircuitBreakerStates(): void {
+  crossClusterCircuitBreakerStates.clear();
+}
+
 export function resetPrimedPools(): void {
   primedPools.clear();
 }
@@ -986,20 +991,48 @@ if (CROSS_CLUSTER_CIRCUIT_BREAKER_CONFIRM_TRIPS < 2) {
 
 const crossClusterCircuitBreakerStates = new Map<string, CircuitBreakerState>();
 
-function getCrossClusterCircuitBreakerState(
-  marketAddress: string,
+/**
+ * GH#172: exported as a test seam (like `resetPrimedPools` below) so the SEEDING WIRING is covered,
+ * not just the decode and the breaker arithmetic. Without this the one line that passes
+ * `{ marketAddress, assetIndex }` from the push loop would be checked only by tsc and review.
+ */
+export function getCrossClusterCircuitBreakerState(
+  unitKey: string,
   label: string,
+  seed?: { marketAddress: string; assetIndex: number },
 ): CircuitBreakerState {
-  let state = crossClusterCircuitBreakerStates.get(marketAddress);
+  let state = crossClusterCircuitBreakerStates.get(unitKey);
   if (!state) {
+    // GH#172: seed the baseline from the asset's last PUSHED mark on chain instead of 0.
+    //
+    // This map is in memory, so without a seed every market's first push after every restart takes
+    // `checkCircuitBreaker`'s "First price — always accept" branch and is bounded by nothing. That
+    // is closed issue #33, whose fix (a secondary-source cross-check in `pushAndCrank`) left the
+    // tree with that function in the cross-cluster rewrite; only a replica in
+    // `security-fixes.test.ts` survives, so the suite still reports it covered.
+    //
+    // The seed is the "stale but TRUSTED" value `mark-smoother.ts` already prefers to an
+    // unconfirmed one, and it costs no extra RPC: `recordPushDeadline` caches it from the market
+    // reads the cranker already performs (including the one at boot, before the first push cycle).
+    // When nothing has been read for the unit yet the seed is absent and behaviour is unchanged —
+    // a deliberate fail-OPEN, because withholding here would brick pushes on a market the keeper
+    // has never read, which is a worse failure than today's bound. The log line below makes the
+    // unseeded case visible rather than silent.
+    const seedE6 = seed ? getOnChainMarkE6(seed.marketAddress, seed.assetIndex) : null;
+    if (seedE6 === null) {
+      console.warn(
+        `[loop] ${label}: circuit breaker starting UNSEEDED (no on-chain mark read yet) — ` +
+          `the first push is unbounded (GH#172)`,
+      );
+    }
     state = {
       symbol: label,
-      lastPrice: 0,
+      lastPrice: seedE6 === null ? 0 : priceE6ToUsdNumber(seedE6),
       circuitBreakerTrips: 0,
       cbTripPrice: 0,
       cbConsecutiveTrips: 0,
     };
-    crossClusterCircuitBreakerStates.set(marketAddress, state);
+    crossClusterCircuitBreakerStates.set(unitKey, state);
   }
   return state;
 }
@@ -1348,6 +1381,7 @@ async function runCycle(
     const currentCircuitBreakerState = getCrossClusterCircuitBreakerState(
       entry.key,
       entry.label,
+      { marketAddress: entry.marketAddress, assetIndex: entry.assetIndex },
     );
     const candidateCircuitBreakerState = cloneCircuitBreakerState(
       currentCircuitBreakerState,

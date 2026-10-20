@@ -151,10 +151,67 @@ export function recordPushDeadline(marketAddress: string, data: Uint8Array, read
     if (prev?.deadline.terminal) return prev.deadline;
     const d = pushDeadlineOf(data, readSlot);
     if (d) byMarket.set(marketAddress, { deadline: d, atMs });
+    // GH#172: the same read also seeds the circuit breaker's cold-start baseline.
+    recordOnChainMarks(marketAddress, data);
     return d;
   } catch {
     return null;
   }
+}
+
+// ── GH#172: the last PUSHED mark per asset, for cold-start circuit-breaker seeding ─────────────────────────────────
+//
+// `crossClusterCircuitBreakerStates` lives in memory, so after a restart every market's `lastPrice`
+// is 0 and `checkCircuitBreaker` takes its "First price — always accept" branch: the first push of
+// every market after every restart is unbounded. Closed issue #33 was exactly that, and its fix (a
+// secondary-source cross-check inside `pushAndCrank`) left the tree with that function in the
+// cross-cluster rewrite -- only a REPLICA of it in `security-fixes.test.ts` survives, which is why
+// the suite still reports #33 as covered. See GH#172.
+//
+// Seeding the baseline from chain restores the bound without adding a second price feed: the value
+// cached here is what was last PUBLISHED for the asset, i.e. the "stale but TRUSTED" reading
+// `mark-smoother.ts` already prefers over an unconfirmed one. `raw_oracle_target_price` rather than
+// `effective_price` because the former is the pushed target and the latter lags it by the engine's
+// per-slot step cap, which would make the baseline drift conservative-but-wrong after a gap.
+
+/** `market` or `market:assetIndex` -> that asset's `raw_oracle_target_price` (e6) at the last read. */
+const marksByUnit = new Map<string, bigint>();
+
+/** The cache key the push loop uses for a unit: single-asset markets key on the market alone. */
+export function markUnitKey(marketAddress: string, assetIndex: number): string {
+  return assetIndex === 0 ? marketAddress : `${marketAddress}:${assetIndex}`;
+}
+
+/**
+ * Decode every asset slot's last pushed mark from a market read and cache it. Never throws: an
+ * account this keeper cannot decode simply leaves its units unseeded, and the breaker then behaves
+ * exactly as it does today.
+ */
+export function recordOnChainMarks(marketAddress: string, data: Uint8Array): void {
+  try {
+    const det = detectLayout(data);
+    if (!det.known) return;
+    for (let i = 0; i < det.slots; i++) {
+      const base = engineSlotBase(det.layout, i);
+      const lifecycle = data[base + det.layout.asset.lifecycle];
+      // Only a tradable asset has a mark worth trusting as a baseline.
+      if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
+      const mark = u64(data, base + det.layout.asset.rawOracleTargetPrice);
+      if (mark > 0n) marksByUnit.set(markUnitKey(marketAddress, i), mark);
+    }
+  } catch {
+    // leave unseeded
+  }
+}
+
+/** The cached last-pushed mark (e6) for a unit, or null when nothing has been read for it yet. */
+export function getOnChainMarkE6(marketAddress: string, assetIndex: number): bigint | null {
+  return marksByUnit.get(markUnitKey(marketAddress, assetIndex)) ?? null;
+}
+
+/** Test seam. */
+export function resetOnChainMarks(): void {
+  marksByUnit.clear();
 }
 
 /** The cached deadline, or undefined. `maxAgeMs` (default: any age) bounds how old a LIVE entry may be; terminal never ages. */
