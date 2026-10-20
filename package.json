@@ -30,12 +30,14 @@
   },
   "overrides": {
     "ws@>=7.0.0 <7.5.11": "7.5.13",
-    "ws@>=8.0.0 <8.20.2": "8.22.0"
+    "ws@>=8.0.0 <8.20.2": "8.22.0",
+    "bigint-buffer": "file:./vendor/bigint-buffer"
   },
   "pnpm": {
     "overrides": {
       "ws@>=7.0.0 <7.5.11": "7.5.13",
-      "ws@>=8.0.0 <8.20.2": "8.22.0"
+      "ws@>=8.0.0 <8.20.2": "8.22.0",
+      "bigint-buffer": "file:./vendor/bigint-buffer"
     }
   }
 }
