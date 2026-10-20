@@ -24,7 +24,7 @@ describe("flags OFF: no behaviour change", () => {
   it("every v2.2 flag defaults OFF (G9 dry-run defaults ON, the lone LP crank defaults ON = today)", () => {
     const f = v22FlagsFromEnv({});
     assert.equal(f.enabled, false);
-    for (const k of ["dryRun", "feeCrankBond", "sweep", "holdingRent", "dustSweep", "g9", "g9AllowAnyOracleMode", "stakeSync", "earnExit"] as const) assert.equal(f[k], false, k);
+    for (const k of ["dryRun", "feeCrankBond", "sweep", "holdingRent", "dustSweep", "g9", "g9AllowAnyOracleMode", "stakeSync", "stakeCommitTarget", "earnExit"] as const) assert.equal(f[k], false, k);
     assert.equal(f.g9DryRun, true);
     assert.equal(f.loneLpCrank, true);
     assert.equal(f.pairing, "prefer");

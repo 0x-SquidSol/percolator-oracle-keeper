@@ -26,6 +26,7 @@
  *   KEEPER_V22_G9_DRAW_CAP_ATOMS  cap passed to draw (mode 0) in atoms (default 18446744073709551615 = "the program's own caps decide")
  *   KEEPER_V22_STAKE_SYNC         stake tag 31 SyncInsuranceDeployment
  *   KEEPER_V22_STAKE_SYNC_INTERVAL_MS  minimum ms between syncs of one pool (default 60000)
+ *   KEEPER_V22_STAKE_COMMIT_TARGET  stake tag 33 CommitDeployTarget once a proposed deploy target's timelock has elapsed (permissionless; DEFAULT OFF)
  *   KEEPER_V22_EARN_EXIT          keeper-executed Earn exits (tag 77, keeper_ok requests)
  *   KEEPER_V22_MAINNET_BUILD      "on": the wrapper is a mainnet-flavoured build (G9 modes 0 and 2 take the allowlist + leg accounts)
  *   KEEPER_V22_ACCRUE_ANCHORS     "market:flatPortfolio,..." accrue-only crank targets (optional; else discovered)
@@ -62,6 +63,8 @@ export interface V22Flags {
   g9DrawCapAtoms: bigint;
   stakeSync: boolean;
   stakeSyncIntervalMs: number;
+  /** Stake tag 33 CommitDeployTarget after the tag-32 timelock (default OFF). */
+  stakeCommitTarget: boolean;
   earnExit: boolean;
   loneLpCrank: boolean;
   mainnetBuild: boolean;
@@ -106,7 +109,7 @@ const U64_MAX = (1n << 64n) - 1n;
 export const V22_FLAG_DEFAULTS: V22Flags = {
   enabled: false, dryRun: false, tickMs: 20_000, feeCrankBond: false, sweep: false, liquidate: false, liquidatePadBps: 500, liquidateMaxPerTx: 4, pairing: "prefer", holdingRent: false,
   rentCadenceSlots: 9_000, dustSweep: false, g9: false, g9DryRun: true, g9AllowAnyOracleMode: false, g9DrawCapAtoms: U64_MAX,
-  stakeSync: false, stakeSyncIntervalMs: 60_000, earnExit: false, loneLpCrank: true, mainnetBuild: false, lpMaxUnsettledMs: 300_000,
+  stakeSync: false, stakeSyncIntervalMs: 60_000, stakeCommitTarget: false, earnExit: false, loneLpCrank: true, mainnetBuild: false, lpMaxUnsettledMs: 300_000,
 };
 
 export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
@@ -151,6 +154,7 @@ export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
     g9DrawCapAtoms: cap,
     stakeSync: parseFlag(env, "KEEPER_V22_STAKE_SYNC", false),
     stakeSyncIntervalMs: posInt(env, "KEEPER_V22_STAKE_SYNC_INTERVAL_MS", 60_000),
+    stakeCommitTarget: parseFlag(env, "KEEPER_V22_STAKE_COMMIT_TARGET", false),
     earnExit: parseFlag(env, "KEEPER_V22_EARN_EXIT", false),
     // today's behaviour unless explicitly turned off
     loneLpCrank,
@@ -176,6 +180,7 @@ export function describeV22Flags(f: V22Flags): Record<string, string | number | 
     g9: f.g9,
     g9DryRun: f.g9DryRun,
     stakeSync: f.stakeSync,
+    stakeCommitTarget: f.stakeCommitTarget,
     earnExit: f.earnExit,
     loneLpCrank: f.loneLpCrank,
     lpMaxUnsettledMs: f.lpMaxUnsettledMs,

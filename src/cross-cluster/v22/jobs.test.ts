@@ -9,6 +9,7 @@ import { freshRentState, planRentSettles, settleRentOnce } from "./rent.ts";
 import { dustCandidates, freshDustState, sweepDustOnce } from "./dust.ts";
 import { decideG9, freshG9State, g9ExtraTail, g9Once, oracleQualifies } from "./g9.ts";
 import { freshStakeSyncState, stakeSyncOnce } from "./stake-sync.ts";
+import { commitDueSlot, freshStakeCommitTargetState, stakeCommitTargetOnce } from "./stake-commit-target.ts";
 import { bookIsLossCurrent, executeKeeperExits, selectKeeperRequests } from "./earn-exit.ts";
 import { bandHealthFor, pinLevelOf } from "./band.ts";
 import type { V22Positioned } from "./positioned.ts";
@@ -307,6 +308,73 @@ describe("stake v5 sync (tag 31)", () => {
       assert.equal(r.kind, "skipped", JSON.stringify(o));
     }
     assert.equal(f.sims.length, 0, "no simulation, no send");
+    assert.equal(f.sent.length, 0);
+  });
+});
+
+describe("stake v5 CommitDeployTarget (tag 33, KEEPER_V22_STAKE_COMMIT_TARGET)", () => {
+  function pendingPool(pendingSlot: bigint, cooldown = 150n): Uint8Array {
+    const F = STAKE_POOL_FIELD_OFF_V5;
+    const b = Buffer.alloc(STAKE_POOL_SIZE_V5);
+    "SPOOL_V1".split("").forEach((c, i) => (b[F.reserved + i] = c.charCodeAt(0)));
+    b[F.version] = 5;
+    b[F.riskMode] = 1;
+    b.writeBigUInt64LE(cooldown, 184); // pool.cooldown_slots (withdrawal cooldown)
+    b.writeBigUInt64LE(4000n, F.pendingTargetBps);
+    b.writeBigUInt64LE(pendingSlot, F.pendingTargetSlot);
+    return new Uint8Array(b);
+  }
+  it("due slot = pending slot + max(cooldown, 216,000)", () => {
+    assert.equal(commitDueSlot({ pendingTargetSlot: 1000n, cooldownSlots: 150n }), 1000n + 216_000n);
+    assert.equal(commitDueSlot({ pendingTargetSlot: 1000n, cooldownSlots: 300_000n }), 1000n + 300_000n);
+  });
+  it("nothing pending -> skipped, never simulated", async () => {
+    const f = fakeExecConn();
+    const r = await stakeCommitTargetOnce(execCtx(f.conn), v22Ctx(), pendingPool(0n), freshStakeCommitTargetState());
+    assert.equal(r.kind, "skipped");
+    assert.equal(f.sims.length, 0);
+    assert.equal(f.sent.length, 0);
+  });
+  it("timelock not elapsed -> waiting with the due slot, no simulation, no send (negative control)", async () => {
+    const ctx = v22Ctx(); // read slot 5000
+    const f = fakeExecConn();
+    const r = await stakeCommitTargetOnce(execCtx(f.conn), ctx, pendingPool(4000n), freshStakeCommitTargetState());
+    assert.equal(r.kind, "waiting");
+    if (r.kind === "waiting") assert.equal(r.dueSlot, 4000n + 216_000n);
+    assert.equal(f.sims.length, 0);
+    assert.equal(f.sent.length, 0);
+  });
+  it("timelock elapsed -> sends stake tag 33 with [signer, pool writable, clock]; a second tick sees nothing pending", async () => {
+    const late = v22Ctx({ currentSlot: 400_000n });
+    const st = freshStakeCommitTargetState();
+    const g = fakeExecConn();
+    const r = await stakeCommitTargetOnce(execCtx(g.conn), late, pendingPool(100_000n), st);
+    assert.equal(r.kind, "sent");
+    assert.equal(g.sent[0].tags[0], 33);
+    assert.equal(g.sent[0].keys[0].length, 3);
+    assert.equal(st.committed, 1);
+    // exactly at the due slot minus one: still waiting (boundary control)
+    const edge = v22Ctx({ currentSlot: 100_000n + 216_000n - 1n });
+    assert.equal((await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), edge, pendingPool(100_000n), freshStakeCommitTargetState())).kind, "waiting");
+    const atDue = v22Ctx({ currentSlot: 100_000n + 216_000n });
+    assert.equal((await stakeCommitTargetOnce(execCtx(fakeExecConn().conn), atDue, pendingPool(100_000n), freshStakeCommitTargetState())).kind, "sent");
+  });
+  it("40 NoPendingDeployTarget (a race) is quiet and backed off; another code is a refusal", async () => {
+    const late = v22Ctx({ currentSlot: 400_000n });
+    const f = fakeExecConn({ simErr: () => customAt(0, 40) });
+    const st = freshStakeCommitTargetState();
+    assert.equal((await stakeCommitTargetOnce(execCtx(f.conn), late, pendingPool(100_000n), st)).kind, "quiet");
+    assert.equal((await stakeCommitTargetOnce(execCtx(f.conn), late, pendingPool(100_000n), st)).kind, "backoff");
+    assert.equal(f.sims.length, 1, "no retry-spam");
+    const g = fakeExecConn({ simErr: () => customAt(0, 38) });
+    assert.equal((await stakeCommitTargetOnce(execCtx(g.conn), late, pendingPool(100_000n), freshStakeCommitTargetState())).kind, "refused");
+    assert.equal(g.sent.length, 0);
+  });
+  it("dry-run simulates and sends nothing", async () => {
+    const late = v22Ctx({ currentSlot: 400_000n });
+    const f = fakeExecConn();
+    const r = await stakeCommitTargetOnce(execCtx(f.conn, true), late, pendingPool(100_000n), freshStakeCommitTargetState());
+    assert.equal(r.kind, "dry-run");
     assert.equal(f.sent.length, 0);
   });
 });

@@ -47,6 +47,7 @@ import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
 import { freshDustState, sweepDustOnce } from "./dust.ts";
 import { freshG9State, g9Once } from "./g9.ts";
 import { freshStakeSyncState, stakeSyncOnce } from "./stake-sync.ts";
+import { freshStakeCommitTargetState, stakeCommitTargetOnce } from "./stake-commit-target.ts";
 import { executeKeeperExits, fetchRedemptionRequests, freshEarnExitState } from "./earn-exit.ts";
 import { bandHealthFor } from "./band.ts";
 import type { BandHealth } from "./band.ts";
@@ -77,6 +78,7 @@ interface MarketRuntime {
   dust: ReturnType<typeof freshDustState>;
   g9: ReturnType<typeof freshG9State>;
   stake: ReturnType<typeof freshStakeSyncState>;
+  commitTarget: ReturnType<typeof freshStakeCommitTargetState>;
   quarantine: Map<string, bigint>;
   gapBackoff: GapBackoff;
   earn: ReturnType<typeof freshEarnExitState>;
@@ -103,6 +105,7 @@ interface MarketRuntime {
   lastG9: string | null;
   lastFee: string | null;
   lastStake: string | null;
+  lastCommitTarget: string | null;
   lastEarn: string | null;
   layoutNote: string | null;
   positionedCache: { at: number; value: V22Positioned } | null;
@@ -132,6 +135,7 @@ export class V22Loop {
         dust: freshDustState(),
         g9: freshG9State(),
         stake: freshStakeSyncState(),
+        commitTarget: freshStakeCommitTargetState(),
         quarantine: new Map(),
         gapBackoff: freshGapBackoff(),
         earn: freshEarnExitState(),
@@ -153,6 +157,7 @@ export class V22Loop {
         lastG9: null,
         lastFee: null,
         lastStake: null,
+        lastCommitTarget: null,
         lastEarn: null,
         layoutNote: null,
         positionedCache: null,
@@ -479,6 +484,12 @@ export class V22Loop {
           r.lastStake = s.kind;
           if (s.kind === "diverged") this.log(`[v22][stake-sync] ${ctx.label}: InsuranceReadingsDiverged(44): refused; backing off ${r.stake.diverged} time(s), no retry until the backoff ends`);
         }
+        if (f.stakeCommitTarget) {
+          const poolInfo = await this.d.conn.getAccountInfo(deriveStakePool(ctx.market, STAKE_PROGRAM_ID)[0], "processed");
+          const c = await stakeCommitTargetOnce(exec, ctx, poolInfo ? new Uint8Array(poolInfo.data) : null, r.commitTarget);
+          // "skipped: no pending deploy target" is the steady state; only a pending/waiting/sent target is worth a line in /health
+          if (!(c.kind === "skipped")) r.lastCommitTarget = c.kind;
+        }
         if (f.earnExit && this.now() - r.lastEarnAtMs >= 30_000) {
           r.lastEarnAtMs = this.now();
           const reqs = await fetchRedemptionRequests(this.d.conn, ctx);
@@ -502,6 +513,7 @@ export class V22Loop {
         ...(r.lastFee ? { fee78: r.lastFee } : {}),
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
         ...(r.lastStake ? { stakeSync: r.lastStake } : {}),
+        ...(r.lastCommitTarget ? { stakeCommitTarget: r.lastCommitTarget } : {}),
         ...(r.lastEarn ? { earnExit: r.lastEarn } : {}),
         ...(r.escalated.size > 0 ? { persistentDeferrals: [...r.escalated].map(([k, v]) => ({ portfolio: k, rounds: v.count, sinceMsAgo: this.now() - v.atMs })) } : {}),
         ...(this.layoutProblems.has(addr) ? { layoutProblem: redactErrorText(this.layoutProblems.get(addr) as string, 200) } : {}),
