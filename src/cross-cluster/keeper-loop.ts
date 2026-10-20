@@ -20,7 +20,7 @@ import http from "http";
 import { Connection, Keypair } from "@solana/web3.js";
 import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
-import { readAllPoolPricesE6 } from "./price-reader.ts";
+import { isSolUsdEntry, readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
 import type { MarkSmoother } from "./mark-smoother.ts";
 import { createTickPublisher, type TickPublisher, type TickInput } from "./tick-publisher.ts";
@@ -44,6 +44,16 @@ import type { SweepHealth } from "./positioned-sweep.ts";
 import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth.ts";
 import { DEPTH_SOURCE_ONCHAIN_DEX, DepthSourceCache, pushDepthOnchainEnabled, type DexDepthPin } from "./depth-source.ts";
 import { WRAPPER_PROGRAM_ID as DEPTH_WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import {
+  DepthSampleWindow,
+  bracketWarningLine,
+  conservativeReserves,
+  depthMinWindowMs,
+  depthPushJitterPct,
+  jitteredIntervalMs,
+  postPushRereadDelayMs,
+  recordPostPushReads,
+} from "./depth-bracketing.ts";
 import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, pruneMarketAccrual } from "./multi-asset.ts";
 import { DEADLINE_FRESH_MS, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
@@ -52,6 +62,8 @@ import { pushGenerationKey } from "./auth-mark-pusher.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
 const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
+/** SEC-RC L-3: short per-pool window of pre/post-push reserve reads; the attested (mode 1) reserve is its min. */
+const depthWindow = new DepthSampleWindow(depthMinWindowMs());
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -1240,6 +1252,11 @@ async function runCycle(
   }
   state.consecutiveBatchReadFailures = 0;
   state.lastBatchReadError = null;
+  // SEC-RC L-3: attest the MIN of this read and the recent pre/post-push reads, so liquidity added just before a push
+  // and pulled just after it is not what gets attested. Empty (and untouched) when depth pushes are off.
+  const attestReservesUsdE6 = pushDepthOn ? conservativeReserves(depthWindow, quoteReservesUsdE6, Date.now()) : quoteReservesUsdE6;
+  /** market key -> pool, for the pushes that carry a keeper-attested depth (the post-push re-read set). */
+  const attestedDepthPools = new Map<string, string>();
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
   const pushes: Array<{ key: string; multi: boolean; marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null; dex?: DexDepthPin | null }> = [];
@@ -1414,6 +1431,9 @@ async function runCycle(
     stat.lastPriceE6 = publish.priceE6;
     // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
     if (publish.priceE6 !== priceE6) smoothedE12 = null;
+    // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
+    const depth = resolvePushDepth(pushDepthOn, attestReservesUsdE6.get(entry.poolAddress));
+    if (depth) attestedDepthPools.set(entry.key, entry.poolAddress);
     pushes.push({
       key: entry.key,
       multi: entry.multi,
@@ -1421,8 +1441,7 @@ async function runCycle(
       assetIndex: entry.assetIndex,
       priceE6: publish.priceE6,
       ...(smoothedE12 ? { priceE12: smoothedE12 } : {}),
-      // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
-      depth: resolvePushDepth(pushDepthOn, quoteReservesUsdE6.get(entry.poolAddress)),
+      depth,
       // Round 2: the active, same-cluster pin (mode 2); the pusher re-checks it against the live generation.
       ...(pushDepthOnchain ? { dex: depthSourceCache.get(entry.marketAddress) } : {}),
     });
@@ -1566,6 +1585,15 @@ async function runCycle(
     if (res.pushed && res.signature) {
       state.lastSuccessfulPushAt = stamp;
       console.log(`[loop] batched push × ${res.count}: sig=${res.signature.slice(0, 16)}…`);
+      if (pushDepthOn) {
+        // SEC-RC L-3: re-read the attested pools a random 1-3 slots after the push; the next push attests the min.
+        const reread = new Set<string>();
+        for (const p of pushes) {
+          const pool = attestedDepthPools.get(p.key);
+          if (pool && pushedSet.has(p.marketAddress) && !dexPushed.has(p.marketAddress)) reread.add(pool);
+        }
+        await rereadDepthAfterPush(mainnetConn, units, reread, decimalsCache);
+      }
     } else if (config.dryRun && pushes.length > 0) {
       // Dry-run "pushes" count as liveness — the pipeline produced prices.
       state.lastSuccessfulPushAt = stamp;
@@ -1585,6 +1613,38 @@ async function runCycle(
       s.totalErrors++;
       s.lastErrorMsg = msg;
     }
+  }
+}
+
+/**
+ * SEC-RC L-3: the post-push depth re-read. Waits a CSPRNG-random 1-3 slots, re-reads the attested pools (plus the
+ * SOL/USD source rows a WSOL-quoted reserve needs) and records the reserves in the depth window. A sharp drop since the
+ * pre-push read is logged as a structured warning; the low sample is what the next push attests. Any read failure is
+ * logged and adds no sample (never a guess, never a zero).
+ */
+async function rereadDepthAfterPush(
+  mainnetConn: Connection,
+  units: readonly PriceUnit[],
+  pools: ReadonlySet<string>,
+  decimalsCache: DecimalsCache,
+): Promise<void> {
+  if (pools.size === 0) return;
+  await new Promise((r) => setTimeout(r, postPushRereadDelayMs()));
+  const rows = units.filter((u) => u.source === "pool" && (pools.has(u.poolAddress) || isSolUsdEntry({ dexType: u.dexType as DexType, label: u.label, symbol: u.symbol })));
+  const seen = new Set<string>();
+  const entries = rows
+    .filter((u) => (seen.has(u.poolAddress) ? false : (seen.add(u.poolAddress), true)))
+    .map((u) => ({ poolAddress: u.poolAddress, dexType: u.dexType as DexType, label: u.label, symbol: u.symbol, mainnetCa: u.mainnetCa }));
+  const post = new Map<string, bigint>();
+  try {
+    await readAllPoolPricesE6(mainnetConn, entries, decimalsCache, process.env.SOL_USD_REFERENCE_POOL, undefined, undefined, post);
+  } catch (err) {
+    console.warn(`[loop] post-push depth re-read failed (no sample): ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`);
+    return;
+  }
+  const labelOf = new Map(rows.map((u) => [u.poolAddress, u.label] as const));
+  for (const s of recordPostPushReads(depthWindow, post, pools, Date.now())) {
+    console.warn(bracketWarningLine(s, labelOf.get(s.pool) ?? s.pool));
   }
 }
 
@@ -1845,6 +1905,11 @@ export async function startKeeperLoop(
       ` ${registry.markets.length} markets, interval=${config.intervalMs}ms`,
   );
 
+  const depthJitterPct = depthPushJitterPct(pushDepthEnabled());
+  if (depthJitterPct > 0) {
+    console.log(`[keeper] depth-push jitter: interval drawn from [${config.intervalMs - Math.floor((config.intervalMs * depthJitterPct) / 100)}, ${config.intervalMs}]ms (SEC-RC L-3)`);
+  }
+
   // Main loop
   while (!stopping) {
     const cycleStart = Date.now();
@@ -1890,7 +1955,8 @@ export async function startKeeperLoop(
     await reportPushCycle(state, countPushableMarkets(priceUnitsOfRegistry(registry.markets), state.terminalMarkets) - (state.standbyThisCycle?.size ?? 0));
     await reportMarketPush(state, registry);
     const elapsed = Date.now() - cycleStart;
-    const remaining = config.intervalMs - elapsed;
+    // SEC-RC L-3: with depth pushes on, the cadence is jittered DOWNWARD only (never above intervalMs).
+    const remaining = jitteredIntervalMs(config.intervalMs, depthJitterPct) - elapsed;
     if (remaining > 0 && !stopping) {
       await new Promise((r) => setTimeout(r, remaining));
     }
