@@ -436,6 +436,12 @@ export class V22Loop {
       status: r.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES ? "loss-stale" : "ok",
       layout: { id: ctx.layout.id, problem: null, kind: "ok", accountLen: ctx.data.length, provisional: ctx.layout.provisional, hasPositions: positioned.all.length > 0 },
       updatedAt: this.now(),
+      // GH#181: the slot pair, so `slot-lag` can be evaluated for a v2.2 market. `readSlot` is
+      // the RPC context slot of this cycle's read; `post.slotLast` is the engine's clock after
+      // our cranks. Same reason as the K-9 ADL back-fill below: this record REPLACES the
+      // cranker's, so anything the evaluator needs has to be in it.
+      chainSlot: BigInt(ctx.readSlot),
+      engineSlot: post.slotLast,
       // K-9: this record replaces the cranker's on v2.2 sweep markets, so it must carry the ADL state itself.
       ...adlHealthOf(postData ?? ctx.data),
     });

@@ -74,6 +74,15 @@ export interface CrankRefreshHealth {
   layout?: MarketLayoutHealth;
   updatedAt: number;
   /**
+   * GH#181: the chain slot and the engine's `slot_last` at this cycle's read. The v2.2 layer's
+   * record REPLACES the cranker's on a sweep market (see the K-9 note in v22/loop.ts), so the
+   * slot pair has to live here too or `slot-lag` -- the #133 condition -- cannot be evaluated
+   * for any v2.2 market. Optional: records written before this field, and any writer that does
+   * not know the chain slot, produce no slot-lag verdict rather than a wrong one.
+   */
+  chainSlot?: bigint;
+  engineSlot?: bigint | null;
+  /**
    * Drift-layout markets (continuous sweep): bound-vs-insurance coverage, stale and
    * laggard counts, pace. Absent on legacy markets, so their /health is unchanged.
    */
