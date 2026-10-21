@@ -20,6 +20,7 @@ import type { ExecContext, ExecOutcome } from "./exec.ts";
 import type { V22MarketCtx } from "./market.ts";
 import type { V22Positioned } from "./positioned.ts";
 import { legAwareTxUnits, portfolioWeight } from "./settle-pairing.ts";
+import { catchupCrankCount } from "../positioned-refresh.ts";
 
 export interface RentState {
   /** `market|portfolio` -> slot of the last settle (landed or dry-run). */
@@ -39,8 +40,20 @@ export interface RentPlan {
   skippedLp: boolean;
 }
 
-/** Portfolios due for a rent settle: never settled, or older than the cadence; heaviest first. Pure. */
+/**
+ * AUD-S1-4 follow-up. Tag 106 accrues ONE rent-bearing capped segment (max_accrual_dt_slots) per call, then refreshes the
+ * portfolio pinned to the slot that segment reached (wrapper 48d762ca). While the asset lags by a full window or more, a lone
+ * 106 cannot reach the read slot: it settles a little less per call. Rent is index-based and nothing is lost, but the rent
+ * round should run only after the crank catch-up has brought `slot_last` to within one window of the read slot, which is
+ * exactly when `catchupCrankCount` is 0 (the same threshold loop.ts uses to send catch-up cranks first). Pure.
+ */
+export function rentHeldForCatchup(ctx: Pick<V22MarketCtx, "readSlot" | "refresh">): boolean {
+  return catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots) > 0;
+}
+
+/** Portfolios due for a rent settle: never settled, or older than the cadence; heaviest first. Empty while the asset lags (see rentHeldForCatchup). Pure. */
 export function planRentSettles(ctx: V22MarketCtx, positioned: V22Positioned, st: RentState, cadenceSlots: number, pairingActive: boolean, maxPerTick: number): RentPlan {
+  if (rentHeldForCatchup(ctx)) return { due: [], skippedLp: false };
   const now = BigInt(ctx.readSlot);
   const rows: RentPlan["due"] = [];
   let skippedLp = false;
