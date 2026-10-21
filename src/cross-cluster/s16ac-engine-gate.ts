@@ -14,9 +14,13 @@
  * POSITIVE match only. The known S1-6 a/c builds (RC-S16AC.md §2 / §8.1, canonical double builds):
  *   rc-s16ac-build1.so        ddd5a2fa…89fa5  2,649,976 B  first 4096 B sha256 4613f80e…ac61  (wrapper 367e3d08)
  *   rollback-s16ac-build1.so  bae71e12…5c20   2,630,896 B  first 4096 B sha256 0c5eb29e…1fda  (wrapper 0e8bb0c9)
- * The rollback keeps engine e59aa6a6, so it keeps the wait (SEC-RC §S16AC). Anything else (the RC 357fc23f, its
- * rollback fac4d19c, today's deployed build, an unreadable account) is "other" or "unknown", and the gate is OFF:
- * behaviour before the upgrade is unchanged.
+ *   rc2-s16ac-build1.so       4fe8fd53…ac16   2,652,488 B  first 4096 B sha256 7d4d6e56…fe2d  (wrapper 7f368f0e; RC2.md §3)
+ *   rollback2-s16ac-build1.so b6aec357…45e1   2,630,928 B  first 4096 B sha256 d957421d…b4ef  (wrapper 9e54004c)
+ * The rollbacks keep engine e59aa6a6, so they keep the wait (SEC-RC §S16AC). Anything else (RC 357fc23f / rollback
+ * fac4d19c, RC2 cc720a0e / rollback2 8b57d488, today's deployed build, an unreadable account) is "other" or "unknown",
+ * and the gate is OFF: behaviour before the upgrade is unchanged.
+ *
+ * THE GATE MUST MATCH THE BUILD THAT IS FINALLY DEPLOYED: if a different S1-6 a/c build ships, add its fingerprint.
  *
  * A later rebuild on e59aa6a6 will read as "other": add its fingerprint here in the same runbook step that deploys it.
  */
@@ -32,6 +36,8 @@ export const PROGRAMDATA_ELF_OFFSET = 45;
 export const S16AC_WRAPPER_ELF_PREFIX_SHA256: ReadonlySet<string> = new Set([
   "4613f80ecbab0d2157e16005ad08ad332d291f14f3329bce6dfaded47ce0ac61", // rc-s16ac-build1.so (367e3d08)
   "0c5eb29e16466c52551697118d9f2e7e5a372b4815c7dbb272dcfa0332551fda", // rollback-s16ac-build1.so (0e8bb0c9)
+  "7d4d6e5687d67ec1b1e106f2064ea2f249cb3074927426e25f19c1025365fe2d", // rc2-s16ac-build1.so (7f368f0e) — the RC2 variant
+  "d957421dad0766aec7ec8fb595db48fe9ef683a71d74503066c545a21df1b4ef", // rollback2-s16ac-build1.so (9e54004c)
 ]);
 
 export type S16acState = "s16ac" | "other" | "unknown";

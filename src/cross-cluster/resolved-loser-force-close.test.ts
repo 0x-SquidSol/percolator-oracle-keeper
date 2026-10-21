@@ -49,6 +49,11 @@ const ELF = {
   s16acRollback: fx("wrapper-elf4096-rollback-s16ac-bae71e12"),
   rc: fx("wrapper-elf4096-rc-357fc23f"),
   rcRollback: fx("wrapper-elf4096-rollback-fac4d19c"),
+  // RC2 (RC2.md §3): the build that will ship. Its S1-6 a/c pair must read ON, plain RC2 / rollback2 OFF.
+  rc2s16ac: fx("wrapper-elf4096-rc2-s16ac-4fe8fd53"),
+  rc2s16acRollback: fx("wrapper-elf4096-rollback2-s16ac-b6aec357"),
+  rc2: fx("wrapper-elf4096-rc2-cc720a0e"),
+  rc2Rollback: fx("wrapper-elf4096-rollback2-8b57d488"),
 };
 const PROGRAMDATA = PublicKey.unique();
 
@@ -225,6 +230,12 @@ describe("I-S1: the S1-6 a/c engine gate (deployed wrapper ELF fingerprint)", ()
     assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc)), "other");
     assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rcRollback)), "other");
   });
+  it("RC2 (the shipping build): rc2-s16ac 4fe8fd53 and rollback2-s16ac b6aec357 are S1-6 a/c; plain RC2 cc720a0e and rollback2 8b57d488 are not", () => {
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc2s16ac)), "s16ac");
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc2s16acRollback)), "s16ac");
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc2)), "other");
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc2Rollback)), "other");
+  });
   it("unreadable / short / zeroed bytes are unknown (gate off), and unknown is re-read rather than cached", async () => {
     assert.equal(classifyS16acElfPrefix(null), "unknown");
     assert.equal(classifyS16acElfPrefix(new Uint8Array(100)), "unknown");
@@ -333,6 +344,13 @@ describe("I-S1: resolved loser force-close (S1-6 a/c deployed)", () => {
     assert.ok(lines.some((l) => l.includes('"event":"wait_unresolved"')));
   });
 
+  for (const [name, elf] of [["RC2 S1-6 a/c 4fe8fd53", ELF.rc2s16ac], ["RC2 S1-6 a/c rollback2 b6aec357", ELF.rc2s16acRollback]] as const) {
+    it(`deployed ${name}: after the delay the loser is force-closed`, async () => {
+      const w = world({ elf, nowSlot: AFTER });
+      assert.equal((await run(w, AFTER)).outcome, "closed");
+    });
+  }
+
   it("the S1-6 a/c ROLLBACK (bae71e12, same engine) keeps the job on", async () => {
     const w = world({ elf: ELF.s16acRollback, nowSlot: AFTER });
     assert.equal((await run(w, AFTER)).outcome, "closed");
@@ -347,7 +365,7 @@ describe("I-S1: resolved loser force-close (S1-6 a/c deployed)", () => {
 });
 
 describe("I-S1 NEGATIVE CONTROLS: behaviour before the upgrade is unchanged", () => {
-  for (const [name, elf] of [["RC 357fc23f", ELF.rc], ["RC rollback fac4d19c", ELF.rcRollback]] as const) {
+  for (const [name, elf] of [["RC 357fc23f", ELF.rc], ["RC rollback fac4d19c", ELF.rcRollback], ["RC2 cc720a0e", ELF.rc2], ["RC2 rollback2 8b57d488", ELF.rc2Rollback]] as const) {
     it(`deployed ${name}: after the delay the job is inert (one gate read, no simulation, no send)`, async () => {
       const w = world({ elf, nowSlot: AFTER });
       const r = await run(w, AFTER);
