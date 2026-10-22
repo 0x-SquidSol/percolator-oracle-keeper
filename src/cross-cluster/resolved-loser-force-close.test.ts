@@ -54,6 +54,11 @@ const ELF = {
   rc2s16acRollback: fx("wrapper-elf4096-rollback2-s16ac-b6aec357"),
   rc2: fx("wrapper-elf4096-rc2-cc720a0e"),
   rc2Rollback: fx("wrapper-elf4096-rollback2-8b57d488"),
+  // RC2.2 (Option B, 2026-10-22): canonical = the S1-6 a/c twin; the plain twins must read OFF.
+  rc22s16ac: fx("wrapper-elf4096-rc22-s16ac-776d2491"),
+  rc22s16acRollback: fx("wrapper-elf4096-rollback4b-s16ac-3958c36b"),
+  rc22: fx("wrapper-elf4096-rc22-9b630735"),
+  rc22Rollback: fx("wrapper-elf4096-rollback4b-71a891b9"),
 };
 const PROGRAMDATA = PublicKey.unique();
 
@@ -236,6 +241,12 @@ describe("I-S1: the S1-6 a/c engine gate (deployed wrapper ELF fingerprint)", ()
     assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc2)), "other");
     assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc2Rollback)), "other");
   });
+  it("RC2.2 (canonical, Option B): rc22-s16ac 776d2491 and rollback4b-s16ac 3958c36b are S1-6 a/c; plain rc22 9b630735 and rollback4b 71a891b9 are not", () => {
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc22s16ac)), "s16ac");
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc22s16acRollback)), "s16ac");
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc22)), "other");
+    assert.equal(classifyS16acElfPrefix(new Uint8Array(ELF.rc22Rollback)), "other");
+  });
   it("unreadable / short / zeroed bytes are unknown (gate off), and unknown is re-read rather than cached", async () => {
     assert.equal(classifyS16acElfPrefix(null), "unknown");
     assert.equal(classifyS16acElfPrefix(new Uint8Array(100)), "unknown");
@@ -344,7 +355,7 @@ describe("I-S1: resolved loser force-close (S1-6 a/c deployed)", () => {
     assert.ok(lines.some((l) => l.includes('"event":"wait_unresolved"')));
   });
 
-  for (const [name, elf] of [["RC2 S1-6 a/c 4fe8fd53", ELF.rc2s16ac], ["RC2 S1-6 a/c rollback2 b6aec357", ELF.rc2s16acRollback]] as const) {
+  for (const [name, elf] of [["RC2 S1-6 a/c 4fe8fd53", ELF.rc2s16ac], ["RC2 S1-6 a/c rollback2 b6aec357", ELF.rc2s16acRollback], ["RC2.2 S1-6 a/c 776d2491", ELF.rc22s16ac], ["RC2.2 S1-6 a/c rollback4b 3958c36b", ELF.rc22s16acRollback]] as const) {
     it(`deployed ${name}: after the delay the loser is force-closed`, async () => {
       const w = world({ elf, nowSlot: AFTER });
       assert.equal((await run(w, AFTER)).outcome, "closed");
@@ -365,7 +376,7 @@ describe("I-S1: resolved loser force-close (S1-6 a/c deployed)", () => {
 });
 
 describe("I-S1 NEGATIVE CONTROLS: behaviour before the upgrade is unchanged", () => {
-  for (const [name, elf] of [["RC 357fc23f", ELF.rc], ["RC rollback fac4d19c", ELF.rcRollback], ["RC2 cc720a0e", ELF.rc2], ["RC2 rollback2 8b57d488", ELF.rc2Rollback]] as const) {
+  for (const [name, elf] of [["RC 357fc23f", ELF.rc], ["RC rollback fac4d19c", ELF.rcRollback], ["RC2 cc720a0e", ELF.rc2], ["RC2 rollback2 8b57d488", ELF.rc2Rollback], ["RC2.2 plain 9b630735", ELF.rc22], ["RC2.2 plain rollback4b 71a891b9", ELF.rc22Rollback]] as const) {
     it(`deployed ${name}: after the delay the job is inert (one gate read, no simulation, no send)`, async () => {
       const w = world({ elf, nowSlot: AFTER });
       const r = await run(w, AFTER);
