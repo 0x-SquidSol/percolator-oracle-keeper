@@ -117,6 +117,8 @@ interface MarketRuntime {
 }
 
 const POSITIONED_TTL_MS = 10_000;
+/** Margin on a simulated one-crank catch-up cost when sizing the catch-up tx (per-crank cost varies a few % with state). */
+const CATCHUP_MEASURED_MARGIN = 1.08;
 
 export class V22Loop {
   private readonly rt = new Map<string, MarketRuntime>();
@@ -374,9 +376,22 @@ export class V22Loop {
    */
   private async multiAssetCatchup(ctx: V22MarketCtx, target: PublicKey, wanted: number): Promise<void> {
     const hints = observationAssetsFor(ctx.marketAddress).length;
-    const n = Math.min(wanted, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM));
-    const ixs = Array.from({ length: n }, () => buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx)));
-    const units = Math.min(MAX_TX_CU, n * catchupCrankCuFor(CATCHUP_CRANK_CU, hints) + ACCRUAL_TX_CU_HEADROOM);
+    const crank = () => buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx));
+    // v22price 2026-10-22: the per-crank cost depends on the market's config (v2.2 single-asset 36,350 CU; a band market
+    // 42,538), so a fixed estimate either overflows the tx or wastes it. Measure THIS market with a one-crank simulation and
+    // size the tx from it (+8%); the static estimate is the fallback when the measurement is unavailable.
+    let perCrank = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
+    if (wanted > 1) {
+      try {
+        const one = await simulateOnly(this.execCtx(), [crank()], { units: MAX_TX_CU });
+        if (!one.err && one.unitsConsumed && one.unitsConsumed > 0) perCrank = Math.ceil(one.unitsConsumed * CATCHUP_MEASURED_MARGIN);
+      } catch {
+        // keep the static estimate
+      }
+    }
+    const n = Math.min(wanted, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, perCrank, 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM));
+    const ixs = Array.from({ length: n }, crank);
+    const units = Math.min(MAX_TX_CU, n * perCrank + ACCRUAL_TX_CU_HEADROOM);
     const out = await simulateAndSend(this.execCtx(), ixs, { job: "catchup-multi", label: ctx.label, units });
     const gap = BigInt(ctx.readSlot) - ctx.refresh.slotLast;
     const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;

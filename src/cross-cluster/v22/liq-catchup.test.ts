@@ -42,11 +42,12 @@ describe("single-asset v22 catch-up before the round", () => {
     assert.equal(r.f.sent.length, 1);
     assert.deepEqual(r.f.sent[0].tags, [5, 5, 5], "exactly floor(gap/dt) cranks, nothing else");
   });
-  it("gap far beyond one tx (100 windows): the tx is capped by compute (v22price: 34 at 38k, not 40); the rest is the next cycles' work", async () => {
+  it("gap far beyond one tx (100 windows): the tx is capped by compute (v22price: sized from a one-crank simulation); the rest is the next cycles' work", async () => {
     const r = await runAt(DT * 100n);
     assert.equal(r.f.sent.length, 1);
-    const cuCap = maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM);
-    assert.equal(cuCap, 34);
+    // the fake simulation reports 123,456 CU for the one-crank measurement: +8% margin, then what fits 1.3M
+    const cuCap = maxCatchupCranksFor(MAX_CATCHUP_CRANKS, Math.ceil(123_456 * 1.08), 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM);
+    assert.equal(cuCap, 9);
     assert.equal(r.f.sent[0].tags.length, cuCap);
     assert.ok(r.f.sent[0].tags.every((t: number) => t === 5));
     assert.equal(catchupCrankCount(DT * 100n, DT), MAX_CATCHUP_CRANKS);

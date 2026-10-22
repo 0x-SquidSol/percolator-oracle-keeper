@@ -148,8 +148,8 @@ describe("planCrankTx", () => {
 
   it("too far behind: catch-up cranks only (no accrual/refresh), fits one packet and the CU cap", () => {
     const plan = planCrankTx({ owner, market: CATE, lpPortfolio: CATE_LP, catchup: 40, refreshTargets: targets() });
-    // v22price 2026-10-22: CU-capped, floor(1.3M / 38k) = 34 (40 at the measured 36.35k v2.2 cost overflowed 1.4M)
-    assert.equal(plan.cranks.length, 34);
+    // v22price 2026-10-22: CU-capped, floor(1.3M / 45k) = 28 (40 at the measured 36.35k-42.5k v2.2 cost overflowed 1.4M)
+    assert.equal(plan.cranks.length, 28);
     assert.ok(plan.cranks.every((c) => c.kind === "catchup" && crankKind(c.ix.data) === "obs"));
     assert.ok(plan.computeUnits <= 1_400_000);
     const tx = new Transaction();

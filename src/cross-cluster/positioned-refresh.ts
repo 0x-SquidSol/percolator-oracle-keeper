@@ -359,14 +359,15 @@ function buildPermissionlessCrankIx(
  * accrual (an 8th positioned portfolio goes to a follow-up tx).
  */
 /**
- * CATCHUP_CRANK_CU 30k -> 38k (v22price 2026-10-22): a v2.2 (VERSION 19) bounded catch-up crank measures 36,350 CU
- * (simulated on SOL BYFuWyuo…, wrapper 6kpg2wi7, 1 and 2 cranks: 36,350 / 72,701). At 30k the planner packed 40 of
- * them into one transaction (40 x 36.35k = 1.454M > 1.4M): every deep-stale catch-up tx exhausted its compute
+ * CATCHUP_CRANK_CU 30k -> 45k (v22price 2026-10-22): a v2.2 (VERSION 19) bounded catch-up crank measures 36,350 CU
+ * on SOL BYFuWyuo… and 42,538 CU on the band market CHILLHOUSE ALdzXdcR… (simulated, wrapper 6kpg2wi7). At 30k the
+ * planner packed 40 per transaction (40 x 36.35k = 1.454M > 1.4M): every deep-stale catch-up tx exhausted its compute
  * (the boot "compute exhausted at 1400000 CU (40 cranks)" reverts) or failed its simulation, so a market a long
- * outage behind never caught up. 38k leaves ~4.5% margin; the per-tx count is now always CU-capped
- * (`maxCatchupCranksFor`: floor(1.3M / 38k) = 34 single-asset cranks).
+ * outage behind never caught up. 45k covers the worst measured cost with ~6% margin; the per-tx count is now always
+ * CU-capped (`maxCatchupCranksFor`: floor(1.3M / 45k) = 28 single-asset cranks). The v2.2 loop sizes its catch-up
+ * tx from a one-crank simulation of the market instead (loop.ts multiAssetCatchup); this is the static fallback.
  */
-export const CATCHUP_CRANK_CU = 38_000;
+export const CATCHUP_CRANK_CU = 45_000;
 export const ACCRUE_CRANK_CU = 200_000;
 export const REFRESH_CRANK_CU = 145_000;
 export const MAX_TX_CU = 1_400_000;
@@ -505,7 +506,7 @@ export function isBankruptPortfolio(data: Uint8Array): boolean {
 export const MAX_CATCHUP_WITH_REFRESH = 10;
 /**
  * Catch-up-only transaction size cap (40 x ~19 bytes + ~270 fixed fits 1232 bytes). The COMPUTE cap is separate and
- * usually lower: `maxCatchupCranksFor` (floor(budget / CATCHUP_CRANK_CU) = 34 single-asset cranks on v2.2).
+ * usually lower: `maxCatchupCranksFor` (floor(budget / CATCHUP_CRANK_CU) = 28 single-asset cranks).
  */
 export const MAX_CATCHUP_CRANKS = 40;
 
