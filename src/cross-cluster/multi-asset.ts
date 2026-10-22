@@ -258,11 +258,12 @@ export function accrueCrankCuFor(base: number, hints: number): number {
 }
 
 /**
- * Most catch-up cranks one transaction can carry at `hints` observations each: the single-asset cap unchanged for
- * one hint, else what fits `budget` CU at `catchupCrankCuFor`.
+ * Most catch-up cranks one transaction can carry at `hints` observations each: what fits `budget` CU at
+ * `catchupCrankCuFor`, never more than `singleAssetCap` (the packet-size cap), never fewer than 1.
+ * v22price 2026-10-22: the single-asset count is CU-capped too. It used to return `singleAssetCap` (40) for one hint,
+ * which at the real v2.2 cost (36.35k per crank) overflows 1.4M.
  */
 export function maxCatchupCranksFor(singleAssetCap: number, base: number, hints: number, budget: number): number {
-  if (hints <= 1) return singleAssetCap;
   return Math.max(1, Math.min(singleAssetCap, Math.floor(budget / catchupCrankCuFor(base, hints))));
 }
 

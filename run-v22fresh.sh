@@ -27,6 +27,15 @@ unset SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_KEY REGISTER_SOURCE_URL TI
       KEEPER_KEYPAIR PROGRAM_ID KEEPER_DEVNET_V21 KEEPER_ALERT_WEBHOOK_URL KEEPER_ALERT_TELEGRAM_BOT_TOKEN \
       KEEPER_ALERT_TELEGRAM_CHAT_ID DEVNET_RPC_ORIGIN HELIUS_MAINNET_RPC_URL DRY_RUN KEEPER_DRY_RUN
 
+# --- optional: chart ticks to the LOCAL v2.2 price-ws only (v22price 2026-10-22). KEEPER_V22_TICK_INGEST=local posts every
+#     landed push to http://127.0.0.1:${PRICE_WS_PORT:-8797}/ingest/ticks with the local key file; nothing else is ever
+#     accepted here (the scrub above stays: no live ingest URL can be inherited). Default off.
+if [[ "${KEEPER_V22_TICK_INGEST:-off}" == "local" && -s "$HOME/v22-price-ws/tick-ingest.key" ]]; then
+  export TICK_INGEST_URL="http://127.0.0.1:${PRICE_WS_PORT:-8797}/ingest/ticks"
+  TICK_INGEST_KEY="$(cat "$HOME/v22-price-ws/tick-ingest.key")"
+  export TICK_INGEST_KEY
+fi
+
 # --- RPC key (runtime only; never echoed) ---
 TOK="$HOME/.openclaw/credentials/deploy-tokens.env"
 KEY="$(grep -E '^(export )?HELIUS_KEEPER_API_KEY=' "$TOK" | head -1 | sed -E 's/^(export )?HELIUS_KEEPER_API_KEY=//; s/^["'"'"']//; s/["'"'"']$//')"
