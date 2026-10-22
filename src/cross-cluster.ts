@@ -83,6 +83,7 @@ import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-c
 import { makeLpFeeJob } from "./cross-cluster/lp-fee-cranker.ts";
 import { makeStakeFeeJob, stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
 import { makeTerminalInsuranceJob, terminalInsuranceConfigFromEnv } from "./cross-cluster/terminal-insurance.ts";
+import { loserForceCloseConfigFromEnv, makeResolvedLoserForceCloseJob } from "./cross-cluster/resolved-loser-force-close.ts";
 import type { TerminalInsuranceConfig } from "./cross-cluster/terminal-insurance.ts";
 import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
 import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
@@ -559,6 +560,11 @@ const vaultLpCranker =
   const feeJobs: FeeJob[] = [];
   if (LP_FEE_CRANK_ENABLED) feeJobs.push(makeLpFeeJob());
   if (STAKE_FEE_PUSH_ENABLED) feeJobs.push(makeStakeFeeJob(STAKE_FEE_CONFIG));
+  // SEC-RC I-S1 (S1-6 a/c, engine e59aa6a6): after a Resolved market's force-close delay, close the claimants that are not
+  // waiting (the loss side) so winners refused with 21 are released. Inert unless the deployed wrapper is a known S1-6 a/c
+  // build (s16ac-engine-gate.ts). Before the wind-down so the same cycle's cleanup sees the losers closed.
+  const loserForceClose = loserForceCloseConfigFromEnv(process.env);
+  if (loserForceClose) feeJobs.push(makeResolvedLoserForceCloseJob(loserForceClose));
   if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
   // Read-only: alerts when a bound vault's seniors are done but the junior's tag 102 has not run.
   if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
