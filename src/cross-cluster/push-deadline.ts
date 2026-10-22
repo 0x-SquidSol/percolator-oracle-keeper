@@ -33,6 +33,8 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import type { Connection } from "@solana/web3.js";
+import { lotPriceToTokenE6V22 } from "@percolatorct/sdk";
+import { readMarketLotExp } from "./auth-mark-pusher.ts";
 import { decodeTerminalState, marketMode, staleResolveWindow } from "./market-state.ts";
 import { detectLayout, engineSlotBase } from "./market-layout.ts";
 import { decodeMarketRefreshState } from "./positioned-refresh.ts";
@@ -173,8 +175,18 @@ export function recordPushDeadline(marketAddress: string, data: Uint8Array, read
 // `mark-smoother.ts` already prefers over an unconfirmed one. `raw_oracle_target_price` rather than
 // `effective_price` because the former is the pushed target and the latter lags it by the engine's
 // per-slot step cap, which would make the baseline drift conservative-but-wrong after a gap.
+//
+// UNITS. The chain holds every mark PER LOT: the pusher sends the per-token e6 price x 10^lot_exp
+// (auth-mark-pusher.ts `perLotMarkFromE12`) and the wrapper stores it unscaled. The breaker runs on
+// the per-TOKEN price (keeper-loop.ts `priceE6ToUsdNumber(priceE6)`), so the value cached here is
+// the mark divided back by 10^lot_exp, with lot_exp read from the same profile byte the pusher
+// reads. On VERSION < 19 that byte is padding and `readMarketLotExp` returns 0 without reading it,
+// so v2.1 markets (and every lot_exp 0 market) cache exactly the on-chain value.
 
-/** `market` or `market:assetIndex` -> that asset's `raw_oracle_target_price` (e6) at the last read. */
+/**
+ * `market` or `market:assetIndex` -> that asset's last pushed mark PER TOKEN (e6) at the last read:
+ * the PER-LOT `raw_oracle_target_price` divided by 10^lot_exp.
+ */
 const marksByUnit = new Map<string, bigint>();
 
 /** The cache key the push loop uses for a unit: single-asset markets key on the market alone. */
@@ -197,14 +209,24 @@ export function recordOnChainMarks(marketAddress: string, data: Uint8Array): voi
       // Only a tradable asset has a mark worth trusting as a baseline.
       if (lifecycle !== LIFECYCLE_ACTIVE && lifecycle !== LIFECYCLE_DRAIN_ONLY) continue;
       const mark = u64(data, base + det.layout.asset.rawOracleTargetPrice);
-      if (mark > 0n) marksByUnit.set(markUnitKey(marketAddress, i), mark);
+      if (mark === 0n) continue;
+      // Per lot -> per token: divide by what the push multiplied by, read the way the pusher reads
+      // it (the wrapper slot in front of this engine slot). An unreadable lot_exp leaves the unit
+      // UNSEEDED rather than guessing 0: on a lot market that guess is the 10^lot_exp-high seed.
+      const lotExp = readMarketLotExp(data, det.layout.wrapperVersion, base - det.layout.wrapperLen);
+      if (lotExp === null) continue;
+      const tokenMark = lotPriceToTokenE6V22(mark, lotExp);
+      if (tokenMark > 0n) marksByUnit.set(markUnitKey(marketAddress, i), tokenMark);
     }
   } catch {
     // leave unseeded
   }
 }
 
-/** The cached last-pushed mark (e6) for a unit, or null when nothing has been read for it yet. */
+/**
+ * The cached last pushed mark PER TOKEN (e6) for a unit (the on-chain field is per lot; see UNITS above),
+ * or null when nothing has been read for it yet.
+ */
 export function getOnChainMarkE6(marketAddress: string, assetIndex: number): bigint | null {
   return marksByUnit.get(markUnitKey(marketAddress, assetIndex)) ?? null;
 }
