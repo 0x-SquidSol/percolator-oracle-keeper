@@ -31,6 +31,8 @@
  *                    Custom(21) (Custom(120) on the P2b program) until one whole side exits; reported with the
  *                    observed duration and both sides' OI so an abandoned
  *                    position is visible
+ *   - D1 close-only / wind-down overdue (v2.2 band, v22/d1-watch.ts) a band asset is close-only (A != 1) -> WARN;
+ *                    still close-only past the tag-104 bound + grace with no wind-down landed -> CRITICAL
  *   - vault-LP crank stale (v2.2 band, v22/lp-cert-liveness.ts) the vault LP's leg is
  *                    uncertified this band epoch for >= 25% / 50% of the E + Pmax resolve
  *                    horizon (BandPinExpired resolves the market at 100%, sim §P2.10)
@@ -82,7 +84,9 @@ export type AlertKind =
   | "earn-par-e3-gap"
   | "pusher-takeover"
   | "band-pin-expiring"
-  | "vault-lp-crank-stale";
+  | "vault-lp-crank-stale"
+  | "adl-close-only"
+  | "adl-wind-down-overdue";
 
 export interface Alert {
   kind: AlertKind;
