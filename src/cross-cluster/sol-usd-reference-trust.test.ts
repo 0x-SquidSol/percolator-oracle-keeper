@@ -78,6 +78,9 @@ describe("GH#163 SOL/USD reference trust", () => {
     const entries = rowsToEntries(rows as never, new Map([[rows[0]!.dex_pool_address, DLMM]]));
     assert.equal(entries.length, 1, "row should still be admitted — this is not an admission gate");
     assert.match(entries[0]!.label!, /^SOL\/USDC/, "the label really is synthesised as SOL/USDC…");
-    assert.equal(isSolUsdEntry(entries[0]!), false, "…but it must not be trusted as the reference");
+    // On feat/v22-keeper-growth MarketEntry.dexType is optional (multi-asset rows), isSolUsdEntry's pick needs it; a DB row carries it.
+    const e = entries[0]!;
+    assert.ok(e.dexType, "the DB row carries its dexType");
+    assert.equal(isSolUsdEntry({ dexType: e.dexType, label: e.label, symbol: e.symbol }), false, "…but it must not be trusted as the reference");
   });
 });
