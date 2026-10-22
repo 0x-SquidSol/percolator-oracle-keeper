@@ -10,6 +10,9 @@
  *     (118), G9 (111), stake sync (stake 31), keeper Earn exits (77). Each job is its own flag and is skipped
  *     when its flag is off.
  *   - /health          `v22` block (health.ts): flags, per-market band / pin health, pairing stats, per-job counters.
+ *   - vault-LP crank liveness (lp-cert-liveness.ts), every tick on every band market, read-only and flag-free: alert
+ *     `vault-lp-crank-stale` while the vault LP's leg is uncertified this band epoch for >= 25% (WARN) / 50% (CRITICAL)
+ *     of the E + Pmax resolve horizon (sim 2026-10-19 §P2.10).
  *
  * Every send goes through exec.ts (simulate first; dry-run logs "would send"). A market whose layout is not variant B
  * is ignored (the legacy cranker owns v1 / v2.1); a market whose layout is UNKNOWN is a loud, counted problem
@@ -57,6 +60,11 @@ import { setBondFeeDelegated, setLoneLpCrankSuppressor, setProtectiveTrigger, se
 import type { SweepDelegateArgs } from "./delegation.ts";
 import { setV22HealthProvider } from "./health.ts";
 import { adlHealthOf } from "../adl-state.ts";
+import { getAlertSink } from "../alerting.ts";
+import type { Alert, AlertSink } from "../alerting.ts";
+import { terminalKindOf } from "./band.ts";
+import { LP_CERT_ALERT_SCOPE, evaluateVaultLpCrankStaleness, lpCertLevelOf, lpCertStalenessOf, lpCertThresholdsFromEnv, readLpCertAssets } from "./lp-cert-liveness.ts";
+import type { LpCertThresholds } from "./lp-cert-liveness.ts";
 
 export interface V22LoopDeps {
   /** Minimum ms between two catch-up txs across ALL markets (default KEEPER_V22_CATCHUP_SPACING_MS or 1500). */
@@ -73,6 +81,10 @@ export interface V22LoopDeps {
   mainnetBuild?: boolean;
   anchors?: Map<string, PublicKey>;
   feeIntervalMs?: number;
+  /** Where the vault-LP crank liveness alert is reconciled (default: the process-wide sink). */
+  alertSink?: Pick<AlertSink, "reconcile">;
+  /** Vault-LP crank liveness thresholds (default: from ALERT_VAULT_LP_CRANK_* env, boot-safe). */
+  lpCertThresholds?: LpCertThresholds;
   now?: () => number;
   log?: (s: string) => void;
 }
@@ -116,6 +128,10 @@ interface MarketRuntime {
   sweepInflight: boolean;
   /** Liveness repairs (tag 89 / 45) are not retried before this time after one did not land (ms). */
   repairBackoffUntilMs: number;
+  /** Active vault-LP crank liveness alerts from the last GOOD read (kept across a failed read, never cleared by one). */
+  lpCertAlerts: Alert[];
+  /** /health: the LP certification staleness of the worst asset at the last good read. */
+  lastLpCert: { assetIndex: number; certified: boolean; staleSlots: string; horizonSlots: string; remainingSlots: string; level: string; horizonSource: string } | null;
 }
 
 const POSITIONED_TTL_MS = 10_000;
@@ -126,6 +142,7 @@ export class V22Loop {
   private readonly rt = new Map<string, MarketRuntime>();
   private readonly log: (s: string) => void;
   private readonly now: () => number;
+  private readonly lpCertThresholds: LpCertThresholds;
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
@@ -135,6 +152,62 @@ export class V22Loop {
   constructor(private readonly d: V22LoopDeps) {
     this.log = d.log ?? ((s) => console.log(s));
     this.now = d.now ?? Date.now;
+    this.lpCertThresholds = d.lpCertThresholds ?? lpCertThresholdsFromEnv(process.env);
+  }
+
+  /**
+   * Vault-LP crank liveness for one loaded market (lp-cert-liveness.ts). Updates `r.lpCertAlerts` / `r.lastLpCert` only
+   * on a GOOD read: an RPC error or an undecodable LP keeps the previous state, so a flaky read can neither raise nor
+   * falsely RESOLVE the alert. Never throws.
+   */
+  private async checkLpCert(ctx: V22MarketCtx, r: MarketRuntime): Promise<void> {
+    if (!ctx.isBand || !ctx.lpPortfolio || terminalKindOf(ctx.data) !== null) {
+      r.lpCertAlerts = [];
+      r.lastLpCert = null;
+      return;
+    }
+    try {
+      const info = await this.d.conn.getAccountInfo(ctx.lpPortfolio, "processed");
+      if (!info) return; // unreadable this tick: keep the last state
+      const nowSlot = BigInt(ctx.readSlot);
+      const assets = readLpCertAssets(ctx.data, ctx.layout, observationAssetsFor(ctx.marketAddress), new Uint8Array(info.data))
+        .map((a) => lpCertStalenessOf(a, nowSlot))
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+      r.lpCertAlerts = evaluateVaultLpCrankStaleness({ label: ctx.label, market: ctx.marketAddress, terminal: false, nowSlot, assets }, this.lpCertThresholds);
+      const worst = [...assets].sort((x, y) => (x.remainingSlots < y.remainingSlots ? -1 : x.remainingSlots > y.remainingSlots ? 1 : 0)).find((x) => !x.certified) ?? assets[0] ?? null;
+      r.lastLpCert = worst
+        ? { assetIndex: worst.assetIndex, certified: worst.certified, staleSlots: worst.staleSlots.toString(), horizonSlots: worst.horizonSlots.toString(), remainingSlots: worst.remainingSlots.toString(), level: lpCertLevelOf(worst, this.lpCertThresholds), horizonSource: worst.horizonSource }
+        : null;
+    } catch (err) {
+      this.log(`[v22][lp-cert] ${ctx.label}: LP certification read failed (alert state kept): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  /**
+   * Reconcile the vault-LP crank liveness alerts of every registered market (fires new ones, resolves cleared ones).
+   *
+   * Two scopes, one per level, because the sink's cooldown key is (scope, kind, subject) without the severity: in ONE
+   * scope a WARN -> CRITICAL escalation would wait out the 15-min cooldown (~2,250 slots, i.e. the page would land near
+   * 73% of the horizon, not 50%). The `:warn` scope carries every market at WARN or worse (as a warn-level record), the
+   * `:critical` scope only the critical ones, so an escalation pages at once and nothing is double-paged (Telegram
+   * only takes criticals). Recovery resolves both.
+   */
+  private async reconcileLpCert(): Promise<void> {
+    const warn: Alert[] = [];
+    const critical: Alert[] = [];
+    for (const m of this.d.markets()) {
+      for (const a of this.rt.get(m.marketAddress)?.lpCertAlerts ?? []) {
+        warn.push(a.severity === "warn" ? a : { ...a, severity: "warn" });
+        if (a.severity === "critical") critical.push(a);
+      }
+    }
+    try {
+      const sink = this.d.alertSink ?? getAlertSink();
+      await sink.reconcile(`${LP_CERT_ALERT_SCOPE}:warn`, warn);
+      await sink.reconcile(`${LP_CERT_ALERT_SCOPE}:critical`, critical);
+    } catch (err) {
+      this.log(`[v22][lp-cert] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
   }
 
   private rtFor(addr: string): MarketRuntime {
@@ -173,6 +246,8 @@ export class V22Loop {
         layoutNote: null,
         positionedCache: null,
         sweepInflight: false,
+        lpCertAlerts: [],
+        lastLpCert: null,
       };
       this.rt.set(addr, r);
     }
@@ -507,6 +582,7 @@ export class V22Loop {
         if (!ctx) continue;
         const r = this.rtFor(entry.marketAddress);
         r.lastBand = bandHealthFor(ctx);
+        await this.checkLpCert(ctx, r); // read-only; runs even while a round is in flight
         if (r.sweepInflight) continue;
         const needsPositioned = f.feeCrankBond || f.holdingRent || f.dustSweep;
         const positioned = needsPositioned ? await this.positionedFor(ctx, r) : null;
@@ -553,6 +629,7 @@ export class V22Loop {
         this.log(`[v22] ${entry.label}: tick error: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
       }
     }
+    await this.reconcileLpCert();
   }
 
   healthFields(): Record<string, unknown> {
@@ -562,6 +639,7 @@ export class V22Loop {
       markets[addr] = {
         layout: r.layoutNote,
         ...(r.lastBand ? { band: r.lastBand } : {}),
+        ...(r.lastLpCert ? { vaultLpCert: r.lastLpCert } : {}),
         ...(r.lastRound ? { lastRound: r.lastRound } : {}),
         ...(r.lastFee ? { fee78: r.lastFee } : {}),
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
