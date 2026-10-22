@@ -59,6 +59,8 @@ import { setV22HealthProvider } from "./health.ts";
 import { adlHealthOf } from "../adl-state.ts";
 
 export interface V22LoopDeps {
+  /** Minimum ms between two catch-up txs across ALL markets (default KEEPER_V22_CATCHUP_SPACING_MS or 1500). */
+  catchupSpacingMs?: number;
   conn: Connection;
   keeper: Keypair;
   programId: PublicKey;
@@ -127,6 +129,8 @@ export class V22Loop {
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
+  /** v22price 2026-10-22: when the last catch-up tx (any market) was started; see `catchupSpacingMs`. */
+  private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
 
   constructor(private readonly d: V22LoopDeps) {
     this.log = d.log ?? ((s) => console.log(s));
@@ -279,6 +283,13 @@ export class V22Loop {
       {
         const n = catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots);
         if (n > 0) {
+          // v22price 2026-10-22: pace catch-up across markets. After an outage every market is behind at once; one
+          // catch-up tx per market per cycle (each with two simulations, a send and status polls) hit the RPC key's rate
+          // limit (429) and starved the pushes. Skipped markets catch up on a later cycle; returning true keeps the
+          // legacy cranker from sending its own catch-up meanwhile.
+          const spacing = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
+          if (this.now() - this.lastCatchupAtMs < spacing) return true;
+          this.lastCatchupAtMs = this.now();
           await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
           return true;
         }

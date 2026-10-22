@@ -125,3 +125,23 @@ describe("v2.2 loop sizes the catch-up tx from a one-crank simulation of the mar
   }
 });
 
+describe("catch-up is paced across markets (RPC rate limit)", () => {
+  it("a second market behind in the same instant waits for the spacing; after it, it catches up", async () => {
+    const gap = 150n * 10n;
+    const market = v22MarketBytes({ currentSlot: NOW, slotLast: NOW - gap });
+    const f = fakeLoopConn({ readSlot: Number(NOW), market, registry: registryBytes({ bound: true, ext: true, bond: false }), vaultLpState: vaultLpStateBytes(key(901), 0n), lpAccount: portfolioBytes({ owner: key(8), capital: 1000n, pnl: 0n, legs: [{ side: 0, basis: 5n }] }) });
+    let t = 1_000_000;
+    const lines: string[] = [];
+    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [{ marketAddress: MARKET.toBase58(), label: "T/V22" }], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: (l) => lines.push(l), now: () => t, catchupSpacingMs: 1500 });
+    const run = (label: string) => loop.sweepDelegate({ conn: f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: MARKET.toBase58(), label }, marketData: market, slot: Number(NOW), dryRun: false });
+    assert.equal(await run("A"), true);
+    assert.equal(f.sent.length, 1);
+    t += 100;
+    assert.equal(await run("B"), true, "handled (the legacy cranker must not send its own catch-up)");
+    assert.equal(f.sent.length, 1, "paced: nothing sent inside the spacing");
+    t += 1500;
+    await run("B");
+    assert.equal(f.sent.length, 2);
+  });
+});
+
