@@ -74,7 +74,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
 import { bindObservationRegistry, validateMultiAssetEntry } from "./cross-cluster/multi-asset.ts";
-import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
+import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
@@ -278,7 +278,7 @@ const DRY_RUN =
   process.env.KEEPER_DRY_RUN === "true" ||
   process.argv.includes("--dry-run");
 
-const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
+const CC_INTERVAL_MS = bootPositiveNumberEnv("CC_INTERVAL_MS", 7000);
 
 // Cadence footgun (runbook fresh-id-redeploy-plan §8): the mark smoother only
 // publishes once its window SPANS 5/6 of CC_MARK_WINDOW_MS, and samples older
@@ -287,7 +287,7 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 // `never` refuses to boot (a keeper that never pushes looks alive and prices
 // nothing); `fragile` warns. Skipped in dry-run, which never pushes anyway.
 {
-  const windowMs = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+  const windowMs = bootPositiveNumberEnv("CC_MARK_WINDOW_MS", 15_000);
   const c = markCadenceCheck(CC_INTERVAL_MS, windowMs);
   if (c.verdict === "never" && !DRY_RUN) {
     console.error(`[fatal] this cadence can never publish a mark — the keeper would never push. ${c.detail}. Use e.g. 1500 / 8000 (the live pair).`);
@@ -296,10 +296,10 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
   if (c.verdict === "never") console.warn(`[warn] cadence can never publish (dry-run, continuing): ${c.detail}`);
   if (c.verdict === "fragile") console.warn(`[warn] cadence publishes only if every cycle is exactly on time: ${c.detail}`);
 }
-const CC_HEALTH_PORT = parseInt(process.env.CC_HEALTH_PORT ?? "3001", 10);
+const CC_HEALTH_PORT = bootPositiveNumberEnv("CC_HEALTH_PORT", 3001);
 const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
 // D2a — see cross-cluster/keeper-loop.ts's hang-detection doc comment.
-const CC_CYCLE_TIMEOUT_MS = parseInt(process.env.CC_CYCLE_TIMEOUT_MS ?? "10000", 10);
+const CC_CYCLE_TIMEOUT_MS = bootPositiveNumberEnv("CC_CYCLE_TIMEOUT_MS", 10000);
 
 // Recovery/maintenance crank loop — independent cadence from the oracle push.
 // See cross-cluster/recovery-cranker.ts for why this exists (keeps
@@ -307,12 +307,12 @@ const CC_CYCLE_TIMEOUT_MS = parseInt(process.env.CC_CYCLE_TIMEOUT_MS ?? "10000",
 // EngineLockActive on risk-increasing trades). Defaults to on; set
 // CRANK_ENABLED=false to disable (e.g. for a read-only / dry-run deploy).
 const CRANK_ENABLED = process.env.CRANK_ENABLED !== "false";
-const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10);
+const CRANK_INTERVAL_MS = bootPositiveNumberEnv("CRANK_INTERVAL_MS", 20000);
 // LP_FEE_CRANK_ENABLED=false to disable. 200s by default: fee distribution is not
 // latency-sensitive (it only moves already-accrued atoms into the vault), and a
 // market with no LP depositors costs no transaction at all.
 const LP_FEE_CRANK_ENABLED = process.env.LP_FEE_CRANK_ENABLED !== "false";
-const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?? "200000", 10);
+const LP_FEE_CRANK_INTERVAL_MS = bootPositiveNumberEnv("LP_FEE_CRANK_INTERVAL_MS", 200000);
 // Stake-fee push (tag 87 -> stake AccrueFees, fee-flow audit F2/F3). Shares the
 // fee-job loop and its interval with the LP-fee crank.
 const STAKE_FEE_PUSH_ENABLED = process.env.STAKE_FEE_PUSH_ENABLED !== "false";
@@ -338,7 +338,7 @@ let registrationStream: RegistrationStream | null = null;
 // so a new market is picked up in ~ms. This loop exists for when that socket is
 // down, throttled, or Realtime is unavailable — registration still converges,
 // just slower. 30s is fine for that role; it does not gate launch latency.
-const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
+const REGISTER_POLL_INTERVAL_MS = bootPositiveNumberEnv("REGISTER_POLL_INTERVAL_MS", 30000);
 
 // v2.1 cutover: the default registry file follows the program set
 // (registry.json for v1 — unchanged — and registry.v21.json for KEEPER_DEVNET_V21=1).
@@ -348,7 +348,7 @@ const REGISTRY_PATH =
 
 // G6 — registry.json hot-reload, so a re-seed is picked up live without a
 // restart. See cross-cluster/registry-reload.ts for the full rationale.
-const REGISTRY_RELOAD_INTERVAL_MS = parseInt(process.env.REGISTRY_RELOAD_INTERVAL_MS ?? "15000", 10);
+const REGISTRY_RELOAD_INTERVAL_MS = bootPositiveNumberEnv("REGISTRY_RELOAD_INTERVAL_MS", 15000);
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
