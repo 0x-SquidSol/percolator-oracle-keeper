@@ -654,7 +654,14 @@ export async function crankOneMarket(
     const v22Owned = sweepDelegate !== null && detection.known && detection.layout.id === "v2.2-b";
     if (v22Owned) {
       const handled = await sweepDelegate({ conn: devnetConn, keeper, entry, marketData: acct.value.data, slot: acct.context.slot, dryRun });
-      if (handled) return;
+      if (handled) {
+        // v22price 2026-10-22: the v2.2 layer cranked this cycle, so a legacy revert from an earlier fallthrough (e.g. the
+        // boot catch-up) is over. Without this the cranker's `~drift(rev:1 cons:1)` stayed on the health line forever.
+        if (state.consecutiveReverts > 0) console.log(`[cranker] ${label}: legacy revert streak (${state.consecutiveReverts}) cleared: the v2.2 layer owns and cranked this market`);
+        state.consecutiveReverts = 0;
+        state.lastRevertCode = null;
+        return;
+      }
     }
     let pre: MarketRefreshState | null = null;
     if (detection.known) {

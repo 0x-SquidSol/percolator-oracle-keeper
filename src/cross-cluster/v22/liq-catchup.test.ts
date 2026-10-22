@@ -14,7 +14,8 @@ import { v22FlagsFromEnv } from "./flags.ts";
 import { setSweepDelegate, setLoneLpCrankSuppressor, setBondFeeDelegated, setProtectiveTrigger } from "./delegation.ts";
 import { setV22HealthProvider } from "./health.ts";
 import { WRAPPER_PROGRAM_ID } from "../../program-ids.ts";
-import { MAX_CATCHUP_CRANKS, catchupCrankCount, planCrankTx } from "../positioned-refresh.ts";
+import { ACCRUAL_TX_CU_HEADROOM, CATCHUP_CRANK_CU, MAX_CATCHUP_CRANKS, MAX_TX_CU, catchupCrankCount, planCrankTx } from "../positioned-refresh.ts";
+import { maxCatchupCranksFor } from "../multi-asset.ts";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import { fakeLoopConn, key, portfolioBytes, registryBytes, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 
@@ -41,10 +42,12 @@ describe("single-asset v22 catch-up before the round", () => {
     assert.equal(r.f.sent.length, 1);
     assert.deepEqual(r.f.sent[0].tags, [5, 5, 5], "exactly floor(gap/dt) cranks, nothing else");
   });
-  it("gap far beyond one tx (100 windows): the tx is capped at MAX_CATCHUP_CRANKS; the rest is the next cycles' work", async () => {
+  it("gap far beyond one tx (100 windows): the tx is capped by compute (v22price: 34 at 38k, not 40); the rest is the next cycles' work", async () => {
     const r = await runAt(DT * 100n);
     assert.equal(r.f.sent.length, 1);
-    assert.equal(r.f.sent[0].tags.length, MAX_CATCHUP_CRANKS);
+    const cuCap = maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM);
+    assert.equal(cuCap, 34);
+    assert.equal(r.f.sent[0].tags.length, cuCap);
     assert.ok(r.f.sent[0].tags.every((t: number) => t === 5));
     assert.equal(catchupCrankCount(DT * 100n, DT), MAX_CATCHUP_CRANKS);
     // 100 windows = 3 cycles: 40 + 40 + 20, each recomputed from the market that cycle reads

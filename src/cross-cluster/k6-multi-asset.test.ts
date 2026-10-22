@@ -245,7 +245,9 @@ describe("K-6 cranks: observation hints, ordering, CU", () => {
 
   it("CU helpers: one hint costs exactly the single-asset figure", () => {
     assert.equal(catchupCrankCuFor(CATCHUP_CRANK_CU, 1), CATCHUP_CRANK_CU);
-    assert.equal(maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, 1), MAX_CATCHUP_CRANKS);
+    // v22price 2026-10-22: one hint is CU-capped too (it used to ignore the budget and return 40 = 1.454M at v2.2 cost)
+    assert.equal(maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM), 34);
+    assert.equal(maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, 1), 1);
   });
 });
 

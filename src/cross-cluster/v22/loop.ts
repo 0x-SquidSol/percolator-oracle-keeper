@@ -34,6 +34,8 @@ import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
 import { loadV22Positioned, parseAccrueAnchors } from "./positioned.ts";
 import { simulateAndSend, simulateOnly } from "./exec.ts";
 import { buildObservationCrankIx } from "../positioned-refresh.ts";
+import { buildLivenessRepairIx, decodeLivenessState, describeRepair, planLivenessRepairs } from "../liveness-repair.ts";
+import type { LivenessRepair } from "../liveness-repair.ts";
 import { parseSeniorDrawLogs } from "../vault-lp-crank.ts";
 import type { V22Positioned } from "./positioned.ts";
 import { readMarginParams } from "./liquidation.ts";
@@ -110,6 +112,8 @@ interface MarketRuntime {
   layoutNote: string | null;
   positionedCache: { at: number; value: V22Positioned } | null;
   sweepInflight: boolean;
+  /** Liveness repairs (tag 89 / 45) are not retried before this time after one did not land (ms). */
+  repairBackoffUntilMs: number;
 }
 
 const POSITIONED_TTL_MS = 10_000;
@@ -145,6 +149,7 @@ export class V22Loop {
         lastOutstandingRoundAtMs: 0,
         quarantineHistory: new Map(),
         anchorBadRounds: 0,
+        repairBackoffUntilMs: 0,
         deferrals: new Map(),
         escalated: new Map(),
         lastLpSettledAtMs: 0,
@@ -235,6 +240,28 @@ export class V22Loop {
       if (!ctx) return false;
       r.lastBand = bandHealthFor(ctx);
       if (ctx.refresh.lifecycle !== 2 && ctx.refresh.lifecycle !== 3) return false; // not Active / DrainOnly
+      // v22price 2026-10-22: liveness repairs on EVERY asset of a v2.2 market, before any crank. A lapsed `Fresh` backing
+      // bucket refuses every settle of a gain against it with EngineStale (19) and only ExpireBackingBucket (tag 89) frees
+      // it (wrapper v16_program.rs, ExpireBackingBucket doc). The legacy cranker plans these repairs, but a v2.2-owned
+      // market returns into this delegate before it does, and it only ever decoded asset 0: cap4b 2xhs (asset 2, domain 5,
+      // lapsed ~2M slots) refused every round with Custom(19) and its counterparty stayed loss-stale. A landed repair ends
+      // this cycle (the round runs on the next one, on the repaired state); one that does not land backs off 60 s and the
+      // round still runs.
+      if (this.now() >= r.repairBackoffUntilMs) {
+        const repairs = livenessRepairsFor(ctx);
+        if (repairs.length > 0) {
+          const ixs = repairs.map((x) => {
+            const ix = buildLivenessRepairIx(ctx.market, x);
+            ix.programId = this.d.programId;
+            return ix;
+          });
+          const out = await simulateAndSend(this.execCtx(), ixs, { job: "liveness-repair", label: ctx.label, units: Math.min(MAX_TX_CU, 40_000 * ixs.length + ACCRUAL_TX_CU_HEADROOM) });
+          const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
+          this.log(`[v22][repair] ${ctx.label}: ${repairs.map(describeRepair).join(", ")}: ${what}`);
+          if (out.kind === "sent" && out.landed === "landed") return true;
+          r.repairBackoffUntilMs = this.now() + 60_000;
+        }
+      }
       const positioned = await this.positionedFor(ctx, r);
       if (!positioned || !positioned.lp) {
         this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
@@ -541,4 +568,21 @@ export async function startV22Loop(loop: V22Loop, tickMs: number): Promise<void>
     }
     await new Promise((r) => setTimeout(r, tickMs));
   }
+}
+
+/**
+ * Liveness repairs of every engine slot of a v2.2 market (lapsed Fresh backing buckets, finalizable ResetPending sides),
+ * planned at the slot the market was read at (`planLivenessRepairs`). A slot that does not decode is skipped (never
+ * guessed). Exported for tests.
+ */
+export function livenessRepairsFor(ctx: Pick<V22MarketCtx, "data" | "readSlot" | "slots">): LivenessRepair[] {
+  const out: LivenessRepair[] = [];
+  for (let i = 0; i < ctx.slots; i++) {
+    try {
+      out.push(...planLivenessRepairs(decodeLivenessState(ctx.data, i), BigInt(ctx.readSlot)));
+    } catch {
+      // unreadable slot: no repair planned for it
+    }
+  }
+  return out;
 }
