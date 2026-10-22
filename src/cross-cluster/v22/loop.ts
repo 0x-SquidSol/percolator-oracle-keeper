@@ -65,6 +65,10 @@ import type { Alert, AlertSink } from "../alerting.ts";
 import { terminalKindOf } from "./band.ts";
 import { LP_CERT_ALERT_SCOPE, evaluateVaultLpCrankStaleness, lpCertLevelOf, lpCertStalenessOf, lpCertThresholdsFromEnv, readLpCertAssets } from "./lp-cert-liveness.ts";
 import type { LpCertThresholds } from "./lp-cert-liveness.ts";
+import { ADL_D1_ALERT_SCOPE, AdlEpisodeTracker, adlD1ThresholdsFromEnv, evaluateAdlD1 } from "./d1-watch.ts";
+import type { AdlAssetReading, AdlD1Thresholds, AdlEpisode } from "./d1-watch.ts";
+import { ADL_ONE, decodeAdlState } from "../adl-state.ts";
+import { engineSlotBase } from "../market-layout.ts";
 
 export interface V22LoopDeps {
   /** Minimum ms between two catch-up txs across ALL markets (default KEEPER_V22_CATCHUP_SPACING_MS or 1500). */
@@ -85,6 +89,8 @@ export interface V22LoopDeps {
   alertSink?: Pick<AlertSink, "reconcile">;
   /** Vault-LP crank liveness thresholds (default: from ALERT_VAULT_LP_CRANK_* env, boot-safe). */
   lpCertThresholds?: LpCertThresholds;
+  /** D1 close-only / wind-down thresholds (default: from ALERT_ADL_WIND_DOWN_* env, boot-safe). */
+  adlD1Thresholds?: AdlD1Thresholds;
   now?: () => number;
   log?: (s: string) => void;
 }
@@ -132,6 +138,12 @@ interface MarketRuntime {
   lpCertAlerts: Alert[];
   /** /health: the LP certification staleness of the worst asset at the last good read. */
   lastLpCert: { assetIndex: number; certified: boolean; staleSlots: string; horizonSlots: string; remainingSlots: string; level: string; horizonSource: string } | null;
+  /** D1: per-market close-only episode tracker (in memory; a restart makes ages lower bounds). */
+  adlTracker: AdlEpisodeTracker;
+  /** D1: active alerts from the last GOOD read (kept across a failed read). */
+  adlAlerts: Alert[];
+  /** D1: /health view of the close-only episodes at the last good read. */
+  lastAdl: { episodes: Array<{ assetIndex: number; ageSlots: string; observedSinceSlot: string; sinceBoot: boolean; level: string; slotsToBound: string }>; endedEpisodes: number; longestEndedSlots: string; endedPastBound: number } | null;
 }
 
 const POSITIONED_TTL_MS = 10_000;
@@ -143,6 +155,7 @@ export class V22Loop {
   private readonly log: (s: string) => void;
   private readonly now: () => number;
   private readonly lpCertThresholds: LpCertThresholds;
+  private readonly adlD1Thresholds: AdlD1Thresholds;
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
@@ -153,6 +166,7 @@ export class V22Loop {
     this.log = d.log ?? ((s) => console.log(s));
     this.now = d.now ?? Date.now;
     this.lpCertThresholds = d.lpCertThresholds ?? lpCertThresholdsFromEnv(process.env);
+    this.adlD1Thresholds = d.adlD1Thresholds ?? adlD1ThresholdsFromEnv(process.env);
   }
 
   /**
@@ -180,6 +194,53 @@ export class V22Loop {
         : null;
     } catch (err) {
       this.log(`[v22][lp-cert] ${ctx.label}: LP certification read failed (alert state kept): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  /**
+   * D1 (d1-watch.ts): is a band asset close-only (A != 1), and has it outlived the tag-104 wind-down bound? Read-only: it
+   * uses the market bytes this tick already read. Updates `r.adlAlerts` / `r.lastAdl` only on a decodable market; a
+   * decode failure keeps the previous state (never raises or resolves on a bad read). Never throws.
+   */
+  private checkAdlCloseOnly(ctx: V22MarketCtx, r: MarketRuntime): void {
+    const nowSlot = BigInt(ctx.readSlot);
+    if (!ctx.isBand || terminalKindOf(ctx.data) !== null) {
+      r.adlTracker.reset(nowSlot);
+      r.adlAlerts = [];
+      r.lastAdl = null;
+      return;
+    }
+    try {
+      const readings: AdlAssetReading[] = [];
+      for (const assetIndex of observationAssetsFor(ctx.marketAddress)) {
+        const a = decodeAdlState(ctx.data, assetIndex);
+        if (!a) return; // not a market account: keep the last state
+        const lifecycle = ctx.data[engineSlotBase(ctx.layout, assetIndex) + ctx.layout.asset.lifecycle];
+        if (lifecycle !== 2 && lifecycle !== 3) continue; // only Active / DrainOnly assets can be close-only in a way a wind-down fixes
+        readings.push({ assetIndex, closeOnly: a.aLong !== ADL_ONE || a.aShort !== ADL_ONE, oiEffLong: a.oiEffLong, oiEffShort: a.oiEffShort, aLong: a.aLong, aShort: a.aShort });
+      }
+      const episodes: AdlEpisode[] = r.adlTracker.observe(readings, nowSlot);
+      r.adlAlerts = evaluateAdlD1({ label: ctx.label, market: ctx.marketAddress, nowSlot, terminal: false, episodes, readings }, this.adlD1Thresholds);
+      const sm = r.adlTracker.summary(episodes);
+      r.lastAdl = {
+        episodes: sm.episodes.map((e) => ({ assetIndex: e.assetIndex, ageSlots: e.ageSlots.toString(), observedSinceSlot: e.observedSinceSlot.toString(), sinceBoot: e.sinceBoot, level: e.level, slotsToBound: e.slotsToBound.toString() })),
+        endedEpisodes: sm.endedEpisodes,
+        longestEndedSlots: sm.longestEndedSlots,
+        endedPastBound: sm.endedPastBound,
+      };
+    } catch (err) {
+      this.log(`[v22][d1] ${ctx.label}: close-only read failed (alert state kept): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  /** Reconcile the D1 close-only / wind-down-overdue alerts of every registered market (kinds carry their own cooldown keys). */
+  private async reconcileAdlD1(): Promise<void> {
+    const active: Alert[] = [];
+    for (const m of this.d.markets()) active.push(...(this.rt.get(m.marketAddress)?.adlAlerts ?? []));
+    try {
+      await (this.d.alertSink ?? getAlertSink()).reconcile(ADL_D1_ALERT_SCOPE, active);
+    } catch (err) {
+      this.log(`[v22][d1] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
     }
   }
 
@@ -248,6 +309,9 @@ export class V22Loop {
         sweepInflight: false,
         lpCertAlerts: [],
         lastLpCert: null,
+        adlTracker: new AdlEpisodeTracker(this.adlD1Thresholds),
+        adlAlerts: [],
+        lastAdl: null,
       };
       this.rt.set(addr, r);
     }
@@ -583,6 +647,7 @@ export class V22Loop {
         const r = this.rtFor(entry.marketAddress);
         r.lastBand = bandHealthFor(ctx);
         await this.checkLpCert(ctx, r); // read-only; runs even while a round is in flight
+        this.checkAdlCloseOnly(ctx, r); // D1, read-only, no extra RPC
         if (r.sweepInflight) continue;
         const needsPositioned = f.feeCrankBond || f.holdingRent || f.dustSweep;
         const positioned = needsPositioned ? await this.positionedFor(ctx, r) : null;
@@ -630,6 +695,36 @@ export class V22Loop {
       }
     }
     await this.reconcileLpCert();
+    await this.reconcileAdlD1();
+  }
+
+  /**
+   * D1 SLA rollup for /health: how many band markets are close-only, past the tag-104 bound, or overdue, and how many
+   * have a stalled vault-LP crank (warn / critical). All zero = nothing is stuck.
+   */
+  private d1Rollup(): Record<string, unknown> {
+    let closeOnly = 0;
+    let windDownDue = 0;
+    let overdue = 0;
+    let lpWarn = 0;
+    let lpCritical = 0;
+    for (const r of this.rt.values()) {
+      const eps = r.lastAdl?.episodes ?? [];
+      if (eps.length > 0) closeOnly++;
+      if (eps.some((e) => e.level === "wind-down-due" || e.level === "overdue")) windDownDue++;
+      if (eps.some((e) => e.level === "overdue")) overdue++;
+      if (r.lastLpCert?.level === "warn") lpWarn++;
+      if (r.lastLpCert?.level === "critical") lpCritical++;
+    }
+    return {
+      closeOnlyMarkets: closeOnly,
+      windDownDueMarkets: windDownDue,
+      windDownOverdueMarkets: overdue,
+      lpCrankStaleWarnMarkets: lpWarn,
+      lpCrankStaleCriticalMarkets: lpCritical,
+      windDownBoundSlots: this.adlD1Thresholds.boundSlots.toString(),
+      windDownGraceSlots: this.adlD1Thresholds.graceSlots.toString(),
+    };
   }
 
   healthFields(): Record<string, unknown> {
@@ -640,6 +735,7 @@ export class V22Loop {
         layout: r.layoutNote,
         ...(r.lastBand ? { band: r.lastBand } : {}),
         ...(r.lastLpCert ? { vaultLpCert: r.lastLpCert } : {}),
+        ...(r.lastAdl ? { adlCloseOnly: r.lastAdl } : {}),
         ...(r.lastRound ? { lastRound: r.lastRound } : {}),
         ...(r.lastFee ? { fee78: r.lastFee } : {}),
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
@@ -654,6 +750,7 @@ export class V22Loop {
       flags: describeV22Flags(this.d.flags),
       ticks: this.ticks,
       lastTickAgoMs: this.lastTickAt === null ? null : this.now() - this.lastTickAt,
+      d1: this.d1Rollup(),
       pairing: { ...pairingStats },
       jobs: allJobCounters(),
       layoutProblems: Object.fromEntries([...this.layoutProblems].map(([k, v]) => [k, redactErrorText(v, 200)])),
