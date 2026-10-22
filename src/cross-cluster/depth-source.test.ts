@@ -25,6 +25,7 @@ import {
 import type { DexDepthPin } from "./depth-source.ts";
 import { encodePushAuthMarkDexMode, encodePushAuthMarkMaybeDepth, resolvePushDepth } from "./push-depth.ts";
 import { buildPushAuthMarkIx, pushAuthMarkBatch, WRAPPER_PROGRAM_ID } from "./auth-mark-pusher.ts";
+import { nonComputeBudget } from "./test-ix.ts";
 
 const k = () => Keypair.generate().publicKey;
 const PUMP = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
@@ -201,7 +202,7 @@ function marketAccount(): Uint8Array {
   view.setBigUint64(profileOff + V17_ASSET_CONTROL_SEQUENCES_OFF, 100n, true);
   return buf;
 }
-type Ix = { keys: Array<{ pubkey: PublicKey }>; data: Uint8Array };
+type Ix = { programId: PublicKey; keys: Array<{ pubkey: PublicKey }>; data: Uint8Array };
 function chain(refuse129: Set<string>) {
   const simulated: Ix[][] = [];
   const sent: Ix[][] = [];
@@ -210,7 +211,7 @@ function chain(refuse129: Set<string>) {
     conn: {
       async getMultipleAccountsInfo(pks: PublicKey[]) { return pks.map(() => ({ data: marketAccount() })); },
       async simulateTransaction(tx: { instructions: Ix[] }) {
-        const ixs = tx.instructions.slice(1);
+        const ixs = nonComputeBudget(tx.instructions);
         simulated.push(ixs);
         for (let i = 0; i < ixs.length; i++) {
           if (ixs[i].data.length === 44 && ixs[i].data[35] === 2 && refuse129.has(ixs[i].keys[1].pubkey.toBase58())) {

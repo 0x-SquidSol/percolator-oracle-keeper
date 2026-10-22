@@ -34,6 +34,8 @@ import {
   resetPushLandingState,
 } from "./auth-mark-pusher.ts";
 import { pruneDeregisteredMarkets } from "./keeper-loop.ts";
+import { nonComputeBudget } from "./test-ix.ts";
+import type { PublicKey } from "@solana/web3.js";
 
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
 
@@ -49,7 +51,7 @@ function marketAccount(oracleObservation: bigint): Uint8Array {
   return buf;
 }
 
-type IxLike = { keys: Array<{ pubkey: { toBase58(): string } }>; data: Uint8Array };
+type IxLike = { programId: PublicKey; keys: Array<{ pubkey: { toBase58(): string } }>; data: Uint8Array };
 const seqOf = (ix: IxLike) => new DataView(ix.data.buffer, ix.data.byteOffset, ix.data.byteLength).getBigUint64(27, true);
 
 /** Chain whose read view does NOT see our in-flight txs (they land later): the K-7 condition. */
@@ -77,7 +79,7 @@ function chain(markets: string[], start = 100n, landedErr: (pos: number) => unkn
     /** Capture the pushes of the tx being sent (keeper builds then simulates, so use simulate for decoding). */
     capture(conn: { simulateTransaction: (tx: { instructions: IxLike[] }) => Promise<unknown> }) {
       conn.simulateTransaction = async (tx: { instructions: IxLike[] }) => {
-        const ixs = tx.instructions.slice(1);
+        const ixs = nonComputeBudget(tx.instructions);
         sent.push({ markets: ixs.map((ix) => ix.keys[1].pubkey.toBase58()), seqs: ixs.map(seqOf) });
         return { value: { err: null } };
       };

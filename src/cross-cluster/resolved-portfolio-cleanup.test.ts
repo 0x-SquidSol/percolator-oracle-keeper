@@ -37,6 +37,7 @@ import {
 import type { CleanupConfig, CleanupConnection } from "./resolved-portfolio-cleanup.ts";
 import { TerminalInsuranceState, windDownOnce } from "./terminal-insurance.ts";
 import type { TerminalConnection, TerminalInsuranceConfig } from "./terminal-insurance.ts";
+import { nonComputeBudgetCompiled } from "./test-ix.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (n: string): Buffer => Buffer.from(readFileSync(join(here, "__fixtures__", `${n}.b64`), "utf8").trim(), "base64");
@@ -93,7 +94,7 @@ function cconn(portfolios: Array<{ pubkey: PublicKey; data: Buffer }>, reply: (t
   const totalChunks = opts.chunks ?? 1;
   const isChunk = (t: number[]) => (t.includes(30) && !t.includes(8)) || t.includes(101);
   const tagsOf = (tx: VersionedTransaction): number[] =>
-    tx.message.compiledInstructions.slice(1).map((ix) => {
+    nonComputeBudgetCompiled(tx.message.compiledInstructions, tx.message.staticAccountKeys).map((ix) => {
       const pid = tx.message.staticAccountKeys[ix.programIdIndex].toBase58();
       if (pid === WRAPPER.toBase58()) return ix.data[0] === 101 ? (ix.data[1] === 1 ? 1011 : 101) : ix.data[0];
       return pid.startsWith("ATok") ? -1 : -2;

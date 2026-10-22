@@ -7,6 +7,7 @@ import { LAYOUT_V22, WRAPPER_ACCOUNT_MAGIC } from "@percolatorct/sdk";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { ExecConnection, ExecContext } from "./exec.ts";
 import { COMPUTE_IX_COUNT } from "./exec.ts";
+import { nonComputeBudget, nonComputeBudgetCompiled } from "../test-ix.ts";
 import { V22_ASSET_BAND_OFF, V22_CONFIG_OFF, buildV22MarketCtx } from "./market.ts";
 import type { V22MarketCtx } from "./market.ts";
 import { layoutById, engineSlotBase } from "../market-layout.ts";
@@ -57,7 +58,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
   let sim = 0;
   let slot = 1000;
   const decode = (msg: { compiledInstructions: Array<{ programIdIndex: number; accountKeyIndexes: number[]; data: Uint8Array }>; staticAccountKeys: PublicKey[] }): SentTx => {
-    const ixs = msg.compiledInstructions.slice(COMPUTE_IX_COUNT);
+    const ixs = nonComputeBudgetCompiled(msg.compiledInstructions, msg.staticAccountKeys);
     return { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.accountKeyIndexes.map((k) => msg.staticAccountKeys[k].toBase58())) };
   };
   const conn = {
@@ -80,7 +81,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       // decode the transaction actually being sent (phase-1 txs are simulated and sent concurrently)
       rawSizes.push(raw.length);
       const t = Transaction.from(Buffer.from(raw));
-      const ixs = t.instructions.slice(COMPUTE_IX_COUNT);
+      const ixs = nonComputeBudget(t.instructions);
       const d: SentTx = { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.keys.map((k) => k.pubkey.toBase58())) };
       sentData.push(ixs.map((i) => new Uint8Array(i.data)));
       sent.push({ ...d, order: order++ });

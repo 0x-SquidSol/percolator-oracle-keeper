@@ -23,6 +23,7 @@ import {
   pushStakeFeesOnce,
 } from "./stake-fee-pusher.ts";
 import type { StakeFeeConfig, StakeFeeConnection } from "./stake-fee-pusher.ts";
+import { nonComputeBudgetCompiled } from "./test-ix.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = (name: string): Buffer =>
@@ -181,7 +182,8 @@ describe("pushStakeFeesOnce — real devnet bytes", () => {
     assert.match((o as { detail: string }).detail, /pushed 4563668 atoms/);
     const msg = s.calls.simTx!.message;
     const keys = msg.staticAccountKeys;
-    const ixs = msg.compiledInstructions;
+    // [CU limit, payloads...]: with KEEPER_PRIORITY_FEE_MICROLAMPORTS set a trailing SetComputeUnitPrice is appended (S3-A2); it is not a payload.
+    const ixs = [msg.compiledInstructions[0], ...nonComputeBudgetCompiled(msg.compiledInstructions, keys)];
     assert.equal(ixs.length, 3);
     const prog = (i: number) => keys[ixs[i].programIdIndex].toBase58();
     assert.equal(prog(1), WRAPPER.toBase58());

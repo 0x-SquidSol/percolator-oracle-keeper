@@ -37,6 +37,8 @@ import type { V22MarketCtx, V22MarketLoad } from "./market.ts";
 import { loadV22Positioned, parseAccrueAnchors } from "./positioned.ts";
 import { simulateAndSend, simulateOnly } from "./exec.ts";
 import { buildObservationCrankIx } from "../positioned-refresh.ts";
+import { buildLivenessRepairIx, decodeLivenessState, describeRepair, planLivenessRepairs } from "../liveness-repair.ts";
+import type { LivenessRepair } from "../liveness-repair.ts";
 import { parseSeniorDrawLogs } from "../vault-lp-crank.ts";
 import type { V22Positioned } from "./positioned.ts";
 import { readMarginParams } from "./liquidation.ts";
@@ -65,6 +67,8 @@ import { LP_CERT_ALERT_SCOPE, evaluateVaultLpCrankStaleness, lpCertLevelOf, lpCe
 import type { LpCertThresholds } from "./lp-cert-liveness.ts";
 
 export interface V22LoopDeps {
+  /** Minimum ms between two catch-up txs across ALL markets (default KEEPER_V22_CATCHUP_SPACING_MS or 1500). */
+  catchupSpacingMs?: number;
   conn: Connection;
   keeper: Keypair;
   programId: PublicKey;
@@ -122,6 +126,8 @@ interface MarketRuntime {
   layoutNote: string | null;
   positionedCache: { at: number; value: V22Positioned } | null;
   sweepInflight: boolean;
+  /** Liveness repairs (tag 89 / 45) are not retried before this time after one did not land (ms). */
+  repairBackoffUntilMs: number;
   /** Active vault-LP crank liveness alerts from the last GOOD read (kept across a failed read, never cleared by one). */
   lpCertAlerts: Alert[];
   /** /health: the LP certification staleness of the worst asset at the last good read. */
@@ -129,6 +135,8 @@ interface MarketRuntime {
 }
 
 const POSITIONED_TTL_MS = 10_000;
+/** Margin on a simulated one-crank catch-up cost when sizing the catch-up tx (per-crank cost varies a few % with state). */
+const CATCHUP_MEASURED_MARGIN = 1.08;
 
 export class V22Loop {
   private readonly rt = new Map<string, MarketRuntime>();
@@ -138,6 +146,8 @@ export class V22Loop {
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
+  /** v22price 2026-10-22: when the last catch-up tx (any market) was started; see `catchupSpacingMs`. */
+  private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
 
   constructor(private readonly d: V22LoopDeps) {
     this.log = d.log ?? ((s) => console.log(s));
@@ -218,6 +228,7 @@ export class V22Loop {
         lastOutstandingRoundAtMs: 0,
         quarantineHistory: new Map(),
         anchorBadRounds: 0,
+        repairBackoffUntilMs: 0,
         deferrals: new Map(),
         escalated: new Map(),
         lastLpSettledAtMs: 0,
@@ -310,6 +321,28 @@ export class V22Loop {
       if (!ctx) return false;
       r.lastBand = bandHealthFor(ctx);
       if (ctx.refresh.lifecycle !== 2 && ctx.refresh.lifecycle !== 3) return false; // not Active / DrainOnly
+      // v22price 2026-10-22: liveness repairs on EVERY asset of a v2.2 market, before any crank. A lapsed `Fresh` backing
+      // bucket refuses every settle of a gain against it with EngineStale (19) and only ExpireBackingBucket (tag 89) frees
+      // it (wrapper v16_program.rs, ExpireBackingBucket doc). The legacy cranker plans these repairs, but a v2.2-owned
+      // market returns into this delegate before it does, and it only ever decoded asset 0: cap4b 2xhs (asset 2, domain 5,
+      // lapsed ~2M slots) refused every round with Custom(19) and its counterparty stayed loss-stale. A landed repair ends
+      // this cycle (the round runs on the next one, on the repaired state); one that does not land backs off 60 s and the
+      // round still runs.
+      if (this.now() >= r.repairBackoffUntilMs) {
+        const repairs = livenessRepairsFor(ctx);
+        if (repairs.length > 0) {
+          const ixs = repairs.map((x) => {
+            const ix = buildLivenessRepairIx(ctx.market, x);
+            ix.programId = this.d.programId;
+            return ix;
+          });
+          const out = await simulateAndSend(this.execCtx(), ixs, { job: "liveness-repair", label: ctx.label, units: Math.min(MAX_TX_CU, 40_000 * ixs.length + ACCRUAL_TX_CU_HEADROOM) });
+          const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
+          this.log(`[v22][repair] ${ctx.label}: ${repairs.map(describeRepair).join(", ")}: ${what}`);
+          if (out.kind === "sent" && out.landed === "landed") return true;
+          r.repairBackoffUntilMs = this.now() + 60_000;
+        }
+      }
       const positioned = await this.positionedFor(ctx, r);
       if (!positioned || !positioned.lp) {
         this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
@@ -325,6 +358,13 @@ export class V22Loop {
       {
         const n = catchupCrankCount(BigInt(ctx.readSlot) - ctx.refresh.slotLast, ctx.refresh.maxAccrualDtSlots);
         if (n > 0) {
+          // v22price 2026-10-22: pace catch-up across markets. After an outage every market is behind at once; one
+          // catch-up tx per market per cycle (each with two simulations, a send and status polls) hit the RPC key's rate
+          // limit (429) and starved the pushes. Skipped markets catch up on a later cycle; returning true keeps the
+          // legacy cranker from sending its own catch-up meanwhile.
+          const spacing = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
+          if (this.now() - this.lastCatchupAtMs < spacing) return true;
+          this.lastCatchupAtMs = this.now();
           await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
           return true;
         }
@@ -422,9 +462,22 @@ export class V22Loop {
    */
   private async multiAssetCatchup(ctx: V22MarketCtx, target: PublicKey, wanted: number): Promise<void> {
     const hints = observationAssetsFor(ctx.marketAddress).length;
-    const n = Math.min(wanted, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM));
-    const ixs = Array.from({ length: n }, () => buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx)));
-    const units = Math.min(MAX_TX_CU, n * catchupCrankCuFor(CATCHUP_CRANK_CU, hints) + ACCRUAL_TX_CU_HEADROOM);
+    const crank = () => buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx));
+    // v22price 2026-10-22: the per-crank cost depends on the market's config (v2.2 single-asset 36,350 CU; a band market
+    // 42,538), so a fixed estimate either overflows the tx or wastes it. Measure THIS market with a one-crank simulation and
+    // size the tx from it (+8%); the static estimate is the fallback when the measurement is unavailable.
+    let perCrank = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
+    if (wanted > 1) {
+      try {
+        const one = await simulateOnly(this.execCtx(), [crank()], { units: MAX_TX_CU });
+        if (!one.err && one.unitsConsumed && one.unitsConsumed > 0) perCrank = Math.ceil(one.unitsConsumed * CATCHUP_MEASURED_MARGIN);
+      } catch {
+        // keep the static estimate
+      }
+    }
+    const n = Math.min(wanted, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, perCrank, 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM));
+    const ixs = Array.from({ length: n }, crank);
+    const units = Math.min(MAX_TX_CU, n * perCrank + ACCRUAL_TX_CU_HEADROOM);
     const out = await simulateAndSend(this.execCtx(), ixs, { job: "catchup-multi", label: ctx.label, units });
     const gap = BigInt(ctx.readSlot) - ctx.refresh.slotLast;
     const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
@@ -619,4 +672,21 @@ export async function startV22Loop(loop: V22Loop, tickMs: number): Promise<void>
     }
     await new Promise((r) => setTimeout(r, tickMs));
   }
+}
+
+/**
+ * Liveness repairs of every engine slot of a v2.2 market (lapsed Fresh backing buckets, finalizable ResetPending sides),
+ * planned at the slot the market was read at (`planLivenessRepairs`). A slot that does not decode is skipped (never
+ * guessed). Exported for tests.
+ */
+export function livenessRepairsFor(ctx: Pick<V22MarketCtx, "data" | "readSlot" | "slots">): LivenessRepair[] {
+  const out: LivenessRepair[] = [];
+  for (let i = 0; i < ctx.slots; i++) {
+    try {
+      out.push(...planLivenessRepairs(decodeLivenessState(ctx.data, i), BigInt(ctx.readSlot)));
+    } catch {
+      // unreadable slot: no repair planned for it
+    }
+  }
+  return out;
 }
