@@ -69,6 +69,9 @@ import { ADL_D1_ALERT_SCOPE, AdlEpisodeTracker, adlD1ThresholdsFromEnv, evaluate
 import type { AdlAssetReading, AdlD1Thresholds, AdlEpisode } from "./d1-watch.ts";
 import { ADL_ONE, decodeAdlState } from "../adl-state.ts";
 import { engineSlotBase } from "../market-layout.ts";
+import { LifecycleEngine } from "./lifecycle.ts";
+import { crankLpFeesOnce } from "../lp-fee-cranker.ts";
+import { pushStakeFeesOnce, stakeFeeConfigFromEnv } from "../stake-fee-pusher.ts";
 
 export interface V22LoopDeps {
   /** Minimum ms between two catch-up txs across ALL markets (default KEEPER_V22_CATCHUP_SPACING_MS or 1500). */
@@ -77,7 +80,7 @@ export interface V22LoopDeps {
   keeper: Keypair;
   programId: PublicKey;
   /** The live registry (hot-reloaded in place). */
-  markets: () => ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio">>;
+  markets: () => ReadonlyArray<Pick<MarketEntry, "marketAddress" | "label" | "lpPortfolio"> & Partial<Pick<MarketEntry, "dexType" | "assets">>>;
   flags: V22Flags;
   /** Global DRY_RUN / --dry-run. */
   dryRun: boolean;
@@ -161,12 +164,69 @@ export class V22Loop {
   private layoutProblems = new Map<string, string>();
   /** v22price 2026-10-22: when the last catch-up tx (any market) was started; see `catchupSpacingMs`. */
   private lastCatchupAtMs = Number.NEGATIVE_INFINITY;
+  /** Market lifecycle: dead-market classifier, permissionless stale resolve (default OFF), warn-band fee forcing (default OFF). */
+  private readonly lifecycle: LifecycleEngine | null;
 
   constructor(private readonly d: V22LoopDeps) {
     this.log = d.log ?? ((s) => console.log(s));
     this.now = d.now ?? Date.now;
     this.lpCertThresholds = d.lpCertThresholds ?? lpCertThresholdsFromEnv(process.env);
     this.adlD1Thresholds = d.adlD1Thresholds ?? adlD1ThresholdsFromEnv(process.env);
+    const lc = d.flags.lifecycle;
+    if (lc.classify) {
+      const sink = d.alertSink ?? getAlertSink();
+      this.lifecycle = new LifecycleEngine({
+        conn: d.conn as never,
+        keeper: d.keeper,
+        programId: d.programId,
+        cfg: lc,
+        dryRun: d.dryRun || d.flags.dryRun,
+        registered: (m) => this.d.markets().some((x) => x.marketAddress === m),
+        sink: { reconcile: (scope, a) => sink.reconcile(scope, a), fire: async (scope, a) => ("fire" in sink && typeof sink.fire === "function" ? (sink as Pick<AlertSink, "fire">).fire(scope, a) : false) },
+        forceFees: lc.warnBandFees ? (ctx) => this.forceFeesFor(ctx) : undefined,
+        sourceGroup: (m) => {
+          const row = this.d.markets().find((x) => x.marketAddress === m);
+          if (!row) return null;
+          if (row.dexType) return row.dexType;
+          const dex = [...new Set((row.assets ?? []).map((a) => (a.source === "pool" ? (a.dexType ?? "pool") : "fixed")))].sort();
+          return dex.length > 0 ? dex.join("+") : null;
+        },
+        now: d.now,
+        log: this.log,
+      });
+    } else {
+      this.lifecycle = null;
+    }
+  }
+
+  /**
+   * Warn-band fee round (KEEPER_V22_WARN_BAND_FEES): tag 78 (the LP leg) and tag 87 + stake 12 (the staker leg) NOW, whatever the
+   * fee loop's cadence and the push thresholds say. Both are Live-only and refused once the stale window matures, and an
+   * uncranked staker leg is forfeited at resolve. Reuses the normal crankers: bond markets go through the v2.2 bond fee path (with
+   * the settle-pairing policy), the rest through the legacy tag-78 job, and tag 87 through the stake-fee pusher with its minimum
+   * push lowered to 1 atom. The pusher's dead-share gate stays (it protects stakers from a griefing dust deposit).
+   */
+  private async forceFeesFor(ctx: V22MarketCtx): Promise<string> {
+    const f = this.d.flags;
+    const dry = this.d.dryRun || f.dryRun;
+    const parts: string[] = [];
+    // Never alongside a v2.2 settle round on the same market (a round may be settling the vault LP): defer to the next tick.
+    const r = this.rtFor(ctx.marketAddress);
+    if (r.sweepInflight) return "deferred: a v2.2 settle round is in flight on this market";
+    {
+      if (f.feeCrankBond && ctx.bond) {
+        const positioned = await this.positionedFor(ctx, r);
+        const res = await crankBondFee(this.sweepDeps(), ctx, positioned, { mode: pairingActive(f) ? f.pairing : "off", weightBudget: weightBudgetFor() });
+        parts.push(`78(bond) ${res.kind === "skipped" ? `skipped: ${res.reason}` : res.kind}`);
+      } else {
+        const o = await crankLpFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry);
+        parts.push(`78 ${typeof o === "string" ? o : o.error}`);
+      }
+      const stakeCfg = { ...stakeFeeConfigFromEnv(process.env), minPushAtoms: 1n };
+      const st = await pushStakeFeesOnce(this.d.conn as never, this.d.keeper, ctx.marketAddress, dry, stakeCfg);
+      parts.push(`87+12 ${st.kind}${st.kind === "skipped" ? `: ${st.reason}` : st.kind === "failed" ? `: ${st.error}` : st.kind === "waiting" || st.kind === "blocked" ? `: ${st.reason}` : ""}`);
+      return parts.join("; ");
+    }
   }
 
   /**
@@ -639,13 +699,17 @@ export class V22Loop {
     this.lastTickAt = this.now();
     const f = this.d.flags;
     const exec = this.execCtx();
+    this.lifecycle?.beginTick();
     for (const entry of this.d.markets()) {
       try {
         const load = await loadV22Market(this.d.conn, entry, this.d.programId);
+        // An RPC failure (not "the account is gone") makes this tick an unclean observation for the lifecycle guards.
+        if (!load.ok && load.reason === "unreadable" && load.detail !== "market account not found") this.lifecycle?.noteReadFailure();
         const ctx = this.noteLoad(entry, load);
         if (!ctx) continue;
         const r = this.rtFor(entry.marketAddress);
         r.lastBand = bandHealthFor(ctx);
+        this.lifecycle?.observe(ctx); // dead-market classifier, read-only, no extra RPC
         await this.checkLpCert(ctx, r); // read-only; runs even while a round is in flight
         this.checkAdlCloseOnly(ctx, r); // D1, read-only, no extra RPC
         if (r.sweepInflight) continue;
@@ -692,10 +756,16 @@ export class V22Loop {
         }
       } catch (err) {
         this.log(`[v22] ${entry.label}: tick error: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+        this.lifecycle?.noteReadFailure();
       }
     }
     await this.reconcileLpCert();
     await this.reconcileAdlD1();
+    try {
+      await this.lifecycle?.endTick();
+    } catch (err) {
+      this.log(`[v22][lifecycle] tick failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
   }
 
   /**
@@ -744,6 +814,7 @@ export class V22Loop {
         ...(r.lastEarn ? { earnExit: r.lastEarn } : {}),
         ...(r.escalated.size > 0 ? { persistentDeferrals: [...r.escalated].map(([k, v]) => ({ portfolio: k, rounds: v.count, sinceMsAgo: this.now() - v.atMs })) } : {}),
         ...(this.layoutProblems.has(addr) ? { layoutProblem: redactErrorText(this.layoutProblems.get(addr) as string, 200) } : {}),
+        ...(this.lifecycle?.view(addr) ? { lifecycle: this.lifecycle.view(addr) } : {}),
       };
     }
     return {
@@ -755,6 +826,7 @@ export class V22Loop {
       jobs: allJobCounters(),
       layoutProblems: Object.fromEntries([...this.layoutProblems].map(([k, v]) => [k, redactErrorText(v, 200)])),
       markets,
+      ...(this.lifecycle ? { lifecycle: this.lifecycle.healthFields() } : {}),
     };
   }
 }

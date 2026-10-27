@@ -32,6 +32,31 @@
  *   KEEPER_V22_ACCRUE_ANCHORS     "market:flatPortfolio,..." accrue-only crank targets (optional; else discovered)
  *   VAULT_LP_LONE_CRANK           "on" (default, today's behaviour) | "off": the lone LP crank 1.5 s after a landed push
  *
+ * Market lifecycle (v22/lifecycle*.ts; plan v22-market-lifecycle-plan-2026-10-25 section 2 option C):
+ *   KEEPER_V22_LIFECYCLE          "on" (default) | "off": the READ-ONLY dead-market classifier (NEVER-CONNECTED / DEAD-PRICE warn+matured /
+ *                                 DEAD-INTEREST), /health `v22.lifecycle` and its alerts. Sends nothing.
+ *   KEEPER_V22_STALE_RESOLVE      "off" (DEFAULT) | "dry" | "on": the permissionless stale resolve (wrapper tag 39). `dry` runs every guard and the
+ *                                 simulation and logs "would resolve", sending nothing. IRREVERSIBLE when on: read v22/lifecycle-resolve.ts first.
+ *   KEEPER_V22_STALE_RESOLVE_MIN_OBS_MS   continuous healthy observation AND source-unavailable time required before a resolve (default 1800000 = 30 min)
+ *   KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD  more matured markets than this at once = outage-shaped: resolve none, alert (default 3)
+ *   KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE   resolves per tick (default 1)
+ *   KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW  comma-separated market addresses: ONLY these unregistered markets whose oracle authority is
+ *                                 this keeper may be resolved (default none = they are HELD with an alert: register them or decide)
+ *   KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT  correlation hold: when at least this percent (default 100; the group needs >= 2 pushable markets) of the
+ *                                 pushable markets sharing one DEX type lack a usable source at once, resolves of that group are held
+ *   KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX / _PCT  global source-health hold: more than MAX (default 3), or more than PCT percent (default 50,
+ *                                 and at least 2) of the markets the keeper can push lack a usable source price at once = a price-reader
+ *                                 regression, not dead markets: resolve no pushable market, alert
+ *   KEEPER_V22_STALE_RESOLVE_RETRY_MS        wait after an attempt that did not resolve before the next one on that market (default 600000)
+ *   KEEPER_V22_LIFECYCLE_MAX_GAP_MS          a gap between two observations longer than this breaks "continuous" (default 120000)
+ *   KEEPER_V22_NEVER_CONNECTED_GRACE_SLOTS   price age before a market with no push path is called NEVER-CONNECTED (default 1500, about 10 min)
+ *   KEEPER_V22_DEAD_INTEREST_DAYS            quiet days (OI = 0 and no trade-fee accrual observed) before DEAD-INTEREST (default 14)
+ *   KEEPER_V22_LIFECYCLE_DISCOVERY_MS        gPA (keys only) for wrapper markets that have no registry row (default 600000; 0 = off)
+ *   KEEPER_V22_LIFECYCLE_STATE_FILE          absolute path: persists the DEAD-INTEREST quiet clock across restarts (default none = in memory only)
+ *   KEEPER_V22_WARN_BAND_FEES     "on" | "off" (DEFAULT): in the DEAD-PRICE warn band force tags 78 and 87+stake 12 every spacing, before maturity refuses them
+ *   KEEPER_V22_WARN_BAND_FEE_SPACING_MS      minimum ms between forced crank rounds of one market (default 60000)
+ *   KEEPER_V22_WARN_BAND_FEE_MAX_PER_TICK    most markets forced per tick (default 4)
+ *
  * `SETTLE_PAIRING` and the lone LP crank: see settle-pairing.ts. With pairing on and the sweep on, the lone crank
  * is suppressed on v2.2 markets whatever VAULT_LP_LONE_CRANK says.
  *
@@ -42,6 +67,51 @@
  */
 
 export type PairingMode = "off" | "prefer" | "strict";
+
+export type StaleResolveMode = "off" | "dry" | "on";
+
+/** The market-lifecycle layer (classifier, permissionless stale resolve, warn-band fee forcing). See the header. */
+export interface LifecycleConfig {
+  classify: boolean;
+  staleResolve: StaleResolveMode;
+  minObservationMs: number;
+  massThreshold: number;
+  maxResolvesPerCycle: number;
+  unregisteredAllow: string[];
+  sourceLossMax: number;
+  sourceLossPct: number;
+  groupLossPct: number;
+  resolveRetryMs: number;
+  maxGapMs: number;
+  neverConnectedGraceSlots: number;
+  deadInterestDays: number;
+  discoveryMs: number;
+  stateFile: string | null;
+  warnBandFees: boolean;
+  warnBandFeeSpacingMs: number;
+  warnBandFeeMaxPerTick: number;
+}
+
+export const LIFECYCLE_DEFAULTS: LifecycleConfig = {
+  classify: true,
+  staleResolve: "off",
+  minObservationMs: 1_800_000,
+  massThreshold: 3,
+  maxResolvesPerCycle: 1,
+  unregisteredAllow: [],
+  sourceLossMax: 3,
+  sourceLossPct: 50,
+  groupLossPct: 100,
+  resolveRetryMs: 600_000,
+  maxGapMs: 120_000,
+  neverConnectedGraceSlots: 1_500,
+  deadInterestDays: 14,
+  discoveryMs: 600_000,
+  stateFile: null,
+  warnBandFees: false,
+  warnBandFeeSpacingMs: 60_000,
+  warnBandFeeMaxPerTick: 4,
+};
 
 export interface V22Flags {
   enabled: boolean;
@@ -70,6 +140,8 @@ export interface V22Flags {
   mainnetBuild: boolean;
   /** Longest the keeper leaves the vault LP unsettled while the market is otherwise healthy before a forced paired round (ms). */
   lpMaxUnsettledMs: number;
+  /** Market lifecycle: classifier, permissionless stale resolve (default OFF), warn-band fee forcing (default OFF). */
+  lifecycle: LifecycleConfig;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -103,13 +175,77 @@ function posInt(env: Env, key: string, def: number): number {
   return n;
 }
 
+/** unset / empty -> `def`; otherwise an integer >= 0 (0 is meaningful: "off"), else THROWS. */
+function nonNegInt(env: Env, key: string, def: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return def;
+  const n = Number(raw.trim());
+  if (!Number.isInteger(n) || n < 0) throw new V22FlagError(key, raw, "a non-negative integer");
+  return n;
+}
+
+function staleResolveMode(env: Env): StaleResolveMode {
+  const raw = env.KEEPER_V22_STALE_RESOLVE;
+  if (raw === undefined || raw.trim() === "") return "off";
+  const v = raw.trim().toLowerCase();
+  if (v === "off" || v === "dry" || v === "on") return v;
+  // "1" / "true" are deliberately NOT accepted: an irreversible action is armed by the word "on" only.
+  throw new V22FlagError("KEEPER_V22_STALE_RESOLVE", raw, "off | dry | on");
+}
+
+function addressList(env: Env, key: string): string[] {
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return [];
+  const out: string[] = [];
+  for (const part of raw.split(",")) {
+    const a = part.trim();
+    if (a === "") continue;
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a)) throw new V22FlagError(key, raw, "comma-separated base58 addresses");
+    if (!out.includes(a)) out.push(a);
+  }
+  return out;
+}
+
+function lifecycleFromEnv(env: Env): LifecycleConfig {
+  const stateRaw = env.KEEPER_V22_LIFECYCLE_STATE_FILE?.trim();
+  if (stateRaw && !stateRaw.startsWith("/")) throw new V22FlagError("KEEPER_V22_LIFECYCLE_STATE_FILE", stateRaw, "an absolute path");
+  return {
+    classify: parseFlag(env, "KEEPER_V22_LIFECYCLE", true),
+    staleResolve: staleResolveMode(env),
+    minObservationMs: posInt(env, "KEEPER_V22_STALE_RESOLVE_MIN_OBS_MS", LIFECYCLE_DEFAULTS.minObservationMs),
+    massThreshold: posInt(env, "KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD", LIFECYCLE_DEFAULTS.massThreshold),
+    maxResolvesPerCycle: posInt(env, "KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE", LIFECYCLE_DEFAULTS.maxResolvesPerCycle),
+    unregisteredAllow: addressList(env, "KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW"),
+    sourceLossMax: posInt(env, "KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX", LIFECYCLE_DEFAULTS.sourceLossMax),
+    groupLossPct: (() => {
+      const v = posInt(env, "KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT", LIFECYCLE_DEFAULTS.groupLossPct);
+      if (v > 100) throw new V22FlagError("KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT", String(v), "1..100");
+      return v;
+    })(),
+    sourceLossPct: (() => {
+      const v = posInt(env, "KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT", LIFECYCLE_DEFAULTS.sourceLossPct);
+      if (v > 100) throw new V22FlagError("KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_PCT", String(v), "1..100");
+      return v;
+    })(),
+    resolveRetryMs: posInt(env, "KEEPER_V22_STALE_RESOLVE_RETRY_MS", LIFECYCLE_DEFAULTS.resolveRetryMs),
+    maxGapMs: posInt(env, "KEEPER_V22_LIFECYCLE_MAX_GAP_MS", LIFECYCLE_DEFAULTS.maxGapMs),
+    neverConnectedGraceSlots: posInt(env, "KEEPER_V22_NEVER_CONNECTED_GRACE_SLOTS", LIFECYCLE_DEFAULTS.neverConnectedGraceSlots),
+    deadInterestDays: posInt(env, "KEEPER_V22_DEAD_INTEREST_DAYS", LIFECYCLE_DEFAULTS.deadInterestDays),
+    discoveryMs: nonNegInt(env, "KEEPER_V22_LIFECYCLE_DISCOVERY_MS", LIFECYCLE_DEFAULTS.discoveryMs),
+    stateFile: stateRaw ? stateRaw : null,
+    warnBandFees: parseFlag(env, "KEEPER_V22_WARN_BAND_FEES", false),
+    warnBandFeeSpacingMs: posInt(env, "KEEPER_V22_WARN_BAND_FEE_SPACING_MS", LIFECYCLE_DEFAULTS.warnBandFeeSpacingMs),
+    warnBandFeeMaxPerTick: posInt(env, "KEEPER_V22_WARN_BAND_FEE_MAX_PER_TICK", LIFECYCLE_DEFAULTS.warnBandFeeMaxPerTick),
+  };
+}
+
 const U64_MAX = (1n << 64n) - 1n;
 
 /** Every v2.2 flag at its default (OFF; G9 dry-run ON; the lone LP crank ON = today). */
 export const V22_FLAG_DEFAULTS: V22Flags = {
   enabled: false, dryRun: false, tickMs: 20_000, feeCrankBond: false, sweep: false, liquidate: false, liquidatePadBps: 500, liquidateMaxPerTx: 4, pairing: "prefer", holdingRent: false,
   rentCadenceSlots: 9_000, dustSweep: false, g9: false, g9DryRun: true, g9AllowAnyOracleMode: false, g9DrawCapAtoms: U64_MAX,
-  stakeSync: false, stakeSyncIntervalMs: 60_000, stakeCommitTarget: false, earnExit: false, loneLpCrank: true, mainnetBuild: false, lpMaxUnsettledMs: 300_000,
+  stakeSync: false, stakeSyncIntervalMs: 60_000, stakeCommitTarget: false, earnExit: false, loneLpCrank: true, mainnetBuild: false, lpMaxUnsettledMs: 300_000, lifecycle: LIFECYCLE_DEFAULTS,
 };
 
 export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
@@ -160,6 +296,7 @@ export function v22FlagsFromEnv(env: Env = process.env): V22Flags {
     loneLpCrank,
     mainnetBuild: parseFlag(env, "KEEPER_V22_MAINNET_BUILD", false),
     lpMaxUnsettledMs: posInt(env, "KEEPER_V22_LP_MAX_UNSETTLED_MS", 300_000),
+    lifecycle: lifecycleFromEnv(env),
   };
 }
 
@@ -184,6 +321,9 @@ export function describeV22Flags(f: V22Flags): Record<string, string | number | 
     earnExit: f.earnExit,
     loneLpCrank: f.loneLpCrank,
     lpMaxUnsettledMs: f.lpMaxUnsettledMs,
+    lifecycle: f.lifecycle.classify,
+    staleResolve: f.lifecycle.staleResolve,
+    warnBandFees: f.lifecycle.warnBandFees,
   };
 }
 

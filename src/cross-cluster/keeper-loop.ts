@@ -18,6 +18,7 @@
  */
 import http from "http";
 import { Connection, Keypair } from "@solana/web3.js";
+import { lifecycleLedger } from "./v22/lifecycle-ledger.ts";
 import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
 import { isSolUsdEntry, readAllPoolPricesE6 } from "./price-reader.ts";
@@ -490,6 +491,7 @@ export function recordMultiAssetPushOutcome(
       crossClusterCircuitBreakerStates.set(p.key, commitPublishedBreakerState(crossClusterCircuitBreakerStates.get(p.key), o.pending, o.stamp));
     }
     recordLandedPush(stat, o.stamp, res.signature);
+    lifecycleLedger.recordPushLanded(p.marketAddress, o.stamp);
     stat.lastDepthE6 = p.depth?.depthE6 ?? null;
     stat.lastDepthSource = p.depth?.source ?? null;
     state.landedThisCycle.add(p.key);
@@ -1248,6 +1250,7 @@ async function runCycle(
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
     state.consecutiveBatchReadFailures++;
     state.lastBatchReadError = msg;
+    lifecycleLedger.noteSourceCycle(false, Date.now()); // an unclean observation: the stale-resolve guards restart their clock
     console.error(
       `[loop] batch pool read error (${state.consecutiveBatchReadFailures} consecutive) — ${msg}`,
     );
@@ -1255,6 +1258,7 @@ async function runCycle(
   }
   state.consecutiveBatchReadFailures = 0;
   state.lastBatchReadError = null;
+  lifecycleLedger.noteSourceCycle(true, Date.now());
   // SEC-RC L-3: attest the MIN of this read and the recent pre/post-push reads, so liquidity added just before a push
   // and pulled just after it is not what gets attested. Empty (and untouched) when depth pushes are off.
   const attestReservesUsdE6 = pushDepthOn ? conservativeReserves(depthWindow, quoteReservesUsdE6, Date.now()) : quoteReservesUsdE6;
@@ -1321,6 +1325,7 @@ async function runCycle(
       }
       stat.sourcePriceE6 = fixed;
       stat.lastPriceE6 = fixed;
+      lifecycleLedger.recordSource(entry.marketAddress, true, smoothNowMs);
       pushes.push({ key: entry.key, multi: entry.multi, marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6: fixed, depth: null });
       continue;
     }
@@ -1332,6 +1337,7 @@ async function runCycle(
       continue;
     }
     recordRawPrice(stat, rawPriceE6, smoothNowMs);
+    lifecycleLedger.recordSource(entry.marketAddress, true, smoothNowMs); // a source price the keeper could publish: such a market is pushed, never resolved
     // The mark that settles trades is the SMOOTHED price, never raw spot.
     let priceE6 = smoothedThisCycle.get(entry.poolAddress);
     if (priceE6 === undefined) {
@@ -1553,6 +1559,7 @@ async function runCycle(
           );
         }
         recordLandedPush(stat, stamp, res.signature);
+        lifecycleLedger.recordPushLanded(p.marketAddress, stamp);
         stat.lastDepthE6 = dexPushed.has(p.marketAddress) ? null : (p.depth?.depthE6 ?? null);
         stat.lastDepthSource = dexPushed.has(p.marketAddress) ? DEPTH_SOURCE_ONCHAIN_DEX : (p.depth?.source ?? null);
         state.landedThisCycle.add(p.marketAddress);

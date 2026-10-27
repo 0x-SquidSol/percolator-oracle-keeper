@@ -177,6 +177,20 @@ The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist acco
 | `KEEPER_V22_MAINNET_BUILD` | off | G9 modes 0/2 pass the allowlist PDA + leg accounts |
 | `KEEPER_V22_STAKE_SYNC` / `_INTERVAL_MS` | off / 60000 | stake v5 tag 31 |
 | `KEEPER_V22_EARN_EXIT` | off | tag 77 on `keeper_ok` requests, only on a loss-current book |
+| `KEEPER_V22_LIFECYCLE` | **on** | read-only dead-market classifier (NEVER-CONNECTED / DEAD-PRICE warn + matured / DEAD-INTEREST), `/health` `v22.lifecycle`, alerts. Sends nothing |
+| `KEEPER_V22_STALE_RESOLVE` | **off** | `off` / `dry` / `on` only (`yes`/`true` refused): permissionless stale resolve, wrapper tag 39, IRREVERSIBLE. `dry` runs every guard + the simulation and logs "would resolve". See "Market lifecycle" below |
+| `KEEPER_V22_STALE_RESOLVE_MIN_OBS_MS` | 1800000 | continuous healthy observation AND (for markets the keeper can push) source-unavailable time required before a resolve |
+| `KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD` | 3 | more OUTAGE-SHAPED matured markets than this: resolve none, critical alert |
+| `KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE` / `_RETRY_MS` | 1 / 600000 | resolves per tick; wait after an attempt before retrying that market |
+| `KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW` | none | comma-separated addresses: the ONLY unregistered markets whose oracle authority is this keeper that may be resolved. Otherwise they are HELD with an alert (register or operator decision) |
+| `KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX` / `_PCT` | 3 / 50 | global source-health hold: more than MAX, or more than PCT percent (and >= 2), of the markets the keeper can push lacking a usable source at once = price-reader regression: resolve no pushable market, critical alert |
+| `KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT` | 100 | correlation hold: when this percent (and >= 2 markets) of the pushable markets sharing one DEX type lack a usable source at once, resolves of that group are held |
+| `KEEPER_V22_LIFECYCLE_MAX_GAP_MS` | 120000 | a gap between two observations longer than this breaks "continuous" |
+| `KEEPER_V22_NEVER_CONNECTED_GRACE_SLOTS` | 1500 | price age before a market with no push path is called NEVER-CONNECTED |
+| `KEEPER_V22_DEAD_INTEREST_DAYS` | 14 | quiet days (OI 0, no trade-fee accrual observed) before DEAD-INTEREST |
+| `KEEPER_V22_LIFECYCLE_DISCOVERY_MS` | 600000 | keys-only gPA for wrapper markets with no registry row (0 = off) |
+| `KEEPER_V22_LIFECYCLE_STATE_FILE` | none | absolute path; persists the DEAD-INTEREST quiet clock across restarts |
+| `KEEPER_V22_WARN_BAND_FEES` / `_SPACING_MS` / `_MAX_PER_TICK` | **off** / 60000 / 4 | in the DEAD-PRICE warn band (>= 50% of the stale window) force tag 78 and tag 87 + stake 12 every spacing, because both are refused once matured and an uncranked staker leg is forfeited |
 | `VAULT_LP_LONE_CRANK` | on | `off` suppresses the lone vault-LP crank after every landed push (works without `KEEPER_V22`) |
 
 **SETTLE_PAIRING.** Engine tag 5 on a portfolio settles only that portfolio, then accrues; a loss is booked at once, counterparties' gains
@@ -204,6 +218,16 @@ round is exactly atomic; anyone can still crank the LP alone (tag 5 is permissio
 any keeper action (`prefer` counts it, `strict` freezes the LP until it clears, see `quarantinedNow`); beyond `maxTxsPerRound` (16) `prefer` settles the LP with counterparties unvisited
 (counted) and `strict` skips the LP that round; the accrue-through-a-counterparty fallback settles that counterparty alone at the new K for the round's duration; the LP's rent is not settled under pairing
 (rent is index-based and timing-invariant). Defence in depth: the engine fix is separate.
+
+### Market lifecycle (plan `v22-market-lifecycle-plan-2026-10-25`, option C)
+
+Tag 39 `ResolveStalePermissionless` is the always-on backstop; the keeper fires it at maturity. The admin resolve (deliberate retirements) is NOT done by the keeper. `KEEPER_V22_STALE_RESOLVE` defaults to `off`: merging or deploying changes nothing until it is set.
+
+Classes (`/health` `v22.lifecycle`, per-market `lifecycle`): `never-connected` (no registry row / oracle authority is not this keeper / no accepted push; there is no on-chain creation slot, so this means "never connected as far as this keeper can tell", and needs a price age of at least the grace), `dead-price-warn` (age >= 50% of `permissionless_resolve_stale_slots`), `dead-price-matured` (>= 100%), `dead-interest` (priced, OI 0, no trade-fee accrual observed for N days; there is no on-chain last-trade slot, so the clock is observation-based: OI 0 and unchanged trade-fee accrual counters; it restarts at every boot unless `KEEPER_V22_LIFECYCLE_STATE_FILE` persists it, in which case it spans downtime and the counter comparison on restart catches any trade-fee accrual meanwhile; a trade that paid no fee is invisible), `no-resolve-window` (stale_slots = 0: classified, never attempted). dead-interest is classify + alert only.
+
+Resolve guards (all in `v22/lifecycle-resolve.ts`, each unit-tested with a negative control): mode on; market Live; window enabled; matured; BOTH keeper loops observing continuously for `MIN_OBS_MS` (a keeper that was down, RPC-failing, stalled or just booted never resolves); not outage-shaped (more than `MASS_THRESHOLD` matured markets that the keeper could push and still has a usable source for); a market the keeper can push (registry row and asset-0 oracle authority = this keeper) is resolved only after its source has been unavailable for `MIN_OBS_MS` (if the keeper has a usable price it must push, which re-advances `last_good_oracle_slot`); only a market whose oracle authority is NOT this keeper resolves without source evidence (a usable price is irrelevant when it can never push, and it never counts toward the outage guard); an UNREGISTERED market whose authority IS this keeper (including one a registry hot-reload pruned) is HELD with an alert unless allowlisted, and does not count toward the outage guard unless it was registered earlier in this process and pruned (a shrinking registry is outage-shaped); a global source-health hold stops all pushable resolves when many pushable markets lack a source at once, and a per-DEX-type correlation hold when all (or `GROUP_LOSS_PCT`) of one DEX group lack a source together; one attempt per market per retry window and never again after a landed one; `MAX_PER_CYCLE` per tick. Immediately before the send the account is re-read: wrapper-owned, still Live, still matured at the current slot, `last_good_oracle_slot` unchanged. Multi-asset: tag 39 reads the config `last_good_oracle_slot`, which mirrors asset 0 only.
+
+After a resolve the existing terminal path takes over for REGISTRY markets (terminal-insurance + resolved-portfolio-cleanup on the next fee-loop cycle; the push loop is told the market is terminal). A market with no registry row is not swept by those jobs (they walk the registry).
 
 Env parsing is STRICT (on/1/true/yes, off/0/false/no). Scope: `KEEPER_V22` and `VAULT_LP_LONE_CRANK` are validated on EVERY start; the other `KEEPER_V22_*` variables are read and validated only when `KEEPER_V22` is on. **Operator: audit the live (Railway) env for stray `KEEPER_V22*` / `VAULT_LP_LONE_CRANK` values before deploying this build**: a malformed `VAULT_LP_LONE_CRANK` stops even a flags-off keeper at boot (fail closed).
 
