@@ -42,7 +42,7 @@ import {
   totalsByOwner,
 } from "./lev-guard-math.ts";
 import type { OwnerView, TokenAccountView } from "./lev-guard-math.ts";
-import { LEV_GUARD_DEFAULTS, LevGuardKeeper, keyTagOf, netPosOnAsset, W1_MAX_VICTIMS_PER_TX, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey, w1Victims } from "./lev-guard.ts";
+import { LEV_GUARD_DEFAULTS, LevGuardKeeper, KEY_TAG_LEN, keyTagOf, netPosOnAsset, W1_MAX_VICTIMS_PER_TX, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey, w1Victims } from "./lev-guard.ts";
 import type { LevGuardConfig } from "./lev-guard.ts";
 import { fakeExecConn, key, portfolioBytes, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 import { levGuardHealthFields, setLevGuardHealthProvider } from "./health.ts";
@@ -100,7 +100,7 @@ function guardBytes(o: GuardOpts): Uint8Array {
   v.setBigUint64(r + 336, o.roundOpenSlot ?? 0n, true);
   const touched = o.touched ?? [];
   v.setUint16(r + 100, touched.length, true);
-  touched.forEach((k, i) => v.setBigUint64(r + 344 + 8 * i, keyTagOf(k), true));
+  touched.forEach((k, i) => { const t = keyTagOf(k); v.setBigUint64(r + 344 + KEY_TAG_LEN * i, t & ((1n << 64n) - 1n), true); v.setBigUint64(r + 344 + KEY_TAG_LEN * i + 8, t >> 64n, true); });
   return data;
 }
 
@@ -338,14 +338,25 @@ describe("report fields", () => {
 });
 
 describe("touched tag", () => {
-  it("keyTagOf is the first 8 bytes of the key, LE, for pooled and unpooled buffers and equals the SDK's fixed levKeyTagV22", () => {
+  it("keyTagOf is the first KEY_TAG_LEN bytes of the key, LE, for pooled and unpooled buffers and equals the SDK's levKeyTagV22", () => {
+    const le = (b: Uint8Array): bigint => { let x = 0n; for (let i = KEY_TAG_LEN - 1; i >= 0; i--) x = (x << 8n) | BigInt(b[i]); return x; };
     for (let i = 0; i < 20; i++) {
       const k = Keypair.generate().publicKey;
-      assert.equal(keyTagOf(k), Buffer.from(k.toBase58() ? k.toBuffer() : []).readBigUInt64LE(0));
+      assert.equal(keyTagOf(k), le(k.toBuffer()));
       assert.equal(keyTagOf(k), levKeyTagV22(k));
-      assert.equal(keyTagOf(k), new DataView(Uint8Array.from(k.toBuffer()).buffer).getBigUint64(0, true));
+      assert.equal(keyTagOf(k), le(Uint8Array.from(k.toBuffer())));
     }
     assert.notEqual(keyTagOf(key(2001)), keyTagOf(key(2002)));
+  });
+
+  it("separates two portfolios sharing an 8-byte address prefix (prog#610)", () => {
+    // The pair an attacker prepares: identical first 8 bytes, differing at byte 8. On the 8-byte
+    // tag these were ONE entry, so w1Victims filtered out an account the program had never cut.
+    const mk = (b8: number): PublicKey => { const b = new Uint8Array(32).fill(7); b[8] = b8; return new PublicKey(b); };
+    const a = mk(1), b = mk(2);
+    assert.notEqual(keyTagOf(a), keyTagOf(b));
+    const touched = new Set([keyTagOf(a)]);
+    assert.equal(touched.has(keyTagOf(b)), false, "b was never cut, so it must stay listable");
   });
 });
 
