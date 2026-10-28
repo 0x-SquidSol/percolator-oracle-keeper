@@ -244,3 +244,26 @@ Booked / draw log parsing (`p3_senior_draw*`) accepts both the v2.1 and the v2.2
 Anchor: `node --import tsx/esm src/v22-create-anchor.ts <market>` (operator tool, never run by the keeper) creates the keeper's own flat portfolio at the layout's exact length; it needs `KEEPER_V22_CREATE_ANCHOR=on`, is dry-run unless `KEEPER_V22_CREATE_ANCHOR_DRY_RUN=off`, and refuses (before simulating or sending) unless the market account is owned by the configured wrapper program and has a supported wrapper VERSION. The `KEEPER_V22_ACCRUE_ANCHORS` override must pass the same keeper-owned / flat check as discovery.
 
 Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.
+
+### Leverage guard (wrapper tag 124) — `KEEPER_LEV_*`, all default OFF
+
+Source: `v22/lev-guard.ts`, maths in `v22/lev-guard-math.ts`. Wire spec: ledger `v22-lev-guard-wire-spec-2026-10-28`. Nothing is deployed on chain yet; a market without a guard PDA is a cached no-op (re-checked every 10 min), so every flag is inert on a deployment with no guarded market. These flags do NOT need `KEEPER_V22`. They are parsed strictly (a typo stops the boot, like the v2.2 flags) and honour the global dry-run (`DRY_RUN` / `KEEPER_DRY_RUN` / `KEEPER_V22_DRY_RUN`): the transaction is simulated and logged `[v22][DRY-RUN] ...`, never signed or sent. Every send goes through `v22/exec.ts` (simulate first; refusals named). Jobs are `lev-poke`, `lev-tighten`, `lev-report`, `lev-w1` in `/health` `v22.jobs` (when `KEEPER_V22` is on) and the additive `/health` `levGuard` block (only when a flag is on).
+
+| Env | Default | What |
+|---|---|---|
+| `KEEPER_LEV_POKE` | **off** | op 4 POKE with NAV sampling (`vault_lp_state` [4] + `vault_lp_ext` [5]) after each landed mark push, and immediately BEFORE a tag-103 Earn -> LP allocation send (after its clean simulation; the allocation tx is then re-signed on a fresh blockhash) |
+| `KEEPER_LEV_HOLDER_JOB` | **off** | hourly per guarded market: op 3 TIGHTEN (flags refresh); the base mint's 20 largest token accounts, pool vaults / program- / pool- / PDA-owned dropped, CPMM dump `1-(R/(R+q))^2` vs the pinned pool base vault, op 3 with the single largest holder account (falls to the next on a 134, max 3 tries); with a risk key, op 2 REPORT |
+| `KEEPER_LEV_RISK_KEY_PATH` | unset | absolute path of the guard's risk-key keypair JSON (contents never logged; a group- or world-readable file stops the boot, `chmod 600`). Unset = no REPORT. Only used with `KEEPER_LEV_HOLDER_JOB`; the report is skipped when the guard's `risk_key` is a different key |
+| `KEEPER_LEV_W1` | **off** | after a landed push: when the guard says the LP stop holds, or a round is open, cut the opposing user portfolios in batches until `round_active` is 0; the opening call already carries the first batch (the program reverts an opening call that cuts nothing; LP side from the vault LP's net position, or `round_lp_long` once a round is open); victims are chosen by effective (net) side; a call with no victim is never sent; error 135 on a call with victims = nothing to do. The LP is never listed |
+| `KEEPER_LEV_POKE_MIN_GAP_MS` | 1500 | least gap between two push-triggered pokes of one market (the pre-allocation poke ignores it) |
+| `KEEPER_LEV_HOLDER_INTERVAL_MS` | 3600000 | holder job cadence per market (first runs staggered over up to 10 min) |
+| `KEEPER_LEV_W1_BATCH` | 4 (max 24) | opposing portfolios per op 5 transaction (24 is the 1,232 B packet ceiling; CU is the real limit, tune from the simulated units in the log) |
+| `KEEPER_LEV_W1_MAX_TXS` | 12 | most op 5 transactions of one run; a longer round continues on the next landed push |
+
+Report fields: `m_ind` = largest individual FULL-balance CPMM dump (H9; a holder's token accounts among the top 20 are summed), `j_dump` = the sim `holder_terms` J with every unknown holder as kind `whale`, `l_cap_x100` 0 (no cap), `n_mult_bps` 10000; every bps field is an integer clamped to [0, 10000], rounded up, and no report is sent if any figure is not finite. The program merges reports tighten-only.
+
+Holder filtering errs on dropping: an owner that is off-curve (a PDA, including a Squads vault) or whose own account is program-owned is NOT counted as an individual holder (counting a pool/vault as a holder would over-tighten a market). Known limit: a whale that holds through a PDA wallet is invisible to this job until the owner is on the curve.
+
+SDK: tag-124 comes from the main `@percolatorct/sdk` pin (percolator-sdk `feat/v22-sdk-growth` @ 7aeb7a13). The keeper keeps its own `keyTagOf` (tested equal to the SDK's fixed `levKeyTagV22`).
+
+Guard length: the guard PDA is accepted at 4,456 B or the burst-memory 4,472 B; any other length on a program-owned kind-17 account at the PDA raises a `[lev-guard][ALERT]` log and `levGuard.stats.guardBadLength`. Both lengths decode through the SDK (0a6ac576).

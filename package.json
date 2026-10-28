@@ -16,7 +16,7 @@
     "rotate-logs": "bash scripts/rotate-keeper-logs.sh"
   },
   "dependencies": {
-    "@percolatorct/sdk": "github:dcccrypto/percolator-sdk#3a435f004ea66ca1a68e93c36d7ccefb2bd4ba28",
+    "@percolatorct/sdk": "github:dcccrypto/percolator-sdk#0a6ac5767f07ffa10a76ef834c903387b06bba21",
     "@solana/web3.js": "1.99.0",
     "@supabase/supabase-js": "^2.111.0",
     "tsx": "4.19.1"

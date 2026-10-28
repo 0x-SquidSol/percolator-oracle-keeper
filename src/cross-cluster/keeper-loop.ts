@@ -34,7 +34,7 @@ import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRe
 import { p2bHealthFields } from "./p2b-health.ts";
 import { rpcFailoverHealth } from "../rpc-failover.ts";
 import { restartHealth } from "../restart-escalation.ts";
-import { v22HealthFields } from "./v22/health.ts";
+import { levGuardHealthFields, v22HealthFields } from "./v22/health.ts";
 import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import { rpcMetrics } from "./rpc-metrics.ts";
@@ -789,6 +789,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       ...p2bHealthFields(),
       // v2.2 layer, additive: `v22`. `{}` unless KEEPER_V22=on.
       ...v22HealthFields(),
+      // leverage guard (tag 124), additive: `levGuard`. `{}` unless a KEEPER_LEV_* flag is on.
+      ...levGuardHealthFields(),
       ...healthExtensionFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
