@@ -488,6 +488,27 @@ describe("item 17 (F-10): error text is redacted; no literal key in dry-run.ts",
     // the loop's layout-problem text path goes through it too (negative control: a plain message survives)
     assert.equal(redactErrorText("layout unknown: length 123"), "layout unknown: length 123");
   });
+  it("GH#225: a key in the URL PATH is redacted too, not just one in the query", () => {
+    // The sibling test above uses Helius, which carries its key in the query -- the one form the
+    // original implementation handled. Every other major provider puts it in the path.
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["alchemy", "https://solana-mainnet.g.alchemy.com/v2/SECRETKEY123"],
+      ["quicknode", "https://example-name.solana-mainnet.quiknode.pro/SECRETKEY123/"],
+      ["ankr", "https://rpc.ankr.com/solana/SECRETKEY123"],
+      ["triton", "https://example.rpcpool.com/SECRETKEY123"],
+    ];
+    for (const [name, url] of cases) {
+      const r = redactErrorText(`fetch failed ${url} (503)`);
+      assert.doesNotMatch(r, /SECRETKEY123/, `${name}: key survived redaction in ${r}`);
+      assert.match(r, /\/\*\*\*/, `${name}: the path should be marked as elided, got ${r}`);
+    }
+    // the host still identifies the endpoint, which is what the log is for
+    assert.match(redactErrorText("fetch failed https://rpc.ankr.com/solana/SECRETKEY123"), /rpc\.ankr\.com/);
+    // a bare host keeps its empty path (no spurious /***), and the query form still works
+    assert.equal(redactErrorText("down: https://api.devnet.solana.com"), "down: https://api.devnet.solana.com");
+    assert.equal(redactErrorText("x https://h.io/?api-key=K"), "x https://h.io?***");
+  });
+
   it("src/dry-run.ts carries no literal Helius key (same removal as #146 on relaunch-live)", () => {
     const src = readFileSync(new URL("../../dry-run.ts", import.meta.url), "utf8");
     assert.doesNotMatch(src, /api-key=[0-9a-f]{8}-[0-9a-f]{4}-/i);
