@@ -208,12 +208,19 @@ const GUARD_RECHECK_MS = 600_000;
 const VAULT_LP_TTL_MS = 600_000;
 
 /**
- * The tag the program stores for a cut portfolio: the first 8 bytes of its key as a LE u64. Kept local (the SDK's `levKeyTagV22` is fixed at 7aeb7a13;
- * a test pins the two to each other).
+ * Tag width (`KEY_TAG_LEN`, prog#610/#611). The tag is a portfolio address PREFIX and is that account's identity in the W1 touched set, so the
+ * width is a security parameter: at 8 bytes a birthday search over client-chosen portfolio addresses costs ~2^32, at 16 it costs ~2^64.
+ */
+export const KEY_TAG_LEN = 16;
+
+/**
+ * The tag the program stores for a cut portfolio: the first `KEY_TAG_LEN` bytes of its key as a LE unsigned integer. Kept local (a test pins this
+ * to the SDK's `levKeyTagV22`, which must be on the matching width -- see the pin in package.json).
  */
 export function keyTagOf(k: PublicKey): bigint {
   const b = k.toBytes();
-  return new DataView(b.buffer, b.byteOffset, b.byteLength).getBigUint64(0, true);
+  const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  return (v.getBigUint64(8, true) << 64n) | v.getBigUint64(0, true);
 }
 
 const u64le = (d: Uint8Array, o: number): bigint => new DataView(d.buffer, d.byteOffset, d.byteLength).getBigUint64(o, true);

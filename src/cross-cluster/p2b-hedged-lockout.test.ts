@@ -223,7 +223,7 @@ describe("G8 N_cap on the contlev3 curve (v2.2 controller markets, wrapper 21b8c
   it("g8NCapQ = the program's n_cap_g8_q_dials at the lagging dials (kappa 0.6695, lambda_depth 1x at $40k)", () => {
     const n = g8NCapQ(g, BAND, NOW, cM, 1_000_000n);
     assert.equal(n, 26_780_000_000n);
-    const view = growthCeilingView(g, BAND, NOW, cM, 0);
+    const view = growthCeilingView(g, BAND, NOW, cM, 0, undefined, { rc23Caps: false });
     assert.equal(view.tier, 1);
     assert.deepEqual(view.dials, { lSignalX100: 669, kappaBps: 6_695, lambdaDepthBps: 10_000 });
     assert.equal(curveLagU64(40_000n * M, view.thresholdsE6, KAPPA_TABLE_BPS), 6_695n);
@@ -231,7 +231,7 @@ describe("G8 N_cap on the contlev3 curve (v2.2 controller markets, wrapper 21b8c
   });
   it("NEGATIVE CONTROLS: growth-1 nCapQ(lambda) overstates it 11.2x; the round-2 step and 3198539a's leading-curve dials overstate it 1.49x", () => {
     assert.equal(nCapQ(cM, 30_000, 1_000_000n), 300_000_000_000n);
-    const view = growthCeilingView(g, BAND, NOW, cM, 0);
+    const view = growthCeilingView(g, BAND, NOW, cM, 0, undefined, { rc23Caps: false });
     const step = nCapG8Q({ clamp: true, cM, lambdaBps: 30_000, tier: view.tier, capDepth: view.capDepthE6, priceE6: 1_000_000n });
     assert.equal(step, 40_000_000_000n);
     // 3198539a: κ / λ_depth on the LEADING curve (kappa 1.0, lambda_depth 1.339x at $40k)
