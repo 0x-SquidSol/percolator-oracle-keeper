@@ -696,6 +696,56 @@ describe("engine: discovery of wrapper markets with no registry row", () => {
   });
 });
 
+describe("#184: a LIVE unregistered market the keeper is the oracle authority of", () => {
+  const live = () => market({ lastGood: ageToLastGood(100n), authority: keeper.publicKey });
+  const GRACE_MS = 1_500 * 400;
+
+  it("is a critical market-unregistered alert after the grace, even while its price is fresh (not only once matured / never-connected)", async () => {
+    const w = world();
+    const reg = addMarket(w, live());
+    const unreg = addMarket(w, live(), false);
+    const { e, sink, ledger } = engineFor(w, { discoveryMs: 600_000 });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, [reg.ctx]);
+    assert.equal(sink.active("v22-lifecycle:unregistered-live").length, 0, "inside the grace (the register-poll may be about to add it)");
+    w.now += GRACE_MS + 1;
+    await runTick(e, w, [reg.ctx]);
+    const a = sink.active("v22-lifecycle:unregistered-live");
+    assert.deepEqual(a.map((x) => [x.kind, x.severity]), [["market-unregistered", "critical"]]);
+    assert.equal(a[0].data?.market, unreg.addr);
+    const h = e.healthFields() as { unregisteredKeeperAuthority: string[] };
+    assert.deepEqual(h.unregisteredKeeperAuthority, [unreg.addr]);
+  });
+
+  it("negative controls: a foreign-authority market, a registered one and a Resolved one are not alerted", async () => {
+    const w2 = world();
+    const foreign = addMarket(w2, market({ lastGood: ageToLastGood(100n), authority: OTHER }), false);
+    const res = addMarket(w2, market({ lastGood: ageToLastGood(100n), authority: keeper.publicKey, resolved: true }), false);
+    const reg = addMarket(w2, live());
+    const { e, sink, ledger } = engineFor(w2, { discoveryMs: 600_000 });
+    primeLedger(ledger, w2, 3_600_000);
+    await runTick(e, w2, [reg.ctx]);
+    w2.now += GRACE_MS + 1;
+    await runTick(e, w2, [reg.ctx]);
+    assert.equal(sink.active("v22-lifecycle:unregistered-live").length, 0, `${foreign.addr} ${res.addr}`);
+  });
+
+  it("clears when the market gains a registry row", async () => {
+    const w = world();
+    const unreg = addMarket(w, live(), false);
+    const { e, sink, ledger } = engineFor(w, { discoveryMs: 1 });
+    primeLedger(ledger, w, 3_600_000);
+    await runTick(e, w, []);
+    w.now += GRACE_MS + 1;
+    await runTick(e, w, []);
+    assert.equal(sink.active("v22-lifecycle:unregistered-live").length, 1);
+    w.registered.add(unreg.addr);
+    w.now += 10;
+    await runTick(e, w, [unreg.ctx]);
+    assert.equal(sink.active("v22-lifecycle:unregistered-live").length, 0);
+  });
+});
+
 describe("warn-band fee forcing (tags 78 / 87 + stake 12)", () => {
   const warn = () => market({ lastGood: ageToLastGood(12_000n), authority: keeper.publicKey });
   it("forces a fee round for a warn-band registry market every spacing, not for fresh or matured markets", async () => {

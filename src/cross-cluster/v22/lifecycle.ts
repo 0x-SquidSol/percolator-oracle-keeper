@@ -40,6 +40,9 @@ import { redactErrorText } from "./redact.ts";
 
 export const LIFECYCLE_ALERT_SCOPE = "v22-lifecycle";
 
+/** One slot, ms (the classifier's own constant). */
+const SLOT_MS = 400;
+
 /** A pushable market whose source has not been read usable for this long, while the push loop runs, lacks a source now. */
 export const SOURCE_FRESH_MS = 60_000;
 
@@ -153,6 +156,10 @@ export class LifecycleEngine {
   /** Markets that had a registry row at any time in this process (labels the held-unregistered alert). */
   private readonly everRegistered = new Set<string>();
   private lastCounts: Record<string, number> = {};
+  /** #184: when each unregistered market was first seen this process (the grace before "no registry row" is an alert). */
+  private readonly unregFirstSeenMs = new Map<string, number>();
+  /** #184: LIVE unregistered markets whose oracle authority is this keeper, past the grace (the keeper should be pricing them). */
+  private unregisteredKeeperAuthority: string[] = [];
 
   constructor(private readonly d: LifecycleDeps) {
     this.ledger = d.ledger ?? lifecycleLedger;
@@ -313,6 +320,7 @@ export class LifecycleEngine {
       this.log(`[v22][lifecycle] discovery failed (registered markets are unaffected): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
     }
     const all: Tracked[] = [...this.observed.values(), ...[...this.unreg.values()].filter((u) => !this.observed.has(u.ctx.marketAddress))];
+    this.noteUnregistered(all, nowMs);
     this.tally(all);
     this.assessOutage(all, nowMs);
     await this.reconcileAlerts(all);
@@ -321,6 +329,17 @@ export class LifecycleEngine {
       await this.resolveMatured(all);
     }
     this.persist();
+  }
+
+  /** #184: first-seen clock per unregistered market; a market that gained a row (or vanished) loses its clock. */
+  private noteUnregistered(all: Tracked[], nowMs: number): void {
+    const now = new Set<string>();
+    for (const t of all) {
+      if (t.registered) continue;
+      now.add(t.ctx.marketAddress);
+      if (!this.unregFirstSeenMs.has(t.ctx.marketAddress)) this.unregFirstSeenMs.set(t.ctx.marketAddress, nowMs);
+    }
+    for (const k of [...this.unregFirstSeenMs.keys()]) if (!now.has(k)) this.unregFirstSeenMs.delete(k);
   }
 
   private tally(all: Tracked[]): void {
@@ -336,12 +355,15 @@ export class LifecycleEngine {
 
   // ── Alerts ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  private alertsFor(all: Tracked[]): { never: Alert[]; warn: Alert[]; matured: Alert[]; interest: Alert[]; unregHeld: Alert[] } {
+  private alertsFor(all: Tracked[]): { never: Alert[]; warn: Alert[]; matured: Alert[]; interest: Alert[]; unregHeld: Alert[]; unregLive: Alert[] } {
     const unregHeld: Alert[] = [];
     const never: Alert[] = [];
     const warn: Alert[] = [];
     const matured: Alert[] = [];
     const interest: Alert[] = [];
+    const unregLive: Alert[] = [];
+    const nowMs = this.now();
+    const graceMs = this.d.cfg.neverConnectedGraceSlots * SLOT_MS;
     for (const t of all) {
       const addr = t.ctx.marketAddress;
       const lc = t.lc;
@@ -381,6 +403,18 @@ export class LifecycleEngine {
           data: { market: addr, everRegistered: this.everRegistered.has(addr) },
         });
       }
+      if (!t.registered && lc.terminal === null && lc.keeperIsAuthority) {
+        const first = this.unregFirstSeenMs.get(addr);
+        if (first !== undefined && nowMs - first >= graceMs) {
+          unregLive.push({
+            kind: "market-unregistered",
+            severity: "critical",
+            subject: t.label,
+            message: `${addr} is Live, its oracle authority is THIS keeper, and the keeper has no registry row for it: nothing is pricing it${lc.price.kind === "fresh" ? " (its last price is still fresh, so this will only get worse)" : ""}. The market-to-pool binding lives only in the registry source (Supabase / registry.json): re-register it, or confirm it was retired on purpose.`,
+            data: { market: addr, everRegistered: this.everRegistered.has(addr), priceBand: lc.price.kind },
+          });
+        }
+      }
       if (lc.deadInterest) {
         interest.push({
           kind: "market-dead-interest",
@@ -391,7 +425,7 @@ export class LifecycleEngine {
         });
       }
     }
-    return { never, warn, matured, interest, unregHeld };
+    return { never, warn, matured, interest, unregHeld, unregLive };
   }
 
   private async reconcileAlerts(all: Tracked[]): Promise<void> {
@@ -402,6 +436,8 @@ export class LifecycleEngine {
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:dead-price-matured`, a.matured);
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:dead-interest`, a.interest);
       await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:unregistered-held`, a.unregHeld);
+      await this.d.sink.reconcile(`${LIFECYCLE_ALERT_SCOPE}:unregistered-live`, a.unregLive);
+      this.unregisteredKeeperAuthority = a.unregLive.map((x) => String(x.data?.market));
       const held: Alert[] = [];
       if (this.massHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "*", message: `${this.outageShaped} keeper-authority markets are matured while the keeper has a usable source for them (or were registered earlier in this process and their row is gone: ${this.prunedMatured}): outage-shaped. The keeper is NOT resolving any market; check RPC / the push loop / the registry.`, data: { outageShapedMatured: this.outageShaped, threshold: this.d.cfg.massThreshold } });
       if (this.sourceLossHold) held.push({ kind: "stale-resolve-held", severity: "critical", subject: "source-health", message: `${this.sourceLossCount} of ${this.pushableCount} pushable markets have no usable source price at once: a price-reader regression, not dead markets. The keeper is NOT resolving any pushable market.`, data: { lacking: this.sourceLossCount, pushable: this.pushableCount, max: this.d.cfg.sourceLossMax, pct: this.d.cfg.sourceLossPct } });
@@ -642,6 +678,7 @@ export class LifecycleEngine {
       massHold: this.massHold,
       sourceHealth: { pushable: this.pushableCount, lacking: this.sourceLossCount, hold: this.sourceLossHold, groupHolds: Object.fromEntries(this.groupLossHolds) },
       heldUnregisteredKeeperAuthority: this.heldUnregistered,
+      unregisteredKeeperAuthority: this.unregisteredKeeperAuthority,
       prunedMatured: this.prunedMatured,
       resolvesSent: this.resolvesSent,
       lastDiscoveryAgoMs: Number.isFinite(this.lastDiscoveryAt) ? nowMs - this.lastDiscoveryAt : null,

@@ -63,6 +63,10 @@ import { adlHealthOf } from "../adl-state.ts";
 import { getAlertSink } from "../alerting.ts";
 import type { Alert, AlertSink } from "../alerting.ts";
 import { terminalKindOf } from "./band.ts";
+import { assessDepthCapacity, depthCapacityAlert, depthCapacityThresholdsFromEnv } from "./depth-capacity.ts";
+import type { DepthCapacity, DepthCapacityThresholds } from "./depth-capacity.ts";
+import { pushDepthEnabled } from "../push-depth.ts";
+import { decodeAssetGrowthV19 } from "@percolatorct/sdk";
 import { LP_CERT_ALERT_SCOPE, evaluateVaultLpCrankStaleness, lpCertLevelOf, lpCertStalenessOf, lpCertThresholdsFromEnv, readLpCertAssets } from "./lp-cert-liveness.ts";
 import type { LpCertThresholds } from "./lp-cert-liveness.ts";
 import { ADL_D1_ALERT_SCOPE, AdlEpisodeTracker, adlD1ThresholdsFromEnv, evaluateAdlD1 } from "./d1-watch.ts";
@@ -94,6 +98,8 @@ export interface V22LoopDeps {
   lpCertThresholds?: LpCertThresholds;
   /** D1 close-only / wind-down thresholds (default: from ALERT_ADL_WIND_DOWN_* env, boot-safe). */
   adlD1Thresholds?: AdlD1Thresholds;
+  /** #174 depth-capacity thresholds (default: from ALERT_DEPTH_* env, boot-safe). */
+  depthCapacityThresholds?: DepthCapacityThresholds;
   now?: () => number;
   log?: (s: string) => void;
 }
@@ -139,6 +145,10 @@ interface MarketRuntime {
   repairBackoffUntilMs: number;
   /** Active vault-LP crank liveness alerts from the last GOOD read (kept across a failed read, never cleared by one). */
   lpCertAlerts: Alert[];
+  /** #174: active depth-capacity alerts from the last decodable read. */
+  depthAlerts: Alert[];
+  /** #174: /health view of every clamp-enforced growth asset's depth cap at the last decodable read. */
+  lastDepth: DepthCapacity[] | null;
   /** /health: the LP certification staleness of the worst asset at the last good read. */
   lastLpCert: { assetIndex: number; certified: boolean; staleSlots: string; horizonSlots: string; remainingSlots: string; level: string; horizonSource: string } | null;
   /** D1: per-market close-only episode tracker (in memory; a restart makes ages lower bounds). */
@@ -148,6 +158,9 @@ interface MarketRuntime {
   /** D1: /health view of the close-only episodes at the last good read. */
   lastAdl: { episodes: Array<{ assetIndex: number; ageSlots: string; observedSinceSlot: string; sinceBoot: boolean; level: string; slotsToBound: string }>; endedEpisodes: number; longestEndedSlots: string; endedPastBound: number } | null;
 }
+
+/** #174: depth-capacity alerts (scopes `:warn` / `:critical`). */
+export const DEPTH_CAPACITY_ALERT_SCOPE = "v22-depth-capacity";
 
 const POSITIONED_TTL_MS = 10_000;
 /** Margin on a simulated one-crank catch-up cost when sizing the catch-up tx (per-crank cost varies a few % with state). */
@@ -159,6 +172,7 @@ export class V22Loop {
   private readonly now: () => number;
   private readonly lpCertThresholds: LpCertThresholds;
   private readonly adlD1Thresholds: AdlD1Thresholds;
+  private readonly depthThresholds: DepthCapacityThresholds;
   private ticks = 0;
   private lastTickAt: number | null = null;
   private layoutProblems = new Map<string, string>();
@@ -172,6 +186,7 @@ export class V22Loop {
     this.now = d.now ?? Date.now;
     this.lpCertThresholds = d.lpCertThresholds ?? lpCertThresholdsFromEnv(process.env);
     this.adlD1Thresholds = d.adlD1Thresholds ?? adlD1ThresholdsFromEnv(process.env);
+    this.depthThresholds = d.depthCapacityThresholds ?? depthCapacityThresholdsFromEnv(process.env);
     const lc = d.flags.lifecycle;
     if (lc.classify) {
       const sink = d.alertSink ?? getAlertSink();
@@ -293,6 +308,60 @@ export class V22Loop {
     }
   }
 
+  /**
+   * #174: depth capacity of every growth asset of a loaded market (depth-capacity.ts). Read-only: the market bytes this tick already
+   * read, no RPC, nothing sent. A non-band / terminal market clears its state; an undecodable record keeps the previous one. Never throws.
+   */
+  private checkDepthCapacity(ctx: V22MarketCtx, r: MarketRuntime, venue: string | null): void {
+    if (!ctx.isBand || terminalKindOf(ctx.data) !== null) {
+      r.depthAlerts = [];
+      r.lastDepth = null;
+      return;
+    }
+    try {
+      const nowSlot = BigInt(ctx.readSlot);
+      const bandBps = ctx.band.bandBps > 0xffff_ffffn ? Number.MAX_SAFE_INTEGER : Number(ctx.band.bandBps);
+      const assets: DepthCapacity[] = [];
+      const alerts: Alert[] = [];
+      for (const assetIndex of observationAssetsFor(ctx.marketAddress)) {
+        let g: ReturnType<typeof decodeAssetGrowthV19>;
+        try {
+          g = decodeAssetGrowthV19(ctx.data, assetIndex);
+        } catch {
+          continue; // an asset the account does not carry: not evaluated, the others are
+        }
+        if (g === null) continue;
+        const d = assessDepthCapacity(g, assetIndex, bandBps, nowSlot, this.depthThresholds);
+        assets.push(d);
+        const a = depthCapacityAlert(ctx.label, ctx.marketAddress, d, this.depthThresholds, { venue, keeperAttestsVenue: venue === "pumpswap" && pushDepthEnabled() });
+        if (a) alerts.push(a);
+      }
+      r.depthAlerts = alerts;
+      r.lastDepth = assets;
+    } catch (err) {
+      this.log(`[v22][depth] ${ctx.label}: depth-capacity read failed (alert state kept): ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
+  /** #174: reconcile the depth-capacity alerts. Two scopes (warn-or-worse / critical-only), like the vault-LP certification, so a warn -> critical escalation pages at once. */
+  private async reconcileDepthCapacity(): Promise<void> {
+    const warn: Alert[] = [];
+    const critical: Alert[] = [];
+    for (const m of this.d.markets()) {
+      for (const a of this.rt.get(m.marketAddress)?.depthAlerts ?? []) {
+        warn.push(a.severity === "warn" ? a : { ...a, severity: "warn" });
+        if (a.severity === "critical") critical.push(a);
+      }
+    }
+    try {
+      const sink = this.d.alertSink ?? getAlertSink();
+      await sink.reconcile(`${DEPTH_CAPACITY_ALERT_SCOPE}:warn`, warn);
+      await sink.reconcile(`${DEPTH_CAPACITY_ALERT_SCOPE}:critical`, critical);
+    } catch (err) {
+      this.log(`[v22][depth] alert delivery failed: ${redactErrorText(err instanceof Error ? err.message : String(err), 140)}`);
+    }
+  }
+
   /** Reconcile the D1 close-only / wind-down-overdue alerts of every registered market (kinds carry their own cooldown keys). */
   private async reconcileAdlD1(): Promise<void> {
     const active: Alert[] = [];
@@ -368,6 +437,8 @@ export class V22Loop {
         positionedCache: null,
         sweepInflight: false,
         lpCertAlerts: [],
+        depthAlerts: [],
+        lastDepth: null,
         lastLpCert: null,
         adlTracker: new AdlEpisodeTracker(this.adlD1Thresholds),
         adlAlerts: [],
@@ -737,6 +808,7 @@ export class V22Loop {
         this.lifecycle?.observe(ctx); // dead-market classifier, read-only, no extra RPC
         await this.checkLpCert(ctx, r); // read-only; runs even while a round is in flight
         this.checkAdlCloseOnly(ctx, r); // D1, read-only, no extra RPC
+        this.checkDepthCapacity(ctx, r, entry.dexType ?? null); // #174, read-only, no extra RPC
         if (r.sweepInflight) continue;
         const needsPositioned = f.feeCrankBond || f.holdingRent || f.dustSweep;
         const positioned = needsPositioned ? await this.positionedFor(ctx, r) : null;
@@ -786,6 +858,7 @@ export class V22Loop {
     }
     await this.reconcileLpCert();
     await this.reconcileAdlD1();
+    await this.reconcileDepthCapacity();
     try {
       await this.lifecycle?.endTick();
     } catch (err) {
@@ -831,6 +904,7 @@ export class V22Loop {
         ...(r.lastBand ? { band: r.lastBand } : {}),
         ...(r.lastLpCert ? { vaultLpCert: r.lastLpCert } : {}),
         ...(r.lastAdl ? { adlCloseOnly: r.lastAdl } : {}),
+        ...(r.lastDepth && r.lastDepth.length > 0 ? { depthCapacity: r.lastDepth.map((d) => ({ assetIndex: d.assetIndex, status: d.status, capDepthE6: d.capDepthE6 === null ? null : d.capDepthE6.toString(), stickyEpochs: d.stickyEpochs, epochsToZero: d.epochsToZero, depthAgeSlots: d.depthAgeSlots === null ? null : d.depthAgeSlots.toString(), depthSource: d.depthSource, depthDexPinned: d.depthDexPinned })) } : {}),
         ...(r.lastRound ? { lastRound: r.lastRound } : {}),
         ...(r.lastFee ? { fee78: r.lastFee } : {}),
         ...(r.lastG9 ? { g9: r.lastG9 } : {}),
