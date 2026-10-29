@@ -104,7 +104,8 @@ describe("runSettleRound", () => {
     const f = fakeExecConn({ simErr: (_d, n) => (n === 0 ? customAt(0, 22) : null) });
     const r = await runSettleRound(deps(f.conn), { market: MARKET, label: "T" }, { lp: LP, counterparties: cps(2) }, DEFAULT_SWEEP_ROUND_CONFIG);
     assert.equal(f.sent.length, 1);
-    assert.equal(f.sent[0].tags.length, 3, "LP refresh + 2 refreshes, no observation crank");
+    assert.equal(f.sent[0].tags.length, 3, "LP crank + 2 refreshes, no second accrue crank");
+    assert.ok(f.sentData[0][0].length > f.sentData[0][1].length, "the first crank observes (A5-1: a hint-less first crank is ambiguous in a later slot)");
     assert.ok(f.sent[0].keys.some((k) => k.includes(LP.toBase58())));
     assert.equal(r.lpSettled, true);
   });
