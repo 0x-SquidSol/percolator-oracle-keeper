@@ -40,9 +40,8 @@ npm start
 | `SUPABASE_SERVICE_ROLE_KEY` | — | — | Required if SUPABASE_URL set |
 | `DEPLOYMENT_JSON` | — | — | Deployment JSON (alternative to Supabase) |
 | `PUSH_INTERVAL_MS` | — | `3000` | How often to push prices (ms) |
-| `HEALTH_PORT` | — | `18810` | Health endpoint port |
-| `HEALTH_BIND` | — | `0.0.0.0` | Health endpoint bind address |
-| `HEALTH_AUTH_TOKEN` | — | — | Bearer token for health endpoint |
+| `CC_HEALTH_PORT` | — | `3001` (pusher `3002`) | Health endpoint port |
+| `CC_HEALTH_BIND` | — | `0.0.0.0` | Health endpoint bind address |
 | `MAX_PRICE_MOVE_PCT` | — | `10` | Circuit breaker threshold (%) |
 | `STALE_THRESHOLD_S` | — | `30` | Staleness alert threshold (seconds) |
 | `MIN_KEEPER_BALANCE_SOL` | — | `0.05` | Minimum wallet balance before pausing |
@@ -56,18 +55,23 @@ npm start
 GET /health
 ```
 
-Returns JSON with per-market stats, wallet balance, and overall status:
+Returns JSON with the overall status, the wallet balance and per-market stats (`src/cross-cluster/keeper-loop.ts` `makeHealthHandler`), for example:
 
 ```json
 {
+  "walletLow": false,
+  "walletBalanceSol": "1.2346",
   "status": "ok",
-  "uptime": "3600s",
-  "wallet": { "address": "...", "balanceSol": 0.12, "low": false },
-  "markets": {
-    "SOL": { "lastPrice": 135.42, "lastPushAgo": "2s", "stale": false, "source": "pyth", "totalPushes": 1200 }
-  }
+  "lastSuccessfulPushAgo": "2s",
+  "uptimeSec": 3600,
+  "markets": { "<market address>": { "label": "SOL", "...": "..." } }
 }
 ```
+
+`/health` has no authentication, by design: Railway's health check calls it with no header. It is meant to carry no secrets:
+the balance of the keeper's fee payer (public on chain), market addresses and prices, push and crank counters, and
+error text; RPC URLs are redacted (`rpc-failover.ts` `redactUrl`). The launchers bind it to `127.0.0.1` (`run-v22fresh.sh`) or to
+Railway's `$PORT` (`deploy/railway-start.sh`). Do not give a Railway keeper service a public domain.
 
 ## Deployment (Railway)
 
@@ -77,7 +81,6 @@ Required Railway environment variables:
 - `RPC_URL` — Helius devnet RPC
 - `ADMIN_KEYPAIR` — JSON keypair array
 - `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — for market auto-discovery
-- `HEALTH_AUTH_TOKEN` — for secured health checks
 
 ## Devnet v2.1 fresh-ID cutover: two keepers
 
