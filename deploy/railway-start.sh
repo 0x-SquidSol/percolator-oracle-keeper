@@ -24,7 +24,7 @@ if [[ "${KEEPER_ROLE:-}" == "pusher" ]]; then
     printf '%s' "$REGISTRY_SEED_JSON" > "$REGISTRY_PATH"
     echo "[railway-start] pusher: seeded $REGISTRY_PATH from REGISTRY_SEED_JSON"
   fi
-  : "${PUSHER_PRIMARY_DEVNET_RPC_URL:?[fatal] pusher: set PUSHER_PRIMARY_DEVNET_RPC_URL (the primary's endpoint) so the boot can refuse a shared endpoint}"
+  : "${PUSHER_PRIMARY_DEVNET_RPC_URL:?[fatal] pusher: set PUSHER_PRIMARY_DEVNET_RPC_URL (the endpoint of the primary) so the boot can refuse a shared endpoint}"
   export CC_HEALTH_PORT="${PORT:-${CC_HEALTH_PORT:-18796}}"
   echo "[railway-start] $(date -u +%Y-%m-%dT%H:%M:%SZ) ROLE=pusher BUILDTAG=${RAILWAY_GIT_COMMIT_SHA:0:7} wrapper=${WRAPPER_PROGRAM_ID} health=${CC_HEALTH_PORT} registry=${REGISTRY_PATH}"
   exec node_modules/.bin/tsx src/pusher.ts
