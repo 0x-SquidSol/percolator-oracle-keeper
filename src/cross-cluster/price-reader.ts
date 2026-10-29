@@ -455,8 +455,13 @@ const MIN_VAULT_LEN = 72;
  * Only PumpSwap is supported, and that is not an arbitrary limitation:
  * `parseDexPool` exposes `baseVault`/`quoteVault` for pumpswap ONLY. Raydium CLMM
  * prices from `sqrtPrice` and Meteora DLMM from `binStep`; neither returns vault
- * addresses, so there are no reserves to read without extending the SDK. Every
- * market currently registered is pumpswap, so this covers the live board.
+ * addresses, so there are no reserves to read without extending the SDK.
+ *
+ * It therefore does NOT cover the live board. Measured 2026-10-25 from the keeper's own
+ * /health: of 90 registered markets roughly half are meteora-dlmm (SOL, LINK, JUP, WIF,
+ * KMNO, cbBTC, TRUMP, ORCA, VIRTUAL, ...), and the v2.2 board is not pumpswap-only either.
+ * Every one of those is priced with NO depth gate, whatever MIN_POOL_LIQUIDITY_USD is set
+ * to. See #212; `warnDepthFloorUnenforceable` makes that visible rather than silent.
  */
 export function pumpswapQuoteDepthUsdE6(
   quoteVaultData: Uint8Array,
@@ -509,6 +514,36 @@ export const MIN_POOL_LIQUIDITY_USD_E6: bigint = (() => {
   return BigInt(whole) * 1_000_000n + BigInt((frac + "000000").slice(0, 6));
 })();
 
+/** Pools already warned about an unenforceable floor — once per pool per process. */
+const depthFloorUnenforceableWarned = new Set<string>();
+
+/**
+ * #212: the liquidity floor has exactly one implementation, `pumpswapQuoteDepthUsdE6`, and
+ * `parseDexPool` exposes vault reserves for pumpswap ONLY. So on a raydium-clmm or
+ * meteora-dlmm market a configured floor does not apply and the pool is priced unguarded.
+ *
+ * This does NOT change pricing — dropping those markets or teaching the SDK to read DLMM/CLMM
+ * reserves are both calls for the maintainer (see the issue). It only stops the gap being
+ * invisible: an operator who sets MIN_POOL_LIQUIDITY_USD is entitled to know which markets it
+ * cannot cover. Once per POOL per process, so it cannot flood a 1.5 s loop.
+ */
+export function warnDepthFloorUnenforceable(
+  entry: { dexType: string; poolAddress: string; label?: string },
+  warned: Set<string> = depthFloorUnenforceableWarned,
+  log: (line: string) => void = (l) => console.warn(l),
+): boolean {
+  if (MIN_POOL_LIQUIDITY_USD_E6 <= 0n) return false;
+  if (entry.dexType === "pumpswap") return false;
+  if (warned.has(entry.poolAddress)) return false;
+  warned.add(entry.poolAddress);
+  log(
+    `[price-reader] liquidity floor NOT ENFORCEABLE for ${entry.label ?? entry.poolAddress} ` +
+      `(${entry.dexType}): this DEX type exposes no vault reserves, so the ` +
+      `$${(Number(MIN_POOL_LIQUIDITY_USD_E6) / 1e6).toFixed(2)} floor does not apply to it (#212).`,
+  );
+  return true;
+}
+
 export async function readPoolPriceE6(
   mainnetConn: Connection,
   entry: Pick<PoolPriceSource, "poolAddress" | "dexType" | "label" | "mainnetCa">,
@@ -557,6 +592,9 @@ export async function readPoolPriceE6(
   }
 
   // ── Per-DEX price computation ─────────────────────────────────────────────
+
+  // #212: say so once if the configured floor cannot apply to this market's DEX type.
+  warnDepthFloorUnenforceable(entry);
 
   if (entry.dexType === "raydium-clmm") {
     const poolParsed = parseDexPool("raydium-clmm", poolPk, data);
