@@ -154,7 +154,7 @@ export interface LoserForceCloseResult {
 
 export type LoserForceCloseConnection = Pick<
   Connection,
-  "getProgramAccounts" | "getAccountInfo" | "getMultipleAccountsInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+  "getProgramAccounts" | "getAccountInfo" | "getMultipleAccountsInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses"
 >;
 
 interface Candidate {

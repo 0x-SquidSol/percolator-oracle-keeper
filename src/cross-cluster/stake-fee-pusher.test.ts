@@ -87,12 +87,11 @@ function stub(name: Name, opts: {
       calls.sends++;
       return "5igSig1111111111111111111111111111111111111111111111111111111111";
     },
-    async confirmTransaction() {
-      if (opts.confirmThrows) throw new Error("TransactionExpiredBlockheightExceededError: Signature … has expired: block height exceeded.");
-      return { context: { slot: 2 }, value: { err: opts.confirmErr ?? null } };
+    async getBlockHeight() {
+      return Number.MAX_SAFE_INTEGER; // the blockhash has expired
     },
     async getSignatureStatuses() {
-      const s = opts.status === undefined ? { err: null, confirmationStatus: "confirmed" as const } : opts.status;
+      const s = opts.status === undefined ? (opts.confirmThrows ? null : { err: opts.confirmErr ?? null, confirmationStatus: "confirmed" as const }) : opts.status;
       return { context: { slot: 3 }, value: [s ? { slot: 2, confirmations: 1, ...s } : null] };
     },
   };
@@ -225,7 +224,7 @@ describe("pushStakeFeesOnce — real devnet bytes", () => {
     assert.equal(s.calls.sends, 0);
   });
 
-  it("F6 applies here too: a timed-out confirmation of a landed push is DONE", async () => {
+  it("F6 applies here too: a push whose signature status shows it landed is DONE", async () => {
     const s = stub("sol", { confirmThrows: true, status: { err: null, confirmationStatus: "confirmed" } });
     const o = await pushStakeFeesOnce(s.conn, KEEPER, MARKETS.sol.market, false, CFG);
     assert.equal(o.kind, "done");

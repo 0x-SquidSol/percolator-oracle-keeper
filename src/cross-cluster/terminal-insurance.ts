@@ -262,7 +262,7 @@ export type TerminalConnection = Pick<
   | "getLatestBlockhash"
   | "simulateTransaction"
   | "sendRawTransaction"
-  | "confirmTransaction"
+  | "getBlockHeight"
   | "getSignatureStatuses"
   | "getTokenAccountsByOwner"
   | "getProgramAccounts"

@@ -196,11 +196,8 @@ function world(o: { elf: Buffer | null; nowSlot: bigint; chunks?: number; loserE
       }
       return PublicKey.unique().toBase58();
     },
-    async confirmTransaction() {
-      return { value: { err: null } };
-    },
     async getSignatureStatuses() {
-      return { value: [] };
+      return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] };
     },
   };
   return { conn, log, state, holdsClaim };

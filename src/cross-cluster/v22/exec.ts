@@ -23,7 +23,7 @@ import { redactErrorText } from "./redact.ts";
 /** Compute-budget instructions buildTx puts in front of the caller's list (heap frame + unit limit). */
 export const COMPUTE_IX_COUNT = 2;
 
-export type ExecConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses">;
+export type ExecConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses">;
 
 export interface ExecContext {
   conn: ExecConnection;
@@ -226,14 +226,7 @@ export async function simulateAndSend(
       if (hold) return { kind: "held", reason: hold };
       const sig = await ctx.conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
       const c = await confirmBySignature(ctx.conn, sig, blockhash, lastValidBlockHeight, ctx.confirm);
-      let landedSlot: number | null = null;
-      if (c.status === "landed") {
-        try {
-          landedSlot = (await ctx.conn.getSignatureStatuses([sig])).value[0]?.slot ?? null;
-        } catch {
-          landedSlot = null;
-        }
-      }
+      const landedSlot = c.status === "landed" ? c.slot : null;
       const failCode = c.status === "failed" ? c.code : null;
       return { kind: "sent", signature: sig, landed: c.status, failCode, landedSlot, unitsConsumed: units, logs };
     } catch (err) {

@@ -415,7 +415,7 @@ export class CleanupState {
 
 export type CleanupConnection = Pick<
   Connection,
-  "getProgramAccounts" | "getMultipleAccountsInfo" | "getAccountInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+  "getProgramAccounts" | "getMultipleAccountsInfo" | "getAccountInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses"
 >;
 
 export interface CleanupResult {

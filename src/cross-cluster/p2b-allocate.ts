@@ -110,7 +110,7 @@ export interface AllocateStats {
   walletLow: number;
 }
 
-export type AllocateConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses">;
+export type AllocateConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses">;
 
 export interface AllocateDeps {
   programId: PublicKey;

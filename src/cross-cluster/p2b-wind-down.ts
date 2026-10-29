@@ -311,7 +311,7 @@ export interface WindDownStats {
 
 export type WindDownConnection = Pick<
   Connection,
-  "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+  "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses"
 >;
 
 export interface WindDownDeps {

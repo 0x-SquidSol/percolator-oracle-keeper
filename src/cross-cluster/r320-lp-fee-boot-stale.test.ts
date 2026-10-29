@@ -67,8 +67,7 @@ function conn(o: { market: Buffer; slot?: bigint | "throws"; sendError?: unknown
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
       async simulateTransaction() { return { value: { err: o.simErr ?? null, logs: [] } }; },
       async sendRawTransaction() { sends++; if (o.sendError) throw o.sendError; return "sig"; },
-      async confirmTransaction(): Promise<{ value: { err: unknown } }> { return { value: { err: null } }; },
-      async getSignatureStatuses() { return { value: [null] }; },
+      async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
       async getSlot() {
         slotReads++;
         if (o.slot === "throws") throw new Error("429");
@@ -174,7 +173,7 @@ describe("R3.20 lp-fee: the boot-time 27 is waiting, everything else still fails
 
   it("a landed-but-failed tx names its code (was JSON clipped at 100)", async () => {
     const f = conn({ market: liveMarket(AT_FEE_CYCLE0), slot: AT_FEE_CYCLE0 });
-    f.c.confirmTransaction = async () => ({ value: { err: { InstructionError: [1, { Custom: 41 }] } } });
+    (f.c as { getSignatureStatuses: unknown }).getSignatureStatuses = async () => ({ value: [{ slot: 1, confirmations: 1, err: { InstructionError: [1, { Custom: 41 }] }, confirmationStatus: "confirmed" }] });
     const r = await crankLpFeesOnce(f.c as never, KEEPER, MARKET(), false, FAST);
     assert.ok(typeof r === "object" && !r.waiting && /^tag 78 landed but failed on chain: LpVaultZeroSharesMinted\(41\)/.test(r.error), JSON.stringify(r));
   });

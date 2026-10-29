@@ -87,13 +87,11 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       sent.push({ ...d, order: order++ });
       return `sig${sent.length}`;
     },
-    async confirmTransaction(arg: { signature: string }) {
-      const idx = Number(arg.signature.slice(3)) - 1; // sendRawTransaction returned `sig<N>`
+    async getSignatureStatuses(sigs: string[]) {
+      const idx = Number(sigs[0].slice(3)) - 1; // sendRawTransaction returned `sig<N>`
       const code = o.confirmFail ? o.confirmFail(idx, sent[idx]) : o.confirmStatus === "err" ? 1 : null;
-      return { context: { slot: 1 }, value: { err: code !== null ? { InstructionError: [2, { Custom: code }] } : null } };
-    },
-    async getSignatureStatuses() {
-      return { context: { slot: 1 }, value: [{ slot: (o.landedSlot ?? (() => (slot += 1)))(), confirmations: 1, err: null, confirmationStatus: "confirmed" as const }] };
+      const err = code !== null ? { InstructionError: [2, { Custom: code }] } : null;
+      return { context: { slot: 1 }, value: [{ slot: (o.landedSlot ?? (() => (slot += 1)))(), confirmations: 1, err, confirmationStatus: "confirmed" as const }] };
     },
     async getSlot() {
       return (o.slot ?? (() => slot))();

@@ -131,7 +131,7 @@ export function exhaustedAlert(market: string, label: string, e: Pick<ExhaustedE
 
 export type ExhaustedJobConnection = Pick<
   Connection,
-  "getMultipleAccountsInfo" | "getSlot" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+  "getMultipleAccountsInfo" | "getSlot" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses"
 >;
 
 export interface ExhaustedJobConfig {
