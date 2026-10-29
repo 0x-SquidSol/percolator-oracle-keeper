@@ -1917,6 +1917,8 @@ export async function startKeeperLoop(
       ` ${registry.markets.length} markets, interval=${config.intervalMs}ms`,
   );
 
+  // Both depth flags are read every cycle; parsing them here first makes a typo refuse the start, not fail each cycle.
+  pushDepthOnchainEnabled();
   const depthJitterPct = depthPushJitterPct(pushDepthEnabled());
   if (depthJitterPct > 0) {
     console.log(`[keeper] depth-push jitter: interval drawn from [${config.intervalMs - Math.floor((config.intervalMs * depthJitterPct) / 100)}, ${config.intervalMs}]ms (SEC-RC L-3)`);
