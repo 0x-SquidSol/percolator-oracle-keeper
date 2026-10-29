@@ -639,14 +639,31 @@ export async function cleanupResolvedPortfolios(
   }
 
   // Which owner token accounts exist (payout destinations)?
+  //
+  // GH#179: keyed by OWNER, not by position. `pfs` is sorted IN PLACE below (the vault LP has to
+  // settle last), and a positional array does not move with it -- so every portfolio from the LP's
+  // original slot onward read its predecessor's flag.
+  //
+  // The damage was one-directional and deterministic. A false POSITIVE is harmless, because
+  // `buildCreateAtaIdempotentIx` is idempotent. A false NEGATIVE emits no create, so CloseResolved
+  // names a token account that does not exist -- and all three attempt paths below reuse this same
+  // `pre`, so the portfolio fails (a), falls through (b), fails (c) and lands in `out.remaining`
+  // every cycle. `materialized_portfolio_count` then never reaches 0 and tag 41 keeps answering
+  // Custom(21), stranding the stakers' terminal insurance: the exact outcome this module exists to
+  // prevent.
+  //
+  // A map is used rather than moving the two `map` calls below the sort, because that would be
+  // correct only until someone adds another reordering underneath it. Two portfolios sharing an
+  // owner collapse to one entry, which is correct: `ownerAta` is deterministic, so they have the
+  // same account and the same flag.
   const atas = pfs.map((p) => ownerAta(p.owner, collateralMint));
-  let ataExists: boolean[];
+  const ataExists = new Map<string, boolean>();
   try {
     // Chunked at 100 (RPC cap): a resolved market can hold >100 portfolios. A failed chunk reads as "absent" (undefined -> false), as a whole-call failure did.
     const { infos } = await getMultipleAccountsInfoChunked(conn, atas, "confirmed");
-    ataExists = infos.map((i) => i != null);
+    pfs.forEach((p, i) => ataExists.set(p.owner.toBase58(), infos[i] != null));
   } catch {
-    ataExists = atas.map(() => false);
+    pfs.forEach((p) => ataExists.set(p.owner.toBase58(), false));
   }
 
   let ataCreates = 0;
@@ -771,7 +788,7 @@ export async function cleanupResolvedPortfolios(
     }
     try {
       const pre: TransactionInstruction[] = [];
-      if (!ataExists[i]) {
+      if (!ataExists.get(p.owner.toBase58())) {
         if (ataCreates >= cfg.maxAtaCreatesPerCycle) {
           out.remaining.push({ portfolio: p.pubkey.toBase58(), reason: "owner token account missing; ATA-create budget for this cycle used" });
           continue;
