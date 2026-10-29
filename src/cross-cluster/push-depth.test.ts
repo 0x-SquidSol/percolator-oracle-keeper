@@ -72,10 +72,11 @@ describe("plus2PctDepthE6 = floor(R * (1 - 1/sqrt(1.02)))", () => {
 });
 
 describe("KEEPER_PUSH_DEPTH flag", () => {
-  it("defaults OFF; only explicit truthy words turn it on", () => {
+  it("defaults OFF; explicit words turn it on or off; anything else refuses (a typo is never a silent OFF)", () => {
     assert.equal(pushDepthEnabled({}), false);
-    for (const v of ["", "0", "off", "false", "no", "2", "maybe"]) assert.equal(pushDepthEnabled({ KEEPER_PUSH_DEPTH: v }), false, v);
+    for (const v of ["", "0", "off", "false", "no", "OFF"]) assert.equal(pushDepthEnabled({ KEEPER_PUSH_DEPTH: v }), false, v);
     for (const v of ["1", "true", "TRUE", " on ", "yes"]) assert.equal(pushDepthEnabled({ KEEPER_PUSH_DEPTH: v }), true, v);
+    for (const v of ["2", "maybe", "onn", "enabled"]) assert.throws(() => pushDepthEnabled({ KEEPER_PUSH_DEPTH: v }), /KEEPER_PUSH_DEPTH="/, v);
   });
 });
 

@@ -80,6 +80,11 @@ describe("flag", () => {
     assert.equal(pushDepthOnchainEnabled({ KEEPER_PUSH_DEPTH: "on" }), false);
     assert.equal(pushDepthOnchainEnabled({ KEEPER_PUSH_DEPTH: "on", KEEPER_PUSH_DEPTH_ONCHAIN: "1" }), true);
   });
+  it("an unrecognised value refuses, whichever flag it is on and even with the other off", () => {
+    assert.throws(() => pushDepthOnchainEnabled({ KEEPER_PUSH_DEPTH: "on", KEEPER_PUSH_DEPTH_ONCHAIN: "onn" }), /KEEPER_PUSH_DEPTH_ONCHAIN="onn"/);
+    assert.throws(() => pushDepthOnchainEnabled({ KEEPER_PUSH_DEPTH_ONCHAIN: "yes please" }), /KEEPER_PUSH_DEPTH_ONCHAIN=/);
+    assert.throws(() => pushDepthOnchainEnabled({ KEEPER_PUSH_DEPTH: "ture", KEEPER_PUSH_DEPTH_ONCHAIN: "on" }), /KEEPER_PUSH_DEPTH="ture"/);
+  });
 });
 
 describe("wire", () => {

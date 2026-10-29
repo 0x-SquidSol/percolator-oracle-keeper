@@ -40,9 +40,8 @@ npm start
 | `SUPABASE_SERVICE_ROLE_KEY` | — | — | Required if SUPABASE_URL set |
 | `DEPLOYMENT_JSON` | — | — | Deployment JSON (alternative to Supabase) |
 | `PUSH_INTERVAL_MS` | — | `3000` | How often to push prices (ms) |
-| `HEALTH_PORT` | — | `18810` | Health endpoint port |
-| `HEALTH_BIND` | — | `0.0.0.0` | Health endpoint bind address |
-| `HEALTH_AUTH_TOKEN` | — | — | Bearer token for health endpoint |
+| `CC_HEALTH_PORT` | — | `3001` (pusher `3002`) | Health endpoint port |
+| `CC_HEALTH_BIND` | — | `0.0.0.0` | Health endpoint bind address |
 | `MAX_PRICE_MOVE_PCT` | — | `10` | Circuit breaker threshold (%) |
 | `STALE_THRESHOLD_S` | — | `30` | Staleness alert threshold (seconds) |
 | `MIN_KEEPER_BALANCE_SOL` | — | `0.05` | Minimum wallet balance before pausing |
@@ -56,18 +55,23 @@ npm start
 GET /health
 ```
 
-Returns JSON with per-market stats, wallet balance, and overall status:
+Returns JSON with the overall status, the wallet balance and per-market stats (`src/cross-cluster/keeper-loop.ts` `makeHealthHandler`), for example:
 
 ```json
 {
+  "walletLow": false,
+  "walletBalanceSol": "1.2346",
   "status": "ok",
-  "uptime": "3600s",
-  "wallet": { "address": "...", "balanceSol": 0.12, "low": false },
-  "markets": {
-    "SOL": { "lastPrice": 135.42, "lastPushAgo": "2s", "stale": false, "source": "pyth", "totalPushes": 1200 }
-  }
+  "lastSuccessfulPushAgo": "2s",
+  "uptimeSec": 3600,
+  "markets": { "<market address>": { "label": "SOL", "...": "..." } }
 }
 ```
+
+`/health` has no authentication, by design: Railway's health check calls it with no header. It is meant to carry no secrets:
+the balance of the keeper's fee payer (public on chain), market addresses and prices, push and crank counters, and
+error text; RPC URLs are redacted (`rpc-failover.ts` `redactUrl`). The launchers bind it to `127.0.0.1` (`run-v22fresh.sh`) or to
+Railway's `$PORT` (`deploy/railway-start.sh`). Do not give a Railway keeper service a public domain.
 
 ## Deployment (Railway)
 
@@ -77,7 +81,6 @@ Required Railway environment variables:
 - `RPC_URL` — Helius devnet RPC
 - `ADMIN_KEYPAIR` — JSON keypair array
 - `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — for market auto-discovery
-- `HEALTH_AUTH_TOKEN` — for secured health checks
 
 ## Devnet v2.1 fresh-ID cutover: two keepers
 
@@ -177,6 +180,20 @@ The keeper sends none of tags 74, 120, 121 or 122 and reads no G9 allowlist acco
 | `KEEPER_V22_MAINNET_BUILD` | off | G9 modes 0/2 pass the allowlist PDA + leg accounts |
 | `KEEPER_V22_STAKE_SYNC` / `_INTERVAL_MS` | off / 60000 | stake v5 tag 31 |
 | `KEEPER_V22_EARN_EXIT` | off | tag 77 on `keeper_ok` requests, only on a loss-current book |
+| `KEEPER_V22_LIFECYCLE` | **on** | read-only dead-market classifier (NEVER-CONNECTED / DEAD-PRICE warn + matured / DEAD-INTEREST), `/health` `v22.lifecycle`, alerts. Sends nothing |
+| `KEEPER_V22_STALE_RESOLVE` | **off** | `off` / `dry` / `on` only (`yes`/`true` refused): permissionless stale resolve, wrapper tag 39, IRREVERSIBLE. `dry` runs every guard + the simulation and logs "would resolve". See "Market lifecycle" below |
+| `KEEPER_V22_STALE_RESOLVE_MIN_OBS_MS` | 1800000 | continuous healthy observation AND (for markets the keeper can push) source-unavailable time required before a resolve |
+| `KEEPER_V22_STALE_RESOLVE_MASS_THRESHOLD` | 3 | more OUTAGE-SHAPED matured markets than this: resolve none, critical alert |
+| `KEEPER_V22_STALE_RESOLVE_MAX_PER_CYCLE` / `_RETRY_MS` | 1 / 600000 | resolves per tick; wait after an attempt before retrying that market |
+| `KEEPER_V22_STALE_RESOLVE_UNREGISTERED_ALLOW` | none | comma-separated addresses: the ONLY unregistered markets whose oracle authority is this keeper that may be resolved. Otherwise they are HELD with an alert (register or operator decision) |
+| `KEEPER_V22_STALE_RESOLVE_SOURCE_LOSS_MAX` / `_PCT` | 3 / 50 | global source-health hold: more than MAX, or more than PCT percent (and >= 2), of the markets the keeper can push lacking a usable source at once = price-reader regression: resolve no pushable market, critical alert |
+| `KEEPER_V22_STALE_RESOLVE_GROUP_LOSS_PCT` | 100 | correlation hold: when this percent (and >= 2 markets) of the pushable markets sharing one DEX type lack a usable source at once, resolves of that group are held |
+| `KEEPER_V22_LIFECYCLE_MAX_GAP_MS` | 120000 | a gap between two observations longer than this breaks "continuous" |
+| `KEEPER_V22_NEVER_CONNECTED_GRACE_SLOTS` | 1500 | price age before a market with no push path is called NEVER-CONNECTED |
+| `KEEPER_V22_DEAD_INTEREST_DAYS` | 14 | quiet days (OI 0, no trade-fee accrual observed) before DEAD-INTEREST |
+| `KEEPER_V22_LIFECYCLE_DISCOVERY_MS` | 600000 | keys-only gPA for wrapper markets with no registry row (0 = off) |
+| `KEEPER_V22_LIFECYCLE_STATE_FILE` | none | absolute path; persists the DEAD-INTEREST quiet clock across restarts |
+| `KEEPER_V22_WARN_BAND_FEES` / `_SPACING_MS` / `_MAX_PER_TICK` | **off** / 60000 / 4 | in the DEAD-PRICE warn band (>= 50% of the stale window) force tag 78 and tag 87 + stake 12 every spacing, because both are refused once matured and an uncranked staker leg is forfeited |
 | `VAULT_LP_LONE_CRANK` | on | `off` suppresses the lone vault-LP crank after every landed push (works without `KEEPER_V22`) |
 
 **SETTLE_PAIRING.** Engine tag 5 on a portfolio settles only that portfolio, then accrues; a loss is booked at once, counterparties' gains
@@ -205,6 +222,16 @@ any keeper action (`prefer` counts it, `strict` freezes the LP until it clears, 
 (counted) and `strict` skips the LP that round; the accrue-through-a-counterparty fallback settles that counterparty alone at the new K for the round's duration; the LP's rent is not settled under pairing
 (rent is index-based and timing-invariant). Defence in depth: the engine fix is separate.
 
+### Market lifecycle (plan `v22-market-lifecycle-plan-2026-10-25`, option C)
+
+Tag 39 `ResolveStalePermissionless` is the always-on backstop; the keeper fires it at maturity. The admin resolve (deliberate retirements) is NOT done by the keeper. `KEEPER_V22_STALE_RESOLVE` defaults to `off`: merging or deploying changes nothing until it is set.
+
+Classes (`/health` `v22.lifecycle`, per-market `lifecycle`): `never-connected` (no registry row / oracle authority is not this keeper / no accepted push; there is no on-chain creation slot, so this means "never connected as far as this keeper can tell", and needs a price age of at least the grace), `dead-price-warn` (age >= 50% of `permissionless_resolve_stale_slots`), `dead-price-matured` (>= 100%), `dead-interest` (priced, OI 0, no trade-fee accrual observed for N days; there is no on-chain last-trade slot, so the clock is observation-based: OI 0 and unchanged trade-fee accrual counters; it restarts at every boot unless `KEEPER_V22_LIFECYCLE_STATE_FILE` persists it, in which case it spans downtime and the counter comparison on restart catches any trade-fee accrual meanwhile; a trade that paid no fee is invisible), `no-resolve-window` (stale_slots = 0: classified, never attempted). dead-interest is classify + alert only.
+
+Resolve guards (all in `v22/lifecycle-resolve.ts`, each unit-tested with a negative control): mode on; market Live; window enabled; matured; BOTH keeper loops observing continuously for `MIN_OBS_MS` (a keeper that was down, RPC-failing, stalled or just booted never resolves); not outage-shaped (more than `MASS_THRESHOLD` matured markets that the keeper could push and still has a usable source for); a market the keeper can push (registry row and asset-0 oracle authority = this keeper) is resolved only after its source has been unavailable for `MIN_OBS_MS` (if the keeper has a usable price it must push, which re-advances `last_good_oracle_slot`); only a market whose oracle authority is NOT this keeper resolves without source evidence (a usable price is irrelevant when it can never push, and it never counts toward the outage guard); an UNREGISTERED market whose authority IS this keeper (including one a registry hot-reload pruned) is HELD with an alert unless allowlisted, and does not count toward the outage guard unless it was registered earlier in this process and pruned (a shrinking registry is outage-shaped); a global source-health hold stops all pushable resolves when many pushable markets lack a source at once, and a per-DEX-type correlation hold when all (or `GROUP_LOSS_PCT`) of one DEX group lack a source together; one attempt per market per retry window and never again after a landed one; `MAX_PER_CYCLE` per tick. Immediately before the send the account is re-read: wrapper-owned, still Live, still matured at the current slot, `last_good_oracle_slot` unchanged. Multi-asset: tag 39 reads the config `last_good_oracle_slot`, which mirrors asset 0 only.
+
+After a resolve the existing terminal path takes over for REGISTRY markets (terminal-insurance + resolved-portfolio-cleanup on the next fee-loop cycle; the push loop is told the market is terminal). A market with no registry row is not swept by those jobs (they walk the registry).
+
 Env parsing is STRICT (on/1/true/yes, off/0/false/no). Scope: `KEEPER_V22` and `VAULT_LP_LONE_CRANK` are validated on EVERY start; the other `KEEPER_V22_*` variables are read and validated only when `KEEPER_V22` is on. **Operator: audit the live (Railway) env for stray `KEEPER_V22*` / `VAULT_LP_LONE_CRANK` values before deploying this build**: a malformed `VAULT_LP_LONE_CRANK` stops even a flags-off keeper at boot (fail closed).
 
 Rent (tag 106) is NOT substituted for a refresh (106 forces the Refresh action, so a liquidatable counterparty would not be liquidated, and every 106 write-locks the LP, serialising phase 1). It runs after the LP tx of a round, one tx per portfolio, sequentially, only for portfolios the round already refreshed with the plain crank and only when the LP settled. Each 106 accrues and settles ONE counterparty to a K newer than the LP's (the LP tx came first); the LP stays behind until the NEXT round's LP tx (about one cycle). With N per round that mirror window is N sequential txs. `RENT_SETTLES_PER_ROUND` (sweep.ts) is 1 by default: the window is then one portfolio for one cycle. Rent is index-based and timing-invariant, so a slower rent cadence costs nothing (1 per 20 s round still covers 180 portfolios per default 9,000-slot cadence; a bigger book is simply settled less often than the cadence).
@@ -220,3 +247,26 @@ Booked / draw log parsing (`p3_senior_draw*`) accepts both the v2.1 and the v2.2
 Anchor: `node --import tsx/esm src/v22-create-anchor.ts <market>` (operator tool, never run by the keeper) creates the keeper's own flat portfolio at the layout's exact length; it needs `KEEPER_V22_CREATE_ANCHOR=on`, is dry-run unless `KEEPER_V22_CREATE_ANCHOR_DRY_RUN=off`, and refuses (before simulating or sending) unless the market account is owned by the configured wrapper program and has a supported wrapper VERSION. The `KEEPER_V22_ACCRUE_ANCHORS` override must pass the same keeper-owned / flat check as discovery.
 
 Every v2.2 send is simulated first (`v22/exec.ts`); refusals are logged by name (`PriceBandPinned(104)`, `InsuranceReadingsDiverged(44)`); band states 104/111/112/113 are expected, counted, never alerted.
+
+### Leverage guard (wrapper tag 124) — `KEEPER_LEV_*`, all default OFF
+
+Source: `v22/lev-guard.ts`, maths in `v22/lev-guard-math.ts`. Wire spec: ledger `v22-lev-guard-wire-spec-2026-10-28`. Nothing is deployed on chain yet; a market without a guard PDA is a cached no-op (re-checked every 10 min), so every flag is inert on a deployment with no guarded market. These flags do NOT need `KEEPER_V22`. They are parsed strictly (a typo stops the boot, like the v2.2 flags) and honour the global dry-run (`DRY_RUN` / `KEEPER_DRY_RUN` / `KEEPER_V22_DRY_RUN`): the transaction is simulated and logged `[v22][DRY-RUN] ...`, never signed or sent. Every send goes through `v22/exec.ts` (simulate first; refusals named). Jobs are `lev-poke`, `lev-tighten`, `lev-report`, `lev-w1` in `/health` `v22.jobs` (when `KEEPER_V22` is on) and the additive `/health` `levGuard` block (only when a flag is on).
+
+| Env | Default | What |
+|---|---|---|
+| `KEEPER_LEV_POKE` | **off** | op 4 POKE with NAV sampling (`vault_lp_state` [4] + `vault_lp_ext` [5]) after each landed mark push, and immediately BEFORE a tag-103 Earn -> LP allocation send (after its clean simulation; the allocation tx is then re-signed on a fresh blockhash) |
+| `KEEPER_LEV_HOLDER_JOB` | **off** | hourly per guarded market: op 3 TIGHTEN (flags refresh); the base mint's 20 largest token accounts, pool vaults / program- / pool- / PDA-owned dropped, CPMM dump `1-(R/(R+q))^2` vs the pinned pool base vault, op 3 with the single largest holder account (falls to the next on a 134, max 3 tries); with a risk key, op 2 REPORT |
+| `KEEPER_LEV_RISK_KEY_PATH` | unset | absolute path of the guard's risk-key keypair JSON (contents never logged; a group- or world-readable file stops the boot, `chmod 600`). Unset = no REPORT. Only used with `KEEPER_LEV_HOLDER_JOB`; the report is skipped when the guard's `risk_key` is a different key |
+| `KEEPER_LEV_W1` | **off** | after a landed push: when the guard says the LP stop holds, or a round is open, cut the opposing user portfolios in batches until `round_active` is 0; the opening call already carries the first batch (the program reverts an opening call that cuts nothing; LP side from the vault LP's net position, or `round_lp_long` once a round is open); victims are chosen by effective (net) side; a call with no victim is never sent; error 135 on a call with victims = nothing to do. The LP is never listed |
+| `KEEPER_LEV_POKE_MIN_GAP_MS` | 1500 | least gap between two push-triggered pokes of one market (the pre-allocation poke ignores it) |
+| `KEEPER_LEV_HOLDER_INTERVAL_MS` | 3600000 | holder job cadence per market (first runs staggered over up to 10 min) |
+| `KEEPER_LEV_W1_BATCH` | 4 (max 24) | opposing portfolios per op 5 transaction (24 is the 1,232 B packet ceiling; CU is the real limit, tune from the simulated units in the log) |
+| `KEEPER_LEV_W1_MAX_TXS` | 12 | most op 5 transactions of one run; a longer round continues on the next landed push |
+
+Report fields: `m_ind` = largest individual FULL-balance CPMM dump (H9; a holder's token accounts among the top 20 are summed), `j_dump` = the sim `holder_terms` J with every unknown holder as kind `whale`, `l_cap_x100` 0 (no cap), `n_mult_bps` 10000; every bps field is an integer clamped to [0, 10000], rounded up, and no report is sent if any figure is not finite. The program merges reports tighten-only.
+
+Holder filtering errs on dropping: an owner that is off-curve (a PDA, including a Squads vault) or whose own account is program-owned is NOT counted as an individual holder (counting a pool/vault as a holder would over-tighten a market). Known limit: a whale that holds through a PDA wallet is invisible to this job until the owner is on the curve.
+
+SDK: tag-124 comes from the main `@percolatorct/sdk` pin (percolator-sdk `feat/v22-sdk-growth` @ 7aeb7a13). The keeper keeps its own `keyTagOf` (tested equal to the SDK's fixed `levKeyTagV22`).
+
+Guard length: the guard PDA is accepted at 4,456 B or the burst-memory 4,472 B; any other length on a program-owned kind-17 account at the PDA raises a `[lev-guard][ALERT]` log and `levGuard.stats.guardBadLength`. Both lengths decode through the SDK (0a6ac576).

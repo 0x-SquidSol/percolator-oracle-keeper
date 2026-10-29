@@ -148,7 +148,10 @@ export function evaluateHedgedLockout(i: HedgedLockoutInput, t: HedgedLockoutThr
  * i.e. `n_cap_g8_q_dials` as the gate, the TradeCpi clip and the rent snapshot read it. Stress does not enter N_cap. Pure.
  */
 export function g8NCapQ(growth: AssetGrowthV19, bandBps: number, nowSlot: bigint, cM: bigint, priceE6: bigint): bigint | null {
-  const view = growthCeilingView(growth, bandBps, nowSlot, cM, STRESS_NONE);
+  // rc23Caps: false keeps this reader on the wrapper 21b8ccfd semantics it is tested against. SDK 9aff57d (#433) defaults the rc23 kappa / lambda caps ON
+  // (kappa_eff 253 bps), which moves N_cap here by ~26x. Flip it (and the tests) together with the rc23 wrapper deploy -- an owner call, not part of the
+  // 16-byte key-tag fix (#219).
+  const view = growthCeilingView(growth, bandBps, nowSlot, cM, STRESS_NONE, undefined, { rc23Caps: false });
   return nCapG8Q({ clamp: view.clampEnforced, cM, lambdaBps: growth.lambdaBps, tier: view.tier, capDepth: view.capDepthE6, priceE6, dials: view.dials });
 }
 

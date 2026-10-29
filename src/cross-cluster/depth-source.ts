@@ -17,6 +17,7 @@ import { PublicKey } from "@solana/web3.js";
 import { deriveDepthSourceV22 } from "@percolatorct/sdk";
 import type { AccountInfo, Connection } from "@solana/web3.js";
 import { pushDepthEnabled } from "./push-depth.ts";
+import { parseFlag } from "./v22/flags.ts";
 import { getMultipleAccountsInfoChunked } from "./rpc-chunk.ts";
 
 /** Wrapper `DepthSourceInvalid`. */
@@ -33,10 +34,10 @@ const FLAGS_KNOWN = 3;
 const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const TOKEN_2022_PROGRAM = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
-/** `KEEPER_PUSH_DEPTH_ONCHAIN` on AND `KEEPER_PUSH_DEPTH` on. */
+/** `KEEPER_PUSH_DEPTH_ONCHAIN` on AND `KEEPER_PUSH_DEPTH` on. Both are parsed (an unrecognised value throws) even when the other is off. */
 export function pushDepthOnchainEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const v = (env.KEEPER_PUSH_DEPTH_ONCHAIN ?? "").trim().toLowerCase();
-  return pushDepthEnabled(env) && (v === "1" || v === "true" || v === "on" || v === "yes");
+  const onchain = parseFlag(env, "KEEPER_PUSH_DEPTH_ONCHAIN", false);
+  return pushDepthEnabled(env) && onchain;
 }
 
 export function deriveDepthSource(programId: PublicKey, market: PublicKey): PublicKey {

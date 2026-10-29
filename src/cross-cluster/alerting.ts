@@ -36,6 +36,10 @@
  *   - vault-LP crank stale (v2.2 band, v22/lp-cert-liveness.ts) the vault LP's leg is
  *                    uncertified this band epoch for >= 25% / 50% of the E + Pmax resolve
  *                    horizon (BandPinExpired resolves the market at 100%, sim §P2.10)
+ *   - market lifecycle (v2.2, v22/lifecycle.ts) NEVER-CONNECTED (no push path from this keeper and the price is not
+ *                    advancing), DEAD-PRICE (>= 50% of permissionless_resolve_stale_slots WARN, matured CRITICAL),
+ *                    DEAD-INTEREST (priced, OI = 0, no trade-fee accrual for N days), a stale resolve the keeper is
+ *                    HOLDING (outage-shaped / mass maturity: CRITICAL) and the resolve it SENT
  *
  * Output:
  *   `[health] {json}`  one line per sample batch, machine-parseable
@@ -86,7 +90,12 @@ export type AlertKind =
   | "band-pin-expiring"
   | "vault-lp-crank-stale"
   | "adl-close-only"
-  | "adl-wind-down-overdue";
+  | "adl-wind-down-overdue"
+  | "market-never-connected"
+  | "market-dead-price"
+  | "market-dead-interest"
+  | "stale-resolve-held"
+  | "stale-resolve-sent";
 
 export interface Alert {
   kind: AlertKind;
