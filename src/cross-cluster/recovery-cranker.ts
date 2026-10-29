@@ -134,11 +134,11 @@ import {
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
 import type { LegCostModel } from "./positioned-refresh.ts";
-import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import { countLayoutProblem, getCrankRefreshHealth, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
 import { getSweepDelegate } from "./v22/delegation.ts";
 import { observationAssetsFor, recordMarketAccrual, refreshStateForMarket } from "./multi-asset.ts";
 import { formatProgramError } from "./v22/errors.ts";
-import type { MarketLayoutHealth } from "./refresh-coordination.ts";
+import type { CrankRefreshHealth, MarketLayoutHealth } from "./refresh-coordination.ts";
 import { SDK_PORTFOLIO_LENS, describeUnknownLayout, detectLayout } from "./market-layout.ts";
 import type { LayoutDetection } from "./market-layout.ts";
 import {
@@ -1891,6 +1891,76 @@ export function crankSample(label: string, market: string, st: Pick<CrankMarketS
   };
 }
 
+/** GH#181: how stale the v2.2 layer's record may be and still be evaluated. */
+export const V22_HEALTH_MAX_AGE_MS = 120_000;
+
+/**
+ * GH#181: a crank-health sample built from the v2.2 layer's PUBLISHED refresh-health record.
+ *
+ * A v2.2-owned market returns from `crankMarketOnce` before `observed` is ever assigned (the
+ * sweep delegate owns it), so `st.obs` is null and `crankSample` yields nothing. The v2.2 layer
+ * publishes a full record instead -- but nothing evaluated it, so eight alert kinds could not
+ * fire for any v2.2 market. This adapts that record so `evaluateCrankHealth` can run on it.
+ *
+ * The record does not carry crank counters, lapsed-bucket counts or bankruptcy counts, so those
+ * are filled with values that CANNOT trigger their alerts (0 reverts, 0 lapsed, 0 bankrupt)
+ * rather than guessed. Restoring `crank-reverts`, `lapsed-bucket` and `bankrupt-unliquidated`
+ * needs the v2.2 round to define those counters, which is a semantic call, not a translation.
+ *
+ * `slot-lag` IS restored: the record now carries the slot pair. When it does not (a record from
+ * before that field), `engineSlot` is null and `slotLag` returns null -- no verdict, never a
+ * wrong one.
+ *
+ * Returns null for a missing or stale record. A stale record means the v2.2 loop has stopped
+ * publishing, which is the watchdog gap in the second half of #181 and deliberately NOT papered
+ * over here: alerting on frozen numbers would be worse than the current silence.
+ */
+export function v22CrankSample(
+  label: string,
+  market: string,
+  h: CrankRefreshHealth | undefined,
+  nowMs: number,
+  maxAgeMs: number = V22_HEALTH_MAX_AGE_MS,
+): CrankHealthSample | null {
+  if (!h) return null;
+  if (nowMs - h.updatedAt > maxAgeMs) return null;
+  const hasSlots = h.chainSlot !== undefined;
+  return {
+    label,
+    market,
+    chainSlot: h.chainSlot ?? 0n,
+    engineSlot: hasSlots ? (h.engineSlot ?? null) : null,
+    crankOk: true,
+    crankReverted: false,
+    totalOk: 0,
+    totalReverts: 0,
+    consecutiveReverts: 0,
+    lastRevertCode: null,
+    lapsedBuckets: 0,
+    bankruptFound: 0,
+    bankruptLiquidated: 0,
+    staleLong: h.staleLong,
+    staleShort: h.staleShort,
+    positioned: h.positioned,
+    overflow: h.overflow,
+    overflowRefreshed: h.overflowRefreshed,
+    lossStaleCycles: h.lossStaleCycles,
+    ...(h.layout ? { layout: h.layout } : {}),
+    ...(h.sweep ? { sweep: h.sweep } : {}),
+    ...(h.adl
+      ? {
+          adl: {
+            reduceOnly: h.adl.reduceOnly,
+            aLong: BigInt(h.adl.aLong),
+            aShort: BigInt(h.adl.aShort),
+            oiEffLong: BigInt(h.adl.oiEffLong),
+            oiEffShort: BigInt(h.adl.oiEffShort),
+          },
+        }
+      : {}),
+  };
+}
+
 /**
  * Evaluate every market's latest observation, reconcile alerts, and every
  * HEALTH_LINE_EVERY_CYCLES cycles print one `[health]` line. Observations are
@@ -1908,7 +1978,12 @@ export async function reportCrankHealth(
   for (const m of registry.markets) {
     const st = states.get(m.marketAddress);
     if (!st) continue;
-    const sample = crankSample(m.label, m.marketAddress, st);
+    // GH#181: a v2.2-owned market has no observation of its own (the sweep delegate owns it and
+    // this function's caller returns before `observed` is set), so fall back to the record the
+    // v2.2 layer publishes. Without this, evaluateCrankHealth never runs for any v2.2 market.
+    const sample =
+      crankSample(m.label, m.marketAddress, st) ??
+      v22CrankSample(m.label, m.marketAddress, getCrankRefreshHealth(m.marketAddress), Date.now());
     if (!sample) continue;
     const ev = evaluateCrankHealth(sample, st.streaks, sink.thresholds);
     st.streaks = ev.streaks;
