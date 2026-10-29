@@ -153,6 +153,8 @@ export interface PairingStats {
   mergedRounds: number;
   mergedFallbacks: number;
   mergedDroppedCurrent: number;
+  /** LF: cycles the v2.2 layer declined while the lone LP crank is suppressed: the legacy fallback ran without its LP accrual crank (includes every cycle of a market whose asset 0 is not Active / DrainOnly). */
+  declinedClockOnly: number;
 }
 
 const zeroStats = (): PairingStats => ({
@@ -161,7 +163,7 @@ const zeroStats = (): PairingStats => ({
   lastGapSlots: null, maxGapSlots: 0, bandExpected: 0, prunedCurrent: 0, hardRefusals: 0, quarantinedNow: 0,
   anchorAccrues: 0, anchorFallbacks: 0, quarantineCapped: 0, deferralEscalations: 0, lpTimeBoundRounds: 0, counterpartyAccrues: 0, accrueAlreadyDone: 0, protectiveRounds: 0, rentSettlesInRound: 0, shrinkDeferrals: 0,
   feeAfterRound: 0, feeUnpairedLpSettles: 0, liqIncluded: 0, liqLanded: 0, liqNothingToDo: 0, liqRefused: 0, liqDeferred: 0, liqSkipped: 0,
-  mergedRounds: 0, mergedFallbacks: 0, mergedDroppedCurrent: 0,
+  mergedRounds: 0, mergedFallbacks: 0, mergedDroppedCurrent: 0, declinedClockOnly: 0,
 });
 
 export const pairingStats: PairingStats = zeroStats();
@@ -243,7 +245,7 @@ export interface RoundResult {
   /** Counterparties not settled this round, with why. */
   missing: Array<{ key: string; why: "quarantined" | PruneReason | "unlanded" | "unplanned" }>;
   rentSettled: string[];
-  /** The round was skipped for a gap backoff: nothing ran (the delegate must decline so the legacy accrual crank runs). */
+  /** The round was skipped for a gap backoff: nothing ran (the loop then sends one accrue-only crank, never on the LP). */
   backedOff: boolean;
   /** The program refused an anchor accrue this round (the caller drops the anchor for a while). */
   anchorRefused: boolean;

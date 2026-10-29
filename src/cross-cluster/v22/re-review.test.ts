@@ -198,16 +198,16 @@ describe("N-2: the protective trigger uses the program's own signal, with a boun
   });
 });
 
-describe("N-4: a backed-off round makes the delegate decline so the legacy accrual crank runs", () => {
+describe("N-4 + LF: a backed-off round with no accrue target declines clock-only (never the legacy LP accrual crank)", () => {
   const entry = { marketAddress: MARKET.toBase58(), label: "T/V22" };
-  it("backoff -> false (nothing sent); no backoff -> true", async () => {
+  it("backoff, no anchor / counterparty -> \"clock-only\" (nothing sent); no backoff -> true", async () => {
     const f = fakeLoopConn({ market: v22MarketBytes(), registry: registryBytes({ bound: true }), vaultLpState: vaultLpStateBytes(key(901)) });
     const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [entry], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: () => {} });
     const args = { conn: f.conn as never, keeper: Keypair.generate(), entry, marketData: v22MarketBytes(), slot: 5000, dryRun: false };
     assert.equal(await loop.sweepDelegate(args), true, "control: a normal round is handled");
     const sentBefore = f.sent.length;
     (loop as unknown as { rtFor(a: string): { gapBackoff: { skipRounds: number } } }).rtFor(entry.marketAddress).gapBackoff.skipRounds = 1;
-    assert.equal(await loop.sweepDelegate(args), false, "backed off: decline");
+    assert.equal(await loop.sweepDelegate(args), "clock-only", "backed off with nothing to accrue through: decline, pairing suppresses the LP accrual");
     assert.equal(f.sent.length, sentBefore, "and nothing was sent by the v2.2 layer");
     assert.equal(await loop.sweepDelegate(args), true, "the backoff is over");
   });

@@ -582,6 +582,8 @@ export function planCrankTx(params: {
   cost?: LegCostModel;
   /** The LP's positioned entry (leg count): the accrual crank settles it, so a heavy LP is the accrual's cost. */
   lp?: PositionedPortfolio | null;
+  /** false = no accrual crank (it settles the LP): repairs and catch-up only (a v2.2 "clock-only" cycle). Default true. */
+  accrue?: boolean;
 }): CrankPlan {
   const { owner, market, lpPortfolio, catchup, refreshTargets } = params;
   const cost = params.cost;
@@ -606,8 +608,8 @@ export function planCrankTx(params: {
   const accrueCu = accrueCrankCuFor(cost && params.lp && cost.isSolo(params.lp) ? cost.worstRefreshCu(params.lp) : ACCRUE_CRANK_CU, hints);
   // K-6 (multi-asset only): the catch-up and the accrual must fit one transaction, else catch up first.
   const multiTooBig = hints > 1 && catchupN > 0 && repairCu + catchupN * catchupCu + accrueCu > MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
-  if (!catchupAllowsRefresh(catchup) || catchupN < catchup || multiTooBig) {
-    // Too far behind to finish this cycle: catch-up cranks only.
+  if (!catchupAllowsRefresh(catchup) || catchupN < catchup || multiTooBig || params.accrue === false) {
+    // Too far behind to finish this cycle (or no accrual wanted): catch-up cranks only.
     return {
       cranks,
       overflow: [],

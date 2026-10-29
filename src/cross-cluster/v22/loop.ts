@@ -432,11 +432,18 @@ export class V22Loop {
 
   /**
    * The recovery cranker's per-market hook for a variant-B market (KEEPER_V22_SWEEP). Returns true ONLY when this layer
-   * actually ran (or a round is already running); on every "could not run" path it returns FALSE so the legacy
-   * accrual-only crank still runs this cycle (review F-5: the engine clock must keep moving).
+   * actually ran (or a round is already running); on every "could not run" path it declines so the legacy cycle still
+   * runs (review F-5: the engine clock must keep moving). LF: that cycle's accrual crank targets the vault LP and settles
+   * it alone, so where the lone LP crank is suppressed it declines "clock-only" (repairs and catch-up, no accrual crank;
+   * counted `declinedClockOnly`). The cranker calls this only for a variant-B market, so the market is v2.2 even when
+   * this cycle's own read failed.
    */
-  async sweepDelegate(a: SweepDelegateArgs): Promise<boolean> {
-    return this.runRoundFor(a.conn, a.entry, false);
+  async sweepDelegate(a: SweepDelegateArgs): Promise<boolean | "clock-only"> {
+    if (await this.runRoundFor(a.conn, a.entry, false)) return true;
+    const f = this.d.flags;
+    if (!loneLpCrankSuppressed({ loneLpCrankFlag: f.loneLpCrank, pairingActive: pairingActive(f), isV22Market: true })) return false;
+    pairingStats.declinedClockOnly++;
+    return "clock-only";
   }
 
   private async runRoundFor(conn: Connection, entry: { marketAddress: string; label: string; lpPortfolio?: string }, protective: boolean): Promise<boolean> {
@@ -473,7 +480,7 @@ export class V22Loop {
       }
       const positioned = await this.positionedFor(ctx, r);
       if (!positioned || !positioned.lp) {
-        this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy accrual crank`);
+        this.log(`[v22][sweep] ${ctx.label}: no vault LP portfolio or the positioned set is unreadable; leaving this cycle to the legacy fallback`);
         return false;
       }
       // K-6 (+ LIQ-DIAG 2026-10-17: every market, not only multi-asset): a market whose oldest observed asset is a full
@@ -534,7 +541,21 @@ export class V22Loop {
         },
         roundCfg,
       );
-      if (res.backedOff) return false; // nothing ran: let the legacy accrual crank run this cycle (N-4)
+      if (res.backedOff) {
+        // N-4 + LF: no round this cycle, but the clock must keep moving (F-5). Declining here made the legacy fallback crank
+        // the vault LP alone about one cycle after phase 1 settled the counterparties. The positioned set is in hand, so
+        // accrue through the flat anchor, else the lightest unquarantined counterparty (settles only it, as phase 1 does).
+        const nowSlot = BigInt(ctx.readSlot);
+        const cp = positioned.counterparties.filter((c) => !((r.quarantine.get(c.pubkey.toBase58()) ?? 0n) > nowSlot)).sort((x, y) => portfolioWeight(x) - portfolioWeight(y))[0];
+        const target = useAnchor ?? cp?.pubkey ?? null;
+        if (!target) return false;
+        const out = await simulateAndSend(this.execCtx(), [buildObservationCrankIx(this.d.keeper.publicKey, ctx.market, target, crankOracleAccounts(ctx))], { job: "backoff-accrue", label: ctx.label, units: MAX_TX_CU });
+        if (useAnchor) pairingStats.anchorAccrues++;
+        else pairingStats.counterpartyAccrues++;
+        const what = out.kind === "sent" ? `sent ${out.landed}` : out.kind === "refused" ? `refused ${out.name}` : out.kind === "failed" ? `failed ${out.error}` : out.kind;
+        this.log(`[v22][sweep] ${ctx.label}: ${res.abandoned}; accrue-only crank on ${useAnchor ? "the flat anchor" : "a counterparty"} ${target.toBase58().slice(0, 8)}…: ${what}`);
+        return true;
+      }
       if (res.anchorRefused) {
         r.anchorBadRounds = 5;
         this.log(`[v22][sweep] ${ctx.label}: the program refused the flat-anchor accrue; using the counterparty accrue form for 5 rounds`);

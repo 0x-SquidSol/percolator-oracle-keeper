@@ -622,7 +622,7 @@ describe("R3.22b: a v2.2 market the v2.2 layer owns never reaches the legacy lay
       },
     };
     invalidateBlockhash(conn as never);
-    setSweepDelegate(o.delegate ? async () => { delegateCalls++; return false; } : null); // false = the round backed off
+    setSweepDelegate(o.delegate ? async () => { delegateCalls++; return false; } : null); // false = declined, lone LP crank not suppressed (pairing off)
     const state = freshCrankMarketState();
     const before = getLayoutProblemCounts();
     const prefetched = { value: { data: Buffer.from(market), owner: PublicKey.default, lamports: 1, executable: false }, context: { slot } };

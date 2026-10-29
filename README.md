@@ -214,7 +214,16 @@ Tag 78 runs at the END of a paired round (alone, the LP was just settled), tag 1
 LP protection latency. The 1.5 s lone LP crank is suppressed on v2.2 markets while sweep + pairing are on, so the LP's own senior-draw / liquidation protection
 waits for the next round: up to one crank cycle (`CRANK_INTERVAL_MS`, default 20 s) plus the round (about 1-5 s). Exception: on every landed push the v2.2 layer checks
 the LP (senior draw pending, or equity <= 20% of capital: a coarse heuristic, the program decides) and, if so, runs a full PAIRED round immediately (about one round, 1-5 s). A protective
-round may go with phase-1 failures but still puts the LP last in a tx WITH counterparties, never alone. No lone LP crank is reintroduced.
+round may go with phase-1 failures but still puts the LP last in a tx WITH counterparties, never alone. No lone LP crank is reintroduced: when the v2.2 layer
+declines a cycle (unreadable market or positioned set, no vault LP known, asset 0 not Active, an error) the legacy cranker only repairs and catches up (its accrual
+crank, which settles the LP alone, is left out; counted `declinedClockOnly`), so the engine clock lags up to about one accrual window plus one cycle and catches up in
+whole windows while a decline persists. On markets with `max_accrual_dt_slots` 500 (the live v2.2 markets) that is above the default slot-lag thresholds
+(`ALERT_SLOT_LAG_WARN` 300 / `ALERT_SLOT_LAG_CRITICAL` 450): a decline lasting about 6 cycles or more raises the slot-lag alert, which clears at each catch-up.
+A catch-up crank returns before settling anyone only while an observed asset can accrue (Active / DrainOnly). When none can (asset 0 in Recovery on a single-asset
+market), the wrapper skips the asset without accruing it and every catch-up crank on the LP reaches it: a Recovery forfeit / refresh from committed state until the
+LP is current, then the crank fails simulation (Custom(22)) and nothing is sent. No price moves on such an asset, so nothing is stranded.
+A gap-backoff cycle sends one accrue-only crank through the flat anchor, else the lightest counterparty.
+With pairing off and `VAULT_LP_LONE_CRANK` on, a declined cycle still sends the legacy LP accrual crank.
 
 What it cannot guarantee: multi-tx rounds are not atomic (expected gap 1-4 slots, cap 8; funding/rent keep accruing, other writers' pushes can move K); only a single-tx
 round is exactly atomic; anyone can still crank the LP alone (tag 5 is permissionless); the positioned set is a read; a portfolio the program keeps refusing can never be settled by
