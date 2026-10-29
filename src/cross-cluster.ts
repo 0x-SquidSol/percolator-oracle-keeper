@@ -73,7 +73,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
-import { bindObservationRegistry, validateMultiAssetEntry } from "./cross-cluster/multi-asset.ts";
+import { bindObservationRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
 import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
@@ -355,12 +355,12 @@ const REGISTRY_RELOAD_INTERVAL_MS = bootPositiveNumberEnv("REGISTRY_RELOAD_INTER
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
 const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
-// K-6: multi-asset rows must be well formed (the keeper never guesses a source or an asset), and every observation
+// K-6 / A8-4: every row must be well formed (the keeper never guesses a key, a source or an asset), and every observation
 // crank looks its market's asset list up in the LIVE registry (hot-reloaded in place, hence the getter).
 {
-  const problems = registry.markets.flatMap((m) => validateMultiAssetEntry(m));
+  const problems = registryRowProblems(registry.markets);
   if (problems.length > 0) {
-    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid multi-asset row(s):\n  ${problems.join("\n  ")}`);
+    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid registry row(s):\n  ${problems.join("\n  ")}`);
     process.exit(1);
   }
 }

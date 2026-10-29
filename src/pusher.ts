@@ -20,6 +20,7 @@
 import { Connection, Keypair } from "@solana/web3.js";
 import fs from "fs";
 import { loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
+import { registryRowProblems } from "./cross-cluster/multi-asset.ts";
 import { PROGRAM_IDS_RESOLVED, describeProgramIds } from "./program-ids.ts";
 import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
@@ -79,6 +80,13 @@ function loadKeypair(): Keypair {
 const keeper = loadKeypair();
 const REGISTRY_PATH = process.env.REGISTRY_PATH;
 const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
+{
+  const problems = registryRowProblems(registry.markets);
+  if (problems.length > 0) {
+    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid registry row(s):\n  ${problems.join("\n  ")}`);
+    process.exit(1);
+  }
+}
 const mainnetFailover = failoverFromEnv("mainnet", MAINNET_RPC, parseFallbackUrls(process.env.MAINNET_RPC_FALLBACK_URLS, []), process.env, countingFetch("mainnet"));
 const devnetFailover = failoverFromEnv("devnet", DEVNET_RPC, parseFallbackUrls(process.env.DEVNET_RPC_FALLBACK_URLS ?? process.env.RPC_FALLBACK_URLS), process.env, countingFetch("devnet"));
 const mainnetConn = new Connection(MAINNET_RPC, { commitment: "confirmed", fetch: mainnetFailover?.fetch ?? countingFetch("mainnet") });

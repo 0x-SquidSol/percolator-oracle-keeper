@@ -32,6 +32,7 @@
  * Only AUTH_MARK assets are supported on a multi-asset row (the oracle-leg tail of a Hybrid crank belongs to one
  * asset). The registry validator below refuses malformed rows; the keeper never guesses.
  */
+import { PublicKey } from "@solana/web3.js";
 import type { AssetSource, DexType, MarketEntry } from "./registry.ts";
 import { decodeMarketRefreshState, isAssetLossStale } from "./positioned-refresh.ts";
 import type { MarketRefreshState } from "./positioned-refresh.ts";
@@ -192,6 +193,42 @@ export function validateMultiAssetEntry(entry: Pick<MarketEntry, "assets" | "lab
     seen.add(a.assetIndex);
   }
   if (entry.assets.length > MAX_OBSERVATION_HINTS) problems.push(`${entry.label}: ${entry.assets.length} assets > ${MAX_OBSERVATION_HINTS} observation hints`);
+  return problems;
+}
+
+function isPubkey(s: unknown): s is string {
+  if (typeof s !== "string") return false;
+  try {
+    new PublicKey(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every problem with the registry's rows (empty = valid): the shape every consumer assumes (the preflight's row checks,
+ * without its RPC owner check). Run at boot and on every hot-reload, so a bad row is refused before a push batch or a
+ * crank parses it: one unparsable marketAddress used to fail the whole PushAuthMark batch (every market) every cycle.
+ */
+export function registryRowProblems(markets: ReadonlyArray<MarketEntry>): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const m of markets) {
+    const who = m?.label ?? "?";
+    if (!isPubkey(m?.marketAddress)) {
+      problems.push(`${who}: marketAddress ${String(m?.marketAddress)} is not a public key`);
+      continue;
+    }
+    if (seen.has(m.marketAddress)) problems.push(`${who}: duplicate marketAddress ${m.marketAddress}`);
+    seen.add(m.marketAddress);
+    if (m.assets !== undefined) {
+      problems.push(...validateMultiAssetEntry(m));
+      continue;
+    }
+    if (!isPubkey(m.poolAddress)) problems.push(`${who}: poolAddress ${String(m.poolAddress)} is not a public key`);
+    if (typeof m.dexType !== "string" || !DEX_TYPES.has(m.dexType)) problems.push(`${who}: unknown dexType ${String(m.dexType)}`);
+  }
   return problems;
 }
 
