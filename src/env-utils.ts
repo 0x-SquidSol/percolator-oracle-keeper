@@ -35,6 +35,30 @@ export function parsePositiveNumberEnv(name: string, fallback: number, max?: num
 }
 
 /**
+ * Boot-time variant of {@link parsePositiveNumberEnv}: a bad value logs `[fatal] <message>` and exits with code 1.
+ *
+ * Why not just let the throw propagate: `cross-cluster.ts` installs a process-wide `uncaughtException` handler that logs
+ * and stays up (a transient RPC fault must never kill the keeper), and that handler also swallows a throw at module
+ * evaluation, so a bad CC_* value would end the boot with exit code 0 (follow-up to #166 / GH#165; L4 boot test
+ * 2026-10-22). A fatal config error must exit non-zero so the supervisor records a failed boot. `exit` and `logError`
+ * are injectable for tests.
+ */
+export function bootPositiveNumberEnv(
+  name: string,
+  fallback: number,
+  max?: number,
+  exit: (code: number) => never = (code) => process.exit(code),
+  logError: (line: string) => void = (l) => console.error(l),
+): number {
+  try {
+    return parsePositiveNumberEnv(name, fallback, max);
+  } catch (err) {
+    logError(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
+    return exit(1);
+  }
+}
+
+/**
  * Validate that PROGRAM_ID is set when the oracle keeper is running in
  * Supabase-only discovery mode (no deployment file, no DEPLOYMENT_JSON).
  *

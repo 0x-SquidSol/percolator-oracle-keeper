@@ -32,6 +32,7 @@
  * Only AUTH_MARK assets are supported on a multi-asset row (the oracle-leg tail of a Hybrid crank belongs to one
  * asset). The registry validator below refuses malformed rows; the keeper never guesses.
  */
+import { PublicKey } from "@solana/web3.js";
 import type { AssetSource, DexType, MarketEntry } from "./registry.ts";
 import { decodeMarketRefreshState, isAssetLossStale } from "./positioned-refresh.ts";
 import type { MarketRefreshState } from "./positioned-refresh.ts";
@@ -195,6 +196,42 @@ export function validateMultiAssetEntry(entry: Pick<MarketEntry, "assets" | "lab
   return problems;
 }
 
+function isPubkey(s: unknown): s is string {
+  if (typeof s !== "string") return false;
+  try {
+    new PublicKey(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every problem with the registry's rows (empty = valid): the shape every consumer assumes (the preflight's row checks,
+ * without its RPC owner check). Run at boot and on every hot-reload, so a bad row is refused before a push batch or a
+ * crank parses it: one unparsable marketAddress used to fail the whole PushAuthMark batch (every market) every cycle.
+ */
+export function registryRowProblems(markets: ReadonlyArray<MarketEntry>): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const m of markets) {
+    const who = m?.label ?? "?";
+    if (!isPubkey(m?.marketAddress)) {
+      problems.push(`${who}: marketAddress ${String(m?.marketAddress)} is not a public key`);
+      continue;
+    }
+    if (seen.has(m.marketAddress)) problems.push(`${who}: duplicate marketAddress ${m.marketAddress}`);
+    seen.add(m.marketAddress);
+    if (m.assets !== undefined) {
+      problems.push(...validateMultiAssetEntry(m));
+      continue;
+    }
+    if (!isPubkey(m.poolAddress)) problems.push(`${who}: poolAddress ${String(m.poolAddress)} is not a public key`);
+    if (typeof m.dexType !== "string" || !DEX_TYPES.has(m.dexType)) problems.push(`${who}: unknown dexType ${String(m.dexType)}`);
+  }
+  return problems;
+}
+
 // ── Observation hints (which assets each observation crank accrues) ─────────────────────────────────────────────
 
 let registryMarkets: (() => ReadonlyArray<MarketEntry>) | null = null;
@@ -258,11 +295,12 @@ export function accrueCrankCuFor(base: number, hints: number): number {
 }
 
 /**
- * Most catch-up cranks one transaction can carry at `hints` observations each: the single-asset cap unchanged for
- * one hint, else what fits `budget` CU at `catchupCrankCuFor`.
+ * Most catch-up cranks one transaction can carry at `hints` observations each: what fits `budget` CU at
+ * `catchupCrankCuFor`, never more than `singleAssetCap` (the packet-size cap), never fewer than 1.
+ * v22price 2026-10-22: the single-asset count is CU-capped too. It used to return `singleAssetCap` (40) for one hint,
+ * which at the real v2.2 cost (36.35k per crank) overflows 1.4M.
  */
 export function maxCatchupCranksFor(singleAssetCap: number, base: number, hints: number, budget: number): number {
-  if (hints <= 1) return singleAssetCap;
   return Math.max(1, Math.min(singleAssetCap, Math.floor(budget / catchupCrankCuFor(base, hints))));
 }
 

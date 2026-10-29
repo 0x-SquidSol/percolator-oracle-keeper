@@ -7,6 +7,7 @@ import { LAYOUT_V22, WRAPPER_ACCOUNT_MAGIC } from "@percolatorct/sdk";
 import type { PositionedPortfolio } from "../positioned-refresh.ts";
 import type { ExecConnection, ExecContext } from "./exec.ts";
 import { COMPUTE_IX_COUNT } from "./exec.ts";
+import { nonComputeBudget, nonComputeBudgetCompiled } from "../test-ix.ts";
 import { V22_ASSET_BAND_OFF, V22_CONFIG_OFF, buildV22MarketCtx } from "./market.ts";
 import type { V22MarketCtx } from "./market.ts";
 import { layoutById, engineSlotBase } from "../market-layout.ts";
@@ -57,7 +58,7 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
   let sim = 0;
   let slot = 1000;
   const decode = (msg: { compiledInstructions: Array<{ programIdIndex: number; accountKeyIndexes: number[]; data: Uint8Array }>; staticAccountKeys: PublicKey[] }): SentTx => {
-    const ixs = msg.compiledInstructions.slice(COMPUTE_IX_COUNT);
+    const ixs = nonComputeBudgetCompiled(msg.compiledInstructions, msg.staticAccountKeys);
     return { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.accountKeyIndexes.map((k) => msg.staticAccountKeys[k].toBase58())) };
   };
   const conn = {
@@ -80,19 +81,17 @@ export function fakeExecConn(o: FakeConnOptions = {}) {
       // decode the transaction actually being sent (phase-1 txs are simulated and sent concurrently)
       rawSizes.push(raw.length);
       const t = Transaction.from(Buffer.from(raw));
-      const ixs = t.instructions.slice(COMPUTE_IX_COUNT);
+      const ixs = nonComputeBudget(t.instructions);
       const d: SentTx = { tags: ixs.map((i) => i.data[0]), keys: ixs.map((i) => i.keys.map((k) => k.pubkey.toBase58())) };
       sentData.push(ixs.map((i) => new Uint8Array(i.data)));
       sent.push({ ...d, order: order++ });
       return `sig${sent.length}`;
     },
-    async confirmTransaction(arg: { signature: string }) {
-      const idx = Number(arg.signature.slice(3)) - 1; // sendRawTransaction returned `sig<N>`
+    async getSignatureStatuses(sigs: string[]) {
+      const idx = Number(sigs[0].slice(3)) - 1; // sendRawTransaction returned `sig<N>`
       const code = o.confirmFail ? o.confirmFail(idx, sent[idx]) : o.confirmStatus === "err" ? 1 : null;
-      return { context: { slot: 1 }, value: { err: code !== null ? { InstructionError: [2, { Custom: code }] } : null } };
-    },
-    async getSignatureStatuses() {
-      return { context: { slot: 1 }, value: [{ slot: (o.landedSlot ?? (() => (slot += 1)))(), confirmations: 1, err: null, confirmationStatus: "confirmed" as const }] };
+      const err = code !== null ? { InstructionError: [2, { Custom: code }] } : null;
+      return { context: { slot: 1 }, value: [{ slot: (o.landedSlot ?? (() => (slot += 1)))(), confirmations: 1, err, confirmationStatus: "confirmed" as const }] };
     },
     async getSlot() {
       return (o.slot ?? (() => slot))();

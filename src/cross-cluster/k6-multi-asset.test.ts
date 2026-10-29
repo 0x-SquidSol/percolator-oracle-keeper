@@ -245,7 +245,9 @@ describe("K-6 cranks: observation hints, ordering, CU", () => {
 
   it("CU helpers: one hint costs exactly the single-asset figure", () => {
     assert.equal(catchupCrankCuFor(CATCHUP_CRANK_CU, 1), CATCHUP_CRANK_CU);
-    assert.equal(maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, 1), MAX_CATCHUP_CRANKS);
+    // v22price 2026-10-22: one hint is CU-capped too (it used to ignore the budget and return 40 = 1.454M at v2.2 cost)
+    assert.equal(maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM), 28);
+    assert.equal(maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, 1, 1), 1);
   });
 });
 
@@ -544,9 +546,11 @@ describe("K-6 v2.2 delegate: a multi-asset market a window or more behind gets c
   it("2,600 slots behind: ONE tx of 5 catch-up cranks on the LP (simulated, then sent), no settle round this cycle", async () => {
     const r = await delegate(row2xhs(), 2_600n);
     assert.equal(r.handled, true, "handled: the legacy cranker must not run (it would flag a v2.2-b layout problem)");
-    assert.equal(r.sims.length, 1);
-    assert.deepEqual(r.sims[0].tags, [CRANK_TAG, CRANK_TAG, CRANK_TAG, CRANK_TAG, CRANK_TAG]);
-    assert.ok(r.sims[0].keys.every((k) => k[2] === LP));
+    // v22price 2026-10-22: a one-crank simulation measures this market's catch-up cost first, then the tx itself is simulated
+    assert.equal(r.sims.length, 2);
+    assert.deepEqual(r.sims[0].tags, [CRANK_TAG]);
+    assert.deepEqual(r.sims[1].tags, [CRANK_TAG, CRANK_TAG, CRANK_TAG, CRANK_TAG, CRANK_TAG]);
+    assert.ok(r.sims[1].keys.every((k) => k[2] === LP));
     assert.equal(r.sent.length, 1);
     assert.ok(r.logs.some((l) => /\[v22\]\[catchup\].*5 assets.*5 catch-up crank\(s\)/.test(l)), r.logs.join("\n"));
   });
@@ -618,7 +622,7 @@ describe("R3.22b: a v2.2 market the v2.2 layer owns never reaches the legacy lay
       },
     };
     invalidateBlockhash(conn as never);
-    setSweepDelegate(o.delegate ? async () => { delegateCalls++; return false; } : null); // false = the round backed off
+    setSweepDelegate(o.delegate ? async () => { delegateCalls++; return false; } : null); // false = declined, lone LP crank not suppressed (pairing off)
     const state = freshCrankMarketState();
     const before = getLayoutProblemCounts();
     const prefetched = { value: { data: Buffer.from(market), owner: PublicKey.default, lamports: 1, executable: false }, context: { slot } };

@@ -49,11 +49,11 @@ function fakeConn(opts: {
   shares?: bigint;
   domain?: number;
   sendError?: unknown;
-  /** confirmTransaction throws (e.g. block height exceeded) instead of resolving. */
+  /** No confirmed status before the blockhash expired (block height exceeded). */
   confirmThrows?: boolean;
-  /** confirmTransaction resolves with this value.err (landed but failed on chain). */
+  /** The status carries this err (landed but failed on chain). */
   confirmErr?: unknown;
-  /** What getSignatureStatuses reports for the sent signature (undefined = null). */
+  /** What getSignatureStatuses reports for the sent signature (overrides the two above). */
   status?: { err: unknown; confirmationStatus: "processed" | "confirmed" | "finalized" };
 }) {
   let sends = 0;
@@ -75,14 +75,12 @@ function fakeConn(opts: {
         if (opts.sendError) throw opts.sendError;
         return "sig";
       },
-      async confirmTransaction() {
-        if (opts.confirmThrows) {
-          throw new Error("TransactionExpiredBlockheightExceededError: Signature sig has expired: block height exceeded.");
-        }
-        return { value: { err: opts.confirmErr ?? null } };
+      async getBlockHeight() {
+        return 2; // past lastValidBlockHeight 1
       },
       async getSignatureStatuses() {
-        return { value: [opts.status ? { slot: 1, confirmations: 1, ...opts.status } : null] };
+        const s = opts.status ?? (opts.confirmThrows ? null : { err: opts.confirmErr ?? null, confirmationStatus: "confirmed" });
+        return { value: [s ? { slot: 1, confirmations: 1, ...s } : null] };
       },
     },
   };
@@ -150,14 +148,14 @@ describe("crankLpFeesOnce — only spend a transaction when there is something t
     assert.equal(f.sends, 0);
   });
 
-  it("F6: a timed-out confirmation of a tx that LANDED is 'cranked', not a failure", async () => {
+  it("F6: a tx whose signature status shows it LANDED is 'cranked', not a failure", async () => {
     // SOLCAT 5xq4yAXH… / ANSEM 4RJv6kJt… (2026-09-29): logged as "block height
     // exceeded" failures, but lp_fee_withdrawn == accrued on chain.
     const f = fakeConn({ confirmThrows: true, status: { err: null, confirmationStatus: "confirmed" } });
     assert.equal(await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false, FAST), "cranked");
   });
 
-  it("F6: a timed-out confirmation with NO signature status is 'not landed', reported for retry", async () => {
+  it("F6: a tx with NO signature status is 'not landed', reported for retry", async () => {
     const f = fakeConn({ confirmThrows: true });
     const r = await crankLpFeesOnce(f.conn as never, KEEPER, MARKET(), false, FAST);
     assert.ok(typeof r === "object" && /not landed/.test(r.error), JSON.stringify(r));
@@ -188,7 +186,6 @@ describe("crankAllLpFeesOnce — one bad market must not stop the sweep", () => 
       async getMultipleAccountsInfo() { return [{ data: Buffer.alloc(176) }, { data: Buffer.alloc(240) }]; },
       async getLatestBlockhash() { return { blockhash: "1".repeat(32), lastValidBlockHeight: 1 }; },
       async sendRawTransaction() { throw new Error("boom"); },
-      async confirmTransaction() { return { value: { err: null } }; },
     };
     const r = await crankAllLpFeesOnce(
       conn as never,
@@ -212,7 +209,7 @@ describe("crankAllLpFeesOnce — one bad market must not stop the sweep", () => 
       },
       async getLatestBlockhash() { return { blockhash: "1".repeat(32), lastValidBlockHeight: 1 }; },
       async sendRawTransaction() { return "sig"; },
-      async confirmTransaction() { return { value: { err: null } }; },
+      async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     };
     const r = await crankAllLpFeesOnce(
       conn as never,

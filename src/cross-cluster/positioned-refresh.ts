@@ -358,7 +358,16 @@ function buildPermissionlessCrankIx(
  * (163k + 7 x 164k = 1.311M) with no boost. Capacity: 7 refreshes beside the
  * accrual (an 8th positioned portfolio goes to a follow-up tx).
  */
-export const CATCHUP_CRANK_CU = 30_000;
+/**
+ * CATCHUP_CRANK_CU 30k -> 45k (v22price 2026-10-22): a v2.2 (VERSION 19) bounded catch-up crank measures 36,350 CU
+ * on SOL BYFuWyuo… and 42,538 CU on the band market CHILLHOUSE ALdzXdcR… (simulated, wrapper 6kpg2wi7). At 30k the
+ * planner packed 40 per transaction (40 x 36.35k = 1.454M > 1.4M): every deep-stale catch-up tx exhausted its compute
+ * (the boot "compute exhausted at 1400000 CU (40 cranks)" reverts) or failed its simulation, so a market a long
+ * outage behind never caught up. 45k covers the worst measured cost with ~6% margin; the per-tx count is now always
+ * CU-capped (`maxCatchupCranksFor`: floor(1.3M / 45k) = 28 single-asset cranks). The v2.2 loop sizes its catch-up
+ * tx from a one-crank simulation of the market instead (loop.ts multiAssetCatchup); this is the static fallback.
+ */
+export const CATCHUP_CRANK_CU = 45_000;
 export const ACCRUE_CRANK_CU = 200_000;
 export const REFRESH_CRANK_CU = 145_000;
 export const MAX_TX_CU = 1_400_000;
@@ -495,7 +504,10 @@ export function isBankruptPortfolio(data: Uint8Array): boolean {
  * refresh cannot clear loss-stale while `slot_last < current_slot` anyway.
  */
 export const MAX_CATCHUP_WITH_REFRESH = 10;
-/** Catch-up-only transaction size (40 x ~19 bytes + ~270 fixed fits 1232 bytes; 40 x 30k CU fits 1.4M). */
+/**
+ * Catch-up-only transaction size cap (40 x ~19 bytes + ~270 fixed fits 1232 bytes). The COMPUTE cap is separate and
+ * usually lower: `maxCatchupCranksFor` (floor(budget / CATCHUP_CRANK_CU) = 28 single-asset cranks).
+ */
 export const MAX_CATCHUP_CRANKS = 40;
 
 export type PlannedCrankKind = "repair" | "catchup" | "accrue" | "refresh" | "liquidate";
@@ -570,6 +582,8 @@ export function planCrankTx(params: {
   cost?: LegCostModel;
   /** The LP's positioned entry (leg count): the accrual crank settles it, so a heavy LP is the accrual's cost. */
   lp?: PositionedPortfolio | null;
+  /** false = no accrual crank (it settles the LP): repairs and catch-up only (a v2.2 "clock-only" cycle). Default true. */
+  accrue?: boolean;
 }): CrankPlan {
   const { owner, market, lpPortfolio, catchup, refreshTargets } = params;
   const cost = params.cost;
@@ -585,7 +599,8 @@ export function planCrankTx(params: {
   // every figure below is the pre-K-6 one.
   const hints = observationAssetsFor(market.toBase58()).length;
   const catchupCu = catchupCrankCuFor(CATCHUP_CRANK_CU, hints);
-  const catchupN = hints <= 1 ? catchup : Math.min(catchup, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - repairCu));
+  // CU-capped for every hint count (v22price 2026-10-22: the single-asset count used to be uncapped by compute).
+  const catchupN = Math.min(catchup, maxCatchupCranksFor(MAX_CATCHUP_CRANKS, CATCHUP_CRANK_CU, hints, MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM - repairCu));
   for (let i = 0; i < catchupN; i++) {
     cranks.push({ kind: "catchup", portfolio: lpPortfolio, ix: buildObservationCrankIx(owner, market, lpPortfolio) });
   }
@@ -593,8 +608,8 @@ export function planCrankTx(params: {
   const accrueCu = accrueCrankCuFor(cost && params.lp && cost.isSolo(params.lp) ? cost.worstRefreshCu(params.lp) : ACCRUE_CRANK_CU, hints);
   // K-6 (multi-asset only): the catch-up and the accrual must fit one transaction, else catch up first.
   const multiTooBig = hints > 1 && catchupN > 0 && repairCu + catchupN * catchupCu + accrueCu > MAX_TX_CU - ACCRUAL_TX_CU_HEADROOM;
-  if (!catchupAllowsRefresh(catchup) || catchupN < catchup || multiTooBig) {
-    // Too far behind to finish this cycle: catch-up cranks only.
+  if (!catchupAllowsRefresh(catchup) || catchupN < catchup || multiTooBig || params.accrue === false) {
+    // Too far behind to finish this cycle (or no accrual wanted): catch-up cranks only.
     return {
       cranks,
       overflow: [],

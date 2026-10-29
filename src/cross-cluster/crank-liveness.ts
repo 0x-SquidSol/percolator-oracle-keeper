@@ -48,6 +48,19 @@ export const DEFAULT_LIVENESS_INTERVALS = 2;
 export const DEFAULT_LIVENESS_MIN_SILENCE_MS = 120_000;
 
 export function createCrankLiveness(opts: CrankLivenessOptions): CrankLiveness {
+  // GH#165: validate the value we are HANDED, not just the ones we read from env.
+  // `crankLivenessOptsFromEnv` throws on garbage in CRANK_LIVENESS_* so "a typo
+  // cannot silently disable the watchdog" -- but `intervalMs` arrives from the
+  // caller (CRANK_INTERVAL_MS), which is exactly where the garbage came from: a
+  // NaN or 0 made `enabled` false, so `limitMs()` was null and `check()` returned
+  // early forever. That is the watchdog turning itself off, silently, which is
+  // the failure it exists to catch.
+  if (!Number.isFinite(opts.intervalMs) || opts.intervalMs <= 0) {
+    throw new Error(
+      `createCrankLiveness: intervalMs must be a finite positive number (got: ${String(opts.intervalMs)}) — ` +
+        `a NaN/zero value disables the crank-liveness watchdog`,
+    );
+  }
   const now = opts.now ?? Date.now;
   const intervals = opts.intervals ?? DEFAULT_LIVENESS_INTERVALS;
   const minSilenceMs = opts.minSilenceMs ?? DEFAULT_LIVENESS_MIN_SILENCE_MS;

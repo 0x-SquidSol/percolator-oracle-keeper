@@ -100,8 +100,7 @@ function stub(o: { bound?: boolean; logs?: string[]; simErr?: unknown; mkt?: Buf
         return { value: { err: o.simErr ?? null, logs: o.logs ?? [] } };
       },
       async sendRawTransaction(raw: Buffer) { sent.push(Transaction.from(raw)); return `sig${sent.length}`; },
-      async confirmTransaction() { return { value: { err: null } }; },
-      async getSignatureStatuses() { return { value: [null] }; },
+      async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     },
   };
 }
@@ -354,8 +353,7 @@ describe("tag 78 books the pending draw: 'Earn absorbed' only when the booking l
         async simulateTransaction() { return { value: { err: simErr, logs: simLogs } }; },
         async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
         async sendRawTransaction(raw: Buffer) { sent.push(Transaction.from(raw)); return "sig"; },
-        async confirmTransaction() { return { value: { err: null } }; },
-        async getSignatureStatuses() { return { value: [null] }; },
+        async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
       },
     };
   }

@@ -193,7 +193,7 @@ export interface FakeConnOpts {
   /** getMultipleAccountsInfo[AndContext] throws this when set. */
   readError?: Error;
   balanceLamports?: number;
-  /** confirmTransaction result err (null = landed). */
+  /** The signature status err (null = landed). */
   confirmErr?: unknown;
 }
 
@@ -247,13 +247,9 @@ export function fakeConn(o: FakeConnOpts = {}) {
       sent.push(Transaction.from(raw));
       return "sig1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
     },
-    async confirmTransaction() {
-      calls.push({ fn: "confirmTransaction", args: [] });
-      return { context: { slot: 1 }, value: { err: o.confirmErr ?? null } };
-    },
     async getSignatureStatuses() {
       calls.push({ fn: "getSignatureStatuses", args: [] });
-      return { context: { slot: 1 }, value: [null] };
+      return { context: { slot: 1 }, value: [{ slot: 1, confirmations: 1, err: o.confirmErr ?? null, confirmationStatus: "confirmed" }] };
     },
   };
   return { conn, calls, sent, simulated, accounts, count: (fn: string) => calls.filter((c) => c.fn === fn).length };

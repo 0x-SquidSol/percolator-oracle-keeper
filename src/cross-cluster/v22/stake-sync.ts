@@ -113,24 +113,32 @@ export async function stakeSyncOnce(
   const ix = buildStakeSyncIx({ caller: exec.keeper.publicKey, pool, poolData: decoded, market: ctx.market, marketData: ctx.data, wrapperProgramId: ctx.programId, stakeProgramId });
   const expected = new Set<number>([...STAKE_SYNC_QUIET_CODES, STAKE_READINGS_DIVERGED, STAKE_SYNC_WAITING_ENGINE_LOCK]);
   const outcome = await simulateAndSend(exec, [ix], { job: "stake-sync", label: ctx.label, units: STAKE_SYNC_UNITS, program: "stake", expected });
-  if (outcome.kind === "refused" && outcome.code === STAKE_SYNC_WAITING_ENGINE_LOCK) {
+  // A tx that simulated clean but failed on chain (the pool or the market moved between the simulation and the landing)
+  // is classified by its program code exactly like a refusal: 44 backs off 20 cooldowns, 37/43 are quiet, 21 waits.
+  const code = outcome.kind === "refused" ? outcome.code : outcome.kind === "sent" && outcome.landed === "failed" ? outcome.failCode : undefined;
+  if (outcome.kind === "sent" && outcome.landed !== "landed") {
+    exec.log?.(`[v22][stake-sync] ${ctx.label}: tag 31 ${outcome.landed === "failed" ? `landed but failed on chain (code ${outcome.failCode ?? "none"})` : "not landed"} sig=${outcome.signature.slice(0, 16)}…`);
+  }
+  if (code === STAKE_SYNC_WAITING_ENGINE_LOCK) {
     exec.log?.(`[v22][stake-sync] ${ctx.label}: wrapper EngineLockActive(21) on the recover leg: bankruptcy h-lock latched, waiting; not a failure`);
   }
-  if (outcome.kind === "refused") {
-    if (outcome.code === STAKE_READINGS_DIVERGED) {
+  if (code !== undefined) {
+    if (code === STAKE_READINGS_DIVERGED) {
       st.diverged++;
       st.backoffUntil.set(key, nowSlot + decoded.syncCooldownSlots * DIVERGED_BACKOFF_COOLDOWNS);
       return { kind: "diverged", outcome };
     }
-    if (outcome.code === STAKE_SYNC_WAITING_ENGINE_LOCK) {
+    if (code === STAKE_SYNC_WAITING_ENGINE_LOCK) {
       const untilSlot = nowSlot + decoded.syncCooldownSlots;
       st.backoffUntil.set(key, untilSlot);
-      return { kind: "waiting", code: outcome.code, outcome, untilSlot };
+      return { kind: "waiting", code, outcome, untilSlot };
     }
-    if (outcome.code !== null && STAKE_SYNC_QUIET_CODES.has(outcome.code)) return { kind: "quiet", code: outcome.code };
+    if (code !== null && STAKE_SYNC_QUIET_CODES.has(code)) return { kind: "quiet", code };
     st.backoffUntil.set(key, nowSlot + decoded.syncCooldownSlots);
-    return { kind: "refused", outcome };
+    if (outcome.kind === "refused") exec.log?.(`[v22][stake-sync] ${ctx.label}: refused ${outcome.name}; backing off one cooldown (${decoded.syncCooldownSlots} slots)`);
+    return { kind: outcome.kind === "refused" ? "refused" : "failed", outcome };
   }
-  if (outcome.kind === "failed") return { kind: "failed", outcome };
+  if (outcome.kind === "failed") exec.log?.(`[v22][stake-sync] ${ctx.label}: failed: ${outcome.error}`);
+  if (outcome.kind === "failed" || (outcome.kind === "sent" && outcome.landed === "not-landed")) return { kind: "failed", outcome };
   return { kind: outcome.kind === "sent" ? "sent" : "dry-run", outcome };
 }

@@ -64,8 +64,7 @@ function honestConn(marketBytes: Buffer) {
       return { context: { slot: 1 }, value: { err: null, logs: [], accounts: null } };
     },
     async sendRawTransaction() { throw new Error("dry-run must not send"); },
-    async confirmTransaction() { return { value: { err: null } }; },
-    async getSignatureStatuses() { return { value: [] }; },
+    async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
   };
   return { conn, scans, sims };
 }

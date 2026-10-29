@@ -81,6 +81,7 @@ function market(): Buffer {
   b[MODE_ABS] = 1; // Resolved
   b.writeBigUInt64LE(0n, BUDGET_ABS); // no budget: only the amount-0 step runs
   b.writeBigUInt64LE(0n, BUDGET_ABS + 8);
+  b.writeBigUInt64LE(0n, 592 + 517); // every portfolio closed: 31 = done (A6-1: not done while any is materialized)
   return b;
 }
 const ADMIN = k();

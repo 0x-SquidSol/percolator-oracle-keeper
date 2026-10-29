@@ -31,6 +31,15 @@
  *                    Custom(21) (Custom(120) on the P2b program) until one whole side exits; reported with the
  *                    observed duration and both sides' OI so an abandoned
  *                    position is visible
+ *   - D1 close-only / wind-down overdue (v2.2 band, v22/d1-watch.ts) a band asset is close-only (A != 1) -> WARN;
+ *                    still close-only past the tag-104 bound + grace with no wind-down landed -> CRITICAL
+ *   - vault-LP crank stale (v2.2 band, v22/lp-cert-liveness.ts) the vault LP's leg is
+ *                    uncertified this band epoch for >= 25% / 50% of the E + Pmax resolve
+ *                    horizon (BandPinExpired resolves the market at 100%, sim §P2.10)
+ *   - market lifecycle (v2.2, v22/lifecycle.ts) NEVER-CONNECTED (no push path from this keeper and the price is not
+ *                    advancing), DEAD-PRICE (>= 50% of permissionless_resolve_stale_slots WARN, matured CRITICAL),
+ *                    DEAD-INTEREST (priced, OI = 0, no trade-fee accrual for N days), a stale resolve the keeper is
+ *                    HOLDING (outage-shaped / mass maturity: CRITICAL) and the resolve it SENT
  *
  * Output:
  *   `[health] {json}`  one line per sample batch, machine-parseable
@@ -59,6 +68,9 @@ export type AlertKind =
   | "market-no-push"
   | "mark-lagging"
   | "source-frozen"
+  | "market-unregistered"
+  | "depth-cap-zero"
+  | "depth-unavailable"
   | "lapsed-bucket"
   | "bankrupt-unliquidated"
   | "fee-leg-blocked"
@@ -78,7 +90,15 @@ export type AlertKind =
   | "hedged-lockout"
   | "earn-par-e3-gap"
   | "pusher-takeover"
-  | "band-pin-expiring";
+  | "band-pin-expiring"
+  | "vault-lp-crank-stale"
+  | "adl-close-only"
+  | "adl-wind-down-overdue"
+  | "market-never-connected"
+  | "market-dead-price"
+  | "market-dead-interest"
+  | "stale-resolve-held"
+  | "stale-resolve-sent";
 
 export interface Alert {
   kind: AlertKind;
@@ -127,6 +147,16 @@ export interface AlertThresholds {
   /** K-3: ms the raw pool price may stay bit-identical before a source-frozen warning. */
   sourceFrozenMs: number;
   /**
+   * #214: ms the raw pool price may stay bit-identical before the source is treated as DEAD: the source-frozen alert is then critical
+   * (pageable). Effective value is max(this, sourceFrozenMs).
+   */
+  sourceDeadMs: number;
+  /**
+   * #174: ms a constant-product market may keep sending NO depth while KEEPER_PUSH_DEPTH is on (unreadable reserve / no SOL-USD rate this
+   * cycle) before depth-unavailable fires. Each hour without a reading halves the on-chain sticky depth cap.
+   */
+  depthAbsentMs: number;
+  /**
    * R3.24: alert when a LIVE band market's pin is within this many slots of `band_max_pin_slots` (BandPinExpired
    * resolves it at that point, by anyone's crank). Default 4,500 = half the default Pmax of 9,000.
    */
@@ -148,6 +178,8 @@ export const DEFAULT_THRESHOLDS: AlertThresholds = {
   markLagMs: 120_000,
   markLagPct: 10,
   sourceFrozenMs: 2 * 3_600_000,
+  sourceDeadMs: 6 * 3_600_000,
+  depthAbsentMs: 30 * 60_000,
   bandPinExpirySlots: 4_500,
 };
 
@@ -180,6 +212,8 @@ export function thresholdsFromEnv(env: Env): AlertThresholds {
     markLagMs: envInt(env, "ALERT_MARK_LAG_MS", DEFAULT_THRESHOLDS.markLagMs),
     markLagPct: envInt(env, "ALERT_MARK_LAG_PCT", DEFAULT_THRESHOLDS.markLagPct),
     sourceFrozenMs: envInt(env, "ALERT_SOURCE_FROZEN_MS", DEFAULT_THRESHOLDS.sourceFrozenMs),
+    sourceDeadMs: envInt(env, "ALERT_SOURCE_DEAD_MS", DEFAULT_THRESHOLDS.sourceDeadMs),
+    depthAbsentMs: envInt(env, "ALERT_DEPTH_ABSENT_MS", DEFAULT_THRESHOLDS.depthAbsentMs),
     bandPinExpirySlots: envInt(env, "ALERT_BAND_PIN_EXPIRY_SLOTS", DEFAULT_THRESHOLDS.bandPinExpirySlots),
   };
   if (t.slotLagCritical < t.slotLagWarn) {
@@ -502,15 +536,24 @@ export interface MarketPushSample {
   sourceUnchangedSince: number | null;
   /** No push expected (last seen Resolved/closed, or no longer registered): never degraded, never alerted. */
   terminal: boolean;
+  /**
+   * #184: the market is not in the keeper's registry (and is not terminal). "No row" must not read as "healthy": it is its own
+   * status with a critical alert. Absent = false.
+   */
+  unregistered?: boolean;
+  /** #174: unix ms since which this market (depth push on, constant-product venue) has sent no depth; null = it sent one / none expected. */
+  depthAbsentSince?: number | null;
 }
 
-export type MarketPushStatus = "ok" | "no-push" | "mark-lagging";
+export type MarketPushStatus = "ok" | "no-push" | "mark-lagging" | "source-frozen" | "unregistered";
 
 /**
  * Per-market verdict for /health and the alert set. Pure. "no-push" outranks
  * "mark-lagging": a market that pushes nothing is frozen whatever the gap.
- * source-frozen is a warning only and does not change the status (a quiet
- * pool can legitimately sit on one price).
+ * #214: a frozen source (raw pool price bit-identical for `sourceFrozenMs`) is status "source-frozen", NOT "ok": the keeper keeps
+ * re-pushing the dead value every cycle, which keeps `last_good_oracle_slot` current, so on chain the market looks fresh while its
+ * source is dead and nothing else in /health shows it. The alert is a warn at `sourceFrozenMs` (a quiet pool can legitimately sit on
+ * one price) and critical at `sourceDeadMs`. #184: an unregistered market is "unregistered" + critical, never "ok".
  */
 export function evaluateMarketPush(
   s: MarketPushSample,
@@ -518,6 +561,22 @@ export function evaluateMarketPush(
   nowMs: number = Date.now(),
 ): { status: MarketPushStatus; active: Alert[] } {
   if (s.terminal) return { status: "ok", active: [] };
+  if (s.unregistered) {
+    return {
+      status: "unregistered",
+      active: [
+        {
+          kind: "market-unregistered",
+          severity: "critical",
+          subject: s.label,
+          message:
+            `${s.market} has no row in the keeper's registry, so nothing here prices it (no push expected, none counted). ` +
+            "The market-to-pool binding exists only in the registry source (Supabase / registry.json): re-register it or confirm it was retired on purpose",
+          data: { market: s.market },
+        },
+      ],
+    };
+  }
   const active: Alert[] = [];
   let status: MarketPushStatus = "ok";
   if (s.noPushCycles >= t.marketNoPushCycles) {
@@ -548,15 +607,29 @@ export function evaluateMarketPush(
     });
   }
   if (s.sourceUnchangedSince !== null && nowMs - s.sourceUnchangedSince >= t.sourceFrozenMs) {
-    const mins = Math.floor((nowMs - s.sourceUnchangedSince) / 60_000);
+    if (status === "ok") status = "source-frozen";
+    const frozenMs = nowMs - s.sourceUnchangedSince;
+    const mins = Math.floor(frozenMs / 60_000);
     active.push({
       kind: "source-frozen",
-      severity: "warn",
+      severity: frozenMs >= Math.max(t.sourceDeadMs, t.sourceFrozenMs) ? "critical" : "warn",
       subject: s.label,
       message:
         `the pool price has not changed for ${mins} min — the pool may be dead or its active bin never moves; ` +
         "the keeper keeps republishing it as a fresh mark",
       data: { market: s.market, unchangedMinutes: mins },
+    });
+  }
+  if (s.depthAbsentSince != null && nowMs - s.depthAbsentSince >= t.depthAbsentMs) {
+    const mins = Math.floor((nowMs - s.depthAbsentSince) / 60_000);
+    active.push({
+      kind: "depth-unavailable",
+      severity: "warn",
+      subject: s.label,
+      message:
+        `no depth has been attested for ${mins} min although KEEPER_PUSH_DEPTH is on and this is a constant-product pool (reserve unreadable, no SOL/USD rate, or a drained pool): ` +
+        "the market is pushed as a 35-byte mark, so its on-chain sticky depth cap halves every hour and, once it reaches 0, opens close (see depth-cap-zero)",
+      data: { market: s.market, absentMinutes: mins },
     });
   }
   return { status, active };

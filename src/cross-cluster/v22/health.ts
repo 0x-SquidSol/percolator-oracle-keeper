@@ -20,3 +20,22 @@ export function v22HealthFields(): Record<string, unknown> {
     return {};
   }
 }
+
+/**
+ * /health `levGuard` block of the leverage-guard keeper (lev-guard.ts). Additive: `{}` unless a KEEPER_LEV_* flag created the keeper, so with
+ * every one of them off the /health body is byte-identical to before.
+ */
+let levProvider: V22HealthProvider | null = null;
+
+export function setLevGuardHealthProvider(p: V22HealthProvider | null): void {
+  levProvider = p;
+}
+
+export function levGuardHealthFields(): Record<string, unknown> {
+  try {
+    const f = levProvider?.();
+    return f ? { levGuard: f } : {};
+  } catch {
+    return {};
+  }
+}

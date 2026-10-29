@@ -34,8 +34,7 @@ function conn(registry: Buffer) {
       async getMultipleAccountsInfo() { return [{ data: registry }, null]; },
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
       async sendRawTransaction(raw: Buffer) { sent.push(Transaction.from(raw)); return "sig"; },
-      async confirmTransaction() { return { value: { err: null } }; },
-      async getSignatureStatuses() { return { value: [null] }; },
+      async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     },
   };
 }

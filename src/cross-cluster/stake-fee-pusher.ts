@@ -303,7 +303,7 @@ export function accruedFromLogs(logs: string[] | null): bigint | null {
 /** The Connection surface this job uses (stubbable in tests). */
 export type StakeFeeConnection = Pick<
   Connection,
-  "getMultipleAccountsInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses"
+  "getMultipleAccountsInfo" | "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses"
 > &
   /** Read only when tag 87 answers OracleStale, to confirm the stale-resolve wait (R3.20). */
   Partial<Pick<Connection, "getSlot">>;

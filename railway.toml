@@ -3,7 +3,7 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
-watchPatterns = ["src/**", "deploy/**", "Dockerfile", "railway.toml", "package.json", "pnpm-lock.yaml", "tsconfig.json"]
+watchPatterns = ["src/**", "deploy/**", "Dockerfile", "railway.toml", "package.json", "pnpm-lock.yaml", "vendor/**", "tsconfig.json"]
 
 [deploy]
 # Health is always HTTP 200 (degraded state is reported in the body), so this

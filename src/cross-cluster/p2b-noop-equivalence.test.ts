@@ -54,11 +54,10 @@ describe("tag 78 on today's registries: instructions, accounts and RPC pattern",
           sent.push(Transaction.from(raw).instructions);
           return "sig";
         },
-        async confirmTransaction() { calls.push("confirm"); return { value: { err: null } }; },
-        async getSignatureStatuses() { calls.push("status"); return { value: [null] }; },
+        async getSignatureStatuses() { calls.push("status"); return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
       };
       assert.equal(await crankLpFeesOnce(conn as never, KEEPER, SOLCAT, false), "cranked");
-      assert.deepEqual(calls, ["read:2", "blockhash", "send", "confirm"], "the legacy RPC pattern, call for call");
+      assert.deepEqual(calls, ["read:2", "blockhash", "send", "status"], "the same RPC pattern, call for call (the confirm is a status poll)");
       const ix = sent[0].find((i) => i.programId.equals(PROGRAM))!;
       const [reg0] = deriveLpVaultRegistry(PROGRAM, market);
       const expected = new TransactionInstruction({
@@ -82,8 +81,7 @@ describe("tag 78 on today's registries: instructions, accounts and RPC pattern",
       async getMultipleAccountsInfo() { return [{ data: reg }, null]; },
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
       async sendRawTransaction() { return "sig"; },
-      async confirmTransaction() { return { value: { err: null } }; },
-      async getSignatureStatuses() { return { value: [null] }; },
+      async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     };
     const o = await makeLpFeeJob().run({ conn: conn as never, keeper: KEEPER, dryRun: false }, { marketAddress: SOLCAT, label: "SOLCAT" });
     assert.equal(o.kind, "done");

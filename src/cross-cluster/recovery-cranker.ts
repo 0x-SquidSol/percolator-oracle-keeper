@@ -650,11 +650,24 @@ export async function crankOneMarket(
      * crank-health record (the v2.2 layer publishes that). It used to fall through to the legacy layout check and raise
      * "variant-B market on the legacy cranker" every time 2xhs backed off (flapping layoutProblemMarkets).
      * Without the v2.2 layer (no delegate) a variant-B market still gets the loud "unsupported" verdict, as before.
+     * LF: the accrual crank targets the vault LP and settles it ALONE. When the delegate answers "clock-only" (the lone LP
+     * crank is suppressed: pairing on, or VAULT_LP_LONE_CRANK=off) it is left out: liveness repairs and catch-up cranks
+     * only, so the clock lags up to about one accrual window plus a cycle and catches up in whole windows. (A
+     * catch-up crank stops before the portfolio only while an observed asset can accrue; with none, it reaches the LP.)
      */
     const v22Owned = sweepDelegate !== null && detection.known && detection.layout.id === "v2.2-b";
+    let clockOnly = false;
     if (v22Owned) {
       const handled = await sweepDelegate({ conn: devnetConn, keeper, entry, marketData: acct.value.data, slot: acct.context.slot, dryRun });
-      if (handled) return;
+      clockOnly = handled === "clock-only";
+      if (handled === true) {
+        // v22price 2026-10-22: the v2.2 layer cranked this cycle, so a legacy revert from an earlier fallthrough (e.g. the
+        // boot catch-up) is over. Without this the cranker's `~drift(rev:1 cons:1)` stayed on the health line forever.
+        if (state.consecutiveReverts > 0) console.log(`[cranker] ${label}: legacy revert streak (${state.consecutiveReverts}) cleared: the v2.2 layer owns and cranked this market`);
+        state.consecutiveReverts = 0;
+        state.lastRevertCode = null;
+        return;
+      }
     }
     let pre: MarketRefreshState | null = null;
     if (detection.known) {
@@ -725,12 +738,13 @@ export async function crankOneMarket(
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
       sweepCtx
         ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets, cost: legCost })
-        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets, cost: legCost, lp: lpEntry });
+        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets, cost: legCost, lp: lpEntry, accrue: !clockOnly });
+    if (clockOnly && build(targets).cranks.length === 0) return; // no repair due and not a window behind: nothing to send
 
     if (dryRun) {
       const plan = build(targets);
       console.log(
-        `[cranker][DRY-RUN] ${label}: catchup=${catchup} accrue=${lpPortfolio.toBase58().slice(0, 8)}… ` +
+        `[cranker][DRY-RUN] ${label}: catchup=${catchup} accrue=${clockOnly ? "none (v2.2 clock-only)" : `${lpPortfolio.toBase58().slice(0, 8)}…`} ` +
           `refresh=[${plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58().slice(0, 8)).join(",")}]` +
           (sweepCtx ? ` sweep=${sweepCtx.pace.level} k=${sweepCtx.pace.k} txs=${sweepCtx.pace.txs} ratio=${sweepCtx.coverage.ratio}` : ""),
       );
@@ -812,6 +826,8 @@ export async function crankOneMarket(
         }
       }
     }
+
+    if (resolved.plan.cranks.length === 0) return; // LF: every repair dropped and no accrual crank: nothing to send
 
     if (resolved.sim.err && isDuplicateOfLandedTx(resolved.sim.err)) {
       // R3.22b: "AlreadyProcessed" = this exact transaction (same cached blockhash, same instructions) already landed,
@@ -1136,8 +1152,8 @@ export function layoutHealthFor(
   // 9,563 B for VERSION 18, 10,603 B for VERSION 19). An explicit argument overrides it (tests).
   // v2.2 variant B is NEVER driven by this legacy path (its [LP crank, refresh xN] sweep settles the LP in every tx, the
   // shape SETTLE_PAIRING exists to avoid). The v2.2 layer takes the market through the sweep delegate BEFORE this
-  // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP, or the delegate declined) gets the
-  // accrual-only crank and a loud "unsupported" status (security review F-1 / F-5).
+  // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP) gets the accrual-only crank and a loud
+  // "unsupported" status (security review F-1 / F-5). A cycle the delegate declined uses `v22OwnedLayoutHealth` instead.
   if (L.id === "v2.2-b") {
     return {
       id: L.id,
