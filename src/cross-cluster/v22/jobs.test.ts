@@ -13,6 +13,7 @@ import { commitDueSlot, freshStakeCommitTargetState, stakeCommitTargetOnce } fro
 import { bookIsLossCurrent, executeKeeperExits, selectKeeperRequests } from "./earn-exit.ts";
 import { bandHealthFor, pinLevelOf } from "./band.ts";
 import type { V22Positioned } from "./positioned.ts";
+import { pairingStats, resetPairingStats } from "./sweep.ts";
 import { customAt, execCtx, fakeExecConn, key, pf, v22Ctx } from "./test-helpers.ts";
 import { STAKE_PROGRAM_ID } from "../../program-ids.ts";
 
@@ -480,5 +481,49 @@ describe("band markets", () => {
     const off = bandHealthFor(v22Ctx());
     assert.equal(off.band, false);
     assert.equal(off.pinned, false);
+  });
+});
+
+describe("a tx that simulated clean but failed on chain (landed=failed)", () => {
+  function poolBytes(): Uint8Array {
+    const F = STAKE_POOL_FIELD_OFF_V5;
+    const b = Buffer.alloc(STAKE_POOL_SIZE_V5);
+    "SPOOL_V1".split("").forEach((c, i) => (b[F.reserved + i] = c.charCodeAt(0)));
+    b[F.version] = 5;
+    b[F.riskMode] = 1;
+    b.writeBigUInt64LE(150n, F.syncCooldownSlots);
+    return new Uint8Array(b);
+  }
+  it("stake tag 31 landed-failed 44 is DIVERGED and backed off like a refused 44; another code backs off one cooldown", async () => {
+    const ctx = v22Ctx();
+    const f = fakeExecConn({ confirmFail: () => 44 });
+    const st = freshStakeSyncState();
+    assert.equal((await stakeSyncOnce(execCtx(f.conn), ctx, poolBytes(), st, { intervalMs: 0, nowMs: 1 })).kind, "diverged");
+    assert.equal(st.diverged, 1);
+    for (let i = 0; i < 3; i++) assert.equal((await stakeSyncOnce(execCtx(f.conn), ctx, poolBytes(), st, { intervalMs: 0, nowMs: 10 + i })).kind, "backoff");
+    assert.equal(f.sent.length, 1, "no re-send while backed off");
+    const c = allJobCounters()["stake-sync"];
+    assert.equal(c.sent, 1);
+    assert.equal(c.landedFailed, 1);
+    const g = fakeExecConn({ confirmFail: () => 40 });
+    const sg = freshStakeSyncState();
+    assert.equal((await stakeSyncOnce(execCtx(g.conn), ctx, poolBytes(), sg, { intervalMs: 0, nowMs: 1 })).kind, "failed");
+    assert.equal((await stakeSyncOnce(execCtx(g.conn), ctx, poolBytes(), sg, { intervalMs: 0, nowMs: 2 })).kind, "backoff");
+  });
+  it("tag 78 landed-failed counts no LP settle; 38 on chain is 'nothing'; a landed tx still counts (control)", async () => {
+    const ctx = v22Ctx();
+    const big = positioned(Array.from({ length: 12 }, (_, i) => pf(i + 1)));
+    resetPairingStats();
+    const f = fakeExecConn({ confirmFail: () => 7 });
+    assert.equal((await crankBondFee(sd(f.conn), ctx, big, { mode: "prefer", weightBudget: 32 })).kind, "failed");
+    assert.equal(pairingStats.unpairedLpSettles, 0);
+    assert.equal(pairingStats.feeUnpairedLpSettles, 0);
+    const g = fakeExecConn({ confirmFail: () => 38 });
+    assert.equal((await crankBondFee(sd(g.conn), ctx, big, { mode: "prefer", weightBudget: 32 })).kind, "nothing");
+    assert.equal(pairingStats.unpairedLpSettles, 0);
+    const h = fakeExecConn();
+    assert.equal((await crankBondFee(sd(h.conn), ctx, big, { mode: "prefer", weightBudget: 32 })).kind, "sent");
+    assert.equal(pairingStats.unpairedLpSettles, 1);
+    assert.equal(allJobCounters()["fee-78"].landedFailed, 2);
   });
 });

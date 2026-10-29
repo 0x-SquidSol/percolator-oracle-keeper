@@ -80,6 +80,9 @@ export type ExecOutcome =
 /** Per-job counters, exported through /health (health.ts). */
 export interface JobCounters {
   sent: number;
+  /** Of `sent`: landed but failed on chain / never seen landed (`sent` counts every send). */
+  landedFailed: number;
+  notLanded: number;
   dryRun: number;
   refused: number;
   expected: number;
@@ -95,7 +98,7 @@ const counters = new Map<string, JobCounters>();
 export function jobCounters(job: string): JobCounters {
   let c = counters.get(job);
   if (!c) {
-    c = { sent: 0, dryRun: 0, refused: 0, expected: 0, failed: 0, held: 0, byError: {}, lastError: null, lastAt: null };
+    c = { sent: 0, landedFailed: 0, notLanded: 0, dryRun: 0, refused: 0, expected: 0, failed: 0, held: 0, byError: {}, lastError: null, lastAt: null };
     counters.set(job, c);
   }
   return c;
@@ -112,8 +115,11 @@ export function resetJobCounters(): void {
 function bump(job: string, o: ExecOutcome, now: () => number): void {
   const c = jobCounters(job);
   c.lastAt = now();
-  if (o.kind === "sent") c.sent++;
-  else if (o.kind === "dry-run") c.dryRun++;
+  if (o.kind === "sent") {
+    c.sent++;
+    if (o.landed === "failed") c.landedFailed++;
+    else if (o.landed === "not-landed") c.notLanded++;
+  } else if (o.kind === "dry-run") c.dryRun++;
   else if (o.kind === "refused") {
     if (o.expected) c.expected++;
     else c.refused++;

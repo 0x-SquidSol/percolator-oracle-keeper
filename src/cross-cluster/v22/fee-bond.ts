@@ -138,6 +138,11 @@ export async function crankBondFee(
     }
     if (out.kind === "failed") return { kind: "failed", error: out.error };
     if (out.kind === "held") return { kind: "deferred", detail: out.reason };
+    // Sent but not landed clean: nothing settled or cranked (the tx is atomic), so nothing is counted (as runSettleRound's okRun).
+    if (out.kind === "sent" && out.landed !== "landed") {
+      if (out.landed === "failed" && out.failCode === NO_FEES_TO_CRANK) return { kind: "nothing", detail: "no new LP fees (38, on chain: cranked between the simulation and the landing)" };
+      return { kind: "failed", error: `tag 78 (${plan.shape}) ${out.landed === "failed" ? `landed but failed on chain (code ${out.failCode ?? "none"})` : "not landed"} sig=${out.signature.slice(0, 16)}…` };
+    }
     if (plan.shape === "lp-only-unpaired") {
       pairingStats.unpairedLpSettles++;
       pairingStats.feeUnpairedLpSettles++;
