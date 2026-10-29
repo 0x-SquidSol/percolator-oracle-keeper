@@ -19,6 +19,9 @@
  *                              cut the user portfolios opposite the vault LP in batches until the round closes or the program answers 135
  *                              (LpStopNotTriggered = nothing to do). The LP itself is never listed.
  *
+ *   KEEPER_LEV_DRY_RUN=1      simulate and log every op 2/3/4/5 of THIS subsystem, send nothing (GH#226). Also honoured:
+ *                              the global DRY_RUN / KEEPER_DRY_RUN, and KEEPER_V22_DRY_RUN when KEEPER_V22 is on.
+ *
  * Tunables (all optional): KEEPER_LEV_POKE_MIN_GAP_MS (1500), KEEPER_LEV_HOLDER_INTERVAL_MS (3600000), KEEPER_LEV_W1_BATCH (4),
  * KEEPER_LEV_W1_MAX_TXS (12), KEEPER_LEV_RISK_KEY_PATH (a keypair file; its contents are never logged).
  */
@@ -58,6 +61,14 @@ export interface LevGuardConfig {
   poke: boolean;
   holderJob: boolean;
   w1: boolean;
+  /**
+   * GH#226: this subsystem's OWN dry-run switch. It used to borrow `V22_FLAGS.dryRun`, but the
+   * KEEPER_LEV_* jobs run outside KEEPER_V22, and with KEEPER_V22 off `KEEPER_V22_DRY_RUN` is
+   * deliberately not read (N-6) -- so a set KEEPER_V22_DRY_RUN silently did nothing here and op 5
+   * went out live. Still OR-ed with DRY_RUN and V22_FLAGS.dryRun, so nothing that dry-ran before
+   * stops doing so.
+   */
+  dryRun: boolean;
   /** Keypair file of the guard's risk key; null = no REPORT (the holder job still tightens). */
   riskKeyPath: string | null;
   /** Least ms between two pushes-triggered pokes of one market. */
@@ -73,6 +84,7 @@ export const LEV_GUARD_DEFAULTS: LevGuardConfig = {
   poke: false,
   holderJob: false,
   w1: false,
+  dryRun: false,
   riskKeyPath: null,
   pokeMinGapMs: 1_500,
   holderIntervalMs: 3_600_000,
@@ -111,6 +123,7 @@ export function levGuardConfigFromEnv(env: Env = process.env): LevGuardConfig {
     poke: parseFlag(env, "KEEPER_LEV_POKE", false),
     holderJob: parseFlag(env, "KEEPER_LEV_HOLDER_JOB", false),
     w1: parseFlag(env, "KEEPER_LEV_W1", false),
+    dryRun: parseFlag(env, "KEEPER_LEV_DRY_RUN", false),
     riskKeyPath: riskRaw ? riskRaw : null,
     pokeMinGapMs: posInt(env, "KEEPER_LEV_POKE_MIN_GAP_MS", LEV_GUARD_DEFAULTS.pokeMinGapMs, 3_600_000),
     holderIntervalMs: posInt(env, "KEEPER_LEV_HOLDER_INTERVAL_MS", LEV_GUARD_DEFAULTS.holderIntervalMs, 86_400_000),

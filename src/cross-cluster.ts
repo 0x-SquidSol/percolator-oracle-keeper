@@ -521,16 +521,27 @@ const levGuard = levGuardEnabled(LEV_GUARD_CONFIG)
       conn: devnetConn,
       keeper,
       programId: CFG_WRAPPER_PROGRAM_ID,
-      dryRun: DRY_RUN || V22_FLAGS.dryRun,
+      dryRun: DRY_RUN || V22_FLAGS.dryRun || LEV_GUARD_CONFIG.dryRun,
       config: LEV_GUARD_CONFIG,
       riskKey: LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath ? loadRiskKeyOrExit(LEV_GUARD_CONFIG.riskKeyPath) : null,
     })
   : null;
 if (levGuard) {
   setLevGuardHealthProvider(() => levGuard.healthFields());
+  const levDryRun = DRY_RUN || V22_FLAGS.dryRun || LEV_GUARD_CONFIG.dryRun;
+  // GH#226: state the mode positively. It used to be the ABSENCE of a "(DRY-RUN)" suffix that meant
+  // live, and an absent parenthetical is not something an operator notices.
   console.log(
-    `[lev-guard] ON poke=${LEV_GUARD_CONFIG.poke} holderJob=${LEV_GUARD_CONFIG.holderJob} w1=${LEV_GUARD_CONFIG.w1} riskKey=${!!(LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath)}${DRY_RUN || V22_FLAGS.dryRun ? " (DRY-RUN: simulate and log, send nothing)" : ""}`,
+    `[lev-guard] ON mode=${levDryRun ? "DRY-RUN (simulate and log, send nothing)" : "LIVE (sends real transactions)"} poke=${LEV_GUARD_CONFIG.poke} holderJob=${LEV_GUARD_CONFIG.holderJob} w1=${LEV_GUARD_CONFIG.w1} riskKey=${!!(LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath)}`,
   );
+  // GH#226: the trap this fixes. KEEPER_V22_DRY_RUN reads as "the v2.2 jobs simulate", but with
+  // KEEPER_V22 off it is not read at all (N-6, deliberately) and never covered these jobs. Say so
+  // instead of silently going live. Presence only -- parsing it here would re-break N-6.
+  if (!levDryRun && process.env.KEEPER_V22_DRY_RUN !== undefined && !V22_FLAGS.enabled) {
+    console.warn(
+      "[lev-guard] WARNING: KEEPER_V22_DRY_RUN is set but KEEPER_V22 is off, so it is not read and does NOT apply to the leverage-guard jobs. This subsystem is LIVE. Use KEEPER_LEV_DRY_RUN=1 (or DRY_RUN=true) to simulate it.",
+    );
+  }
   if (LEV_GUARD_CONFIG.holderJob) {
     // each market runs at most once per KEEPER_LEV_HOLDER_INTERVAL_MS; this timer only checks who is due
     setInterval(() => {

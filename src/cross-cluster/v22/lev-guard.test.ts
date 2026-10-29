@@ -47,7 +47,7 @@ import type { LevGuardConfig } from "./lev-guard.ts";
 import { fakeExecConn, key, portfolioBytes, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
 import { levGuardHealthFields, setLevGuardHealthProvider } from "./health.ts";
 import { resetJobCounters, allJobCounters } from "./exec.ts";
-import { V22FlagError } from "./flags.ts";
+import { V22FlagError, v22FlagsFromEnv } from "./flags.ts";
 import { VaultLpAllocator } from "../p2b-allocate.ts";
 import { DEFAULT_ALLOCATE_CONFIG } from "../p2b-allocate.ts";
 import { KEEPER as P2B_KEEPER, PROGRAM as P2B_PROGRAM, fakeConn as p2bFakeConn, patchedMarket, registryBytes as p2bRegistryBytes, snapshot, vaultLpStateBytes as p2bVaultLpState } from "../p2b-test-helpers.ts";
@@ -358,6 +358,19 @@ describe("flags", () => {
     assert.equal(c.w1, false);
     assert.equal(c.riskKeyPath, null);
     assert.equal(levGuardEnabled(c), false);
+  });
+  it("GH#226: KEEPER_LEV_DRY_RUN is this subsystem's own switch, because KEEPER_V22_DRY_RUN does not reach it", () => {
+    // The gap being closed: these jobs run outside KEEPER_V22, and with KEEPER_V22 off the v2.2
+    // dry-run flag is deliberately not read (N-6) -- so it cannot be what guards op 5.
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22_DRY_RUN: "on" }).dryRun, false, "N-6: not read with the master switch off");
+    assert.equal(v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_DRY_RUN: "on" }).dryRun, true, "read when the layer is on");
+    // the subsystem's own switch, independent of KEEPER_V22
+    assert.equal(levGuardConfigFromEnv({}).dryRun, false);
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_DRY_RUN: "1" }).dryRun, true);
+    assert.equal(levGuardConfigFromEnv({ KEEPER_LEV_W1: "1", KEEPER_LEV_DRY_RUN: "on" }).dryRun, true);
+    // strict like every other KEEPER_LEV_* flag, and it never enables the subsystem by itself
+    assert.throws(() => levGuardConfigFromEnv({ KEEPER_LEV_DRY_RUN: "dry" }), V22FlagError);
+    assert.equal(levGuardEnabled(levGuardConfigFromEnv({ KEEPER_LEV_DRY_RUN: "1" })), false, "a dry-run flag alone starts no job");
   });
   it("each flag turns on only its own job; 1 / on / true parse; a typo is a startup error (never a silent default)", () => {
     assert.deepEqual([levGuardConfigFromEnv({ KEEPER_LEV_POKE: "1" }).poke, levGuardConfigFromEnv({ KEEPER_LEV_POKE: "1" }).holderJob, levGuardConfigFromEnv({ KEEPER_LEV_POKE: "1" }).w1], [true, false, false]);
