@@ -45,7 +45,7 @@ import { readMarginParams } from "./liquidation.ts";
 import { RENT_SETTLES_PER_ROUND, DEFERRAL_ESCALATION_AFTER, DEFERRAL_ESCALATION_SLOTS, DEFAULT_SWEEP_ROUND_CONFIG, freshGapBackoff, pairingStats, runSettleRound } from "./sweep.ts";
 import type { GapBackoff, RentPlanInput as RoundInputRent, RoundResult, SweepDeps, SweepRoundConfig } from "./sweep.ts";
 import { redactErrorText } from "./redact.ts";
-import { loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
+import { isKnownV22Market, loneLpCrankSuppressed, markV22Market, portfolioWeight, weightBudgetFor } from "./settle-pairing.ts";
 import { crankBondFee } from "./fee-bond.ts";
 import { freshRentState, markRentSettled, planRentSettles, settleRentOnce } from "./rent.ts";
 import { buildSettleHoldingRentIxV22 } from "@percolatorct/sdk";
@@ -396,8 +396,12 @@ export class V22Loop {
     setV22HealthProvider(() => this.healthFields());
   }
 
+  /**
+   * Sticky: once a good read showed variant B, a later failed read ("unreadable") must not re-enable the lone LP crank
+   * or switch off the protective round. `layoutNote` still shows the latest read on /health.
+   */
   private isV22(addr: string): boolean {
-    return this.rt.has(addr) && this.rt.get(addr)?.layoutNote === "v2.2-b";
+    return isKnownV22Market(addr);
   }
 
   private async positionedFor(ctx: V22MarketCtx, r: MarketRuntime): Promise<V22Positioned | null> {
