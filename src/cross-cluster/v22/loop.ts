@@ -569,9 +569,14 @@ export class V22Loop {
           // limit (429) and starved the pushes. Skipped markets catch up on a later cycle; returning true keeps the
           // legacy cranker from sending its own catch-up meanwhile.
           const spacing = this.d.catchupSpacingMs ?? Number(process.env.KEEPER_V22_CATCHUP_SPACING_MS ?? 1500);
-          if (this.now() - this.lastCatchupAtMs < spacing) return true;
-          this.lastCatchupAtMs = this.now();
-          await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
+          const paced = this.now() - this.lastCatchupAtMs < spacing;
+          if (!paced) {
+            this.lastCatchupAtMs = this.now();
+            await this.multiAssetCatchup(ctx, positioned.flatAnchor ?? positioned.lp.pubkey, n);
+          }
+          // A9-1: no round this cycle, so publish this cycle's read as the crank-health record. Without it /health kept the
+          // last round's record for as long as the market stayed behind (a refused catch-up: for good).
+          await this.publishHealth(ctx, r, positioned, null);
           return true;
         }
       }
@@ -757,11 +762,12 @@ export class V22Loop {
     this.log(`[v22][sweep] ${ctx.label}: ${summary}`);
   }
 
-  private async publishHealth(ctx: V22MarketCtx, r: MarketRuntime, positioned: V22Positioned, res: RoundResult): Promise<void> {
+  /** `res` null = no round ran this cycle (catch-up): the record is this cycle's read, with no extra RPC (the pacing's budget). */
+  private async publishHealth(ctx: V22MarketCtx, r: MarketRuntime, positioned: V22Positioned, res: RoundResult | null): Promise<void> {
     let post = ctx.refresh;
     let postData: Uint8Array | null = null;
     try {
-      const info = await this.d.conn.getAccountInfo(ctx.market, "processed");
+      const info = res ? await this.d.conn.getAccountInfo(ctx.market, "processed") : null;
       if (info) {
         postData = new Uint8Array(info.data);
         post = refreshStateForMarket(postData, ctx.marketAddress);
@@ -774,12 +780,12 @@ export class V22Loop {
     setCrankRefreshHealth(ctx.marketAddress, {
       staleLong: Number(ctx.refresh.staleLong),
       staleShort: Number(ctx.refresh.staleShort),
-      postStaleLong: Number(post.staleLong),
-      postStaleShort: Number(post.staleShort),
+      postStaleLong: res ? Number(post.staleLong) : null,
+      postStaleShort: res ? Number(post.staleShort) : null,
       positioned: positioned.all.length,
-      overflow: res.missing.filter((m) => m.why !== "current").length,
+      overflow: res ? res.missing.filter((m) => m.why !== "current").length : 0,
       overflowRefreshed: 0,
-      overflowError: res.abandoned,
+      overflowError: res ? res.abandoned : null,
       lossStaleCycles: r.lossStaleCycles,
       status: r.lossStaleCycles >= LOSS_STALE_ALERT_CYCLES ? "loss-stale" : "ok",
       layout: { id: ctx.layout.id, problem: null, kind: "ok", accountLen: ctx.data.length, provisional: ctx.layout.provisional, hasPositions: positioned.all.length > 0 },

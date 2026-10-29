@@ -21,6 +21,9 @@ import { maxCatchupCranksFor } from "../multi-asset.ts";
 import { detectLayout } from "../market-layout.ts";
 import { livenessOffsetsFor } from "../liveness-repair.ts";
 import { fakeLoopConn, key, portfolioBytes, registryBytes, v22Ctx, v22MarketBytes, vaultLpStateBytes } from "./test-helpers.ts";
+import { getCrankRefreshHealth, resetRefreshCoordination } from "../refresh-coordination.ts";
+import { crankHealthFields, lossStaleMarketLabels, makeHealthHandler, newMarketStat } from "../keeper-loop.ts";
+import { createWalletBalanceState } from "../wallet-balance-guard.ts";
 
 /** Measured v2.2 cost of one bounded catch-up crank (simulation, 2026-10-22): SOL BYFuWyuo, and the band market CHILLHOUSE ALdzXdcR. */
 const MEASURED_V22_CATCHUP_CU = 36_350;
@@ -145,3 +148,88 @@ describe("catch-up is paced across markets (RPC rate limit)", () => {
   });
 });
 
+describe("A9-1: a market in catch-up still publishes its crank-health record (/health must not freeze)", () => {
+  const LP_ACCT = portfolioBytes({ owner: key(8), capital: 1000n, pnl: 0n, legs: [{ side: 0, basis: 5n }] });
+  function setup(o: { market: Uint8Array; spacingMs: number; simErr?: (d: { tags: number[] }) => unknown }) {
+    const opts = { readSlot: Number(NOW), market: o.market, registry: registryBytes({ bound: true, ext: true, bond: false }), vaultLpState: vaultLpStateBytes(key(901), 0n), lpAccount: LP_ACCT, simErr: o.simErr };
+    const f = fakeLoopConn(opts);
+    const marketReads: number[] = [];
+    const getAccountInfo = f.conn.getAccountInfo.bind(f.conn);
+    (f.conn as unknown as { getAccountInfo: unknown }).getAccountInfo = async (k: { equals(x: unknown): boolean }) => {
+      if (k.equals(MARKET)) marketReads.push(1);
+      return getAccountInfo();
+    };
+    const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [{ marketAddress: MARKET.toBase58(), label: "T/V22" }], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: () => {}, catchupSpacingMs: o.spacingMs });
+    const run = (addr = MARKET.toBase58()) => loop.sweepDelegate({ conn: f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: addr, label: "T/V22" }, marketData: opts.market, slot: Number(NOW), dryRun: false });
+    return { opts, f, run, marketReads };
+  }
+
+  /** The real /health body (keeper-loop makeHealthHandler) for one market whose pushes are healthy. */
+  function health(addr: string) {
+    const entry = { marketAddress: addr, label: "T/V22" };
+    const stat = newMarketStat(entry as never);
+    stat.lastPushAt = Date.now();
+    stat.lastPriceE6 = 1_000_000n;
+    const state = { startedAt: Date.now(), lastCycleAt: null, cycleCount: 1, timeoutCount: 0, stats: new Map([[addr, stat]]), lastSuccessfulPushAt: Date.now(), consecutiveBatchReadFailures: 0, lastBatchReadError: null, wallet: createWalletBalanceState(), cycleAttempted: 0, cyclePushed: 0, zeroPushStreak: 0, terminalMarkets: new Set<string>(), landedThisCycle: new Set<string>(), tickPublisher: { counters: () => ({ published: 0 }) } };
+    let body = "";
+    makeHealthHandler(state as never, { intervalMs: 3000, healthPort: 0, healthBind: "127.0.0.1", dryRun: false, minKeeperBalanceLamports: 1, balanceCheckIntervalMs: 1 } as never, { markets: [entry] } as never)({ url: "/health" } as never, { writeHead() {}, end(b: string) { body = b; } } as never);
+    return JSON.parse(body) as { status: string; lossStaleMarkets: string[]; markets: Record<string, { crankStatus: string | null; crankHealthAgo: string | null; postStaleLong: number | null }> };
+  }
+
+  beforeEach(() => resetRefreshCoordination());
+
+  it("a market that goes loss-stale while behind reads loss-stale on /health (tip: the last round's 'ok', for good)", async () => {
+    const s = setup({ market: v22MarketBytes({ currentSlot: NOW, slotLast: NOW }), spacingMs: 0 });
+    assert.equal(await s.run(), true);
+    assert.equal(getCrankRefreshHealth(MARKET.toBase58())?.status, "ok", "control: a round publishes");
+    // an outage: 100 windows behind, 3 portfolios stale; every catch-up is refused, so it never closes
+    s.opts.market = v22MarketBytes({ currentSlot: NOW, slotLast: NOW - 150n * 100n, staleLong: 3n });
+    s.opts.simErr = (d) => (d.tags.every((t) => t === 5) ? { InstructionError: [0, { Custom: 19 }] } : null);
+    for (let i = 0; i < 3; i++) assert.equal(await s.run(), true, "handled: the legacy cranker sends no catch-up of its own");
+    const h = getCrankRefreshHealth(MARKET.toBase58());
+    const row = crankHealthFields(h);
+    assert.equal(row.crankStatus, "loss-stale");
+    assert.equal(row.lossStale, 1);
+    assert.equal(row.lossStaleCycles, 3);
+    assert.equal(row.staleLong, 3);
+    assert.deepEqual(lossStaleMarketLabels(new Map([[MARKET.toBase58(), { label: "T/V22" }]]), undefined, getCrankRefreshHealth), ["T/V22"], "top-level status: degraded-markets");
+    assert.equal(s.marketReads.length, 1, "only the round re-read the market: catch-up cycles add no RPC");
+    // the same through the real /health handler
+    const body = health(MARKET.toBase58());
+    assert.equal(body.markets[MARKET.toBase58()].crankStatus, "loss-stale");
+    assert.equal(body.markets[MARKET.toBase58()].crankHealthAgo, "0s");
+    assert.equal(body.markets[MARKET.toBase58()].postStaleLong, null, "no re-read on a catch-up cycle: the post-state is unknown");
+    assert.deepEqual(body.lossStaleMarkets, ["T/V22"]);
+    assert.equal(body.status, "degraded-markets");
+  });
+
+  it("a non-numeric KEEPER_V22_CATCHUP_SPACING_MS never stops the catch-up", async () => {
+    const prev = process.env.KEEPER_V22_CATCHUP_SPACING_MS;
+    process.env.KEEPER_V22_CATCHUP_SPACING_MS = "1500ms";
+    try {
+      const f = fakeLoopConn({ readSlot: Number(NOW), market: v22MarketBytes({ currentSlot: NOW, slotLast: NOW - 150n * 10n }), registry: registryBytes({ bound: true, ext: true, bond: false }), vaultLpState: vaultLpStateBytes(key(901), 0n), lpAccount: LP_ACCT });
+      const loop = new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [{ marketAddress: MARKET.toBase58(), label: "T/V22" }], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: () => {} });
+      const run = () => loop.sweepDelegate({ conn: f.conn as never, keeper: Keypair.generate(), entry: { marketAddress: MARKET.toBase58(), label: "T/V22" }, marketData: v22MarketBytes({ currentSlot: NOW, slotLast: NOW - 150n * 10n }), slot: Number(NOW), dryRun: false });
+      assert.equal(await run(), true);
+      assert.equal(await run(), true);
+      assert.ok(f.sent.length >= 1, "a typo in the spacing must never stop catch-up");
+    } finally {
+      if (prev === undefined) delete process.env.KEEPER_V22_CATCHUP_SPACING_MS;
+      else process.env.KEEPER_V22_CATCHUP_SPACING_MS = prev;
+    }
+  });
+
+  it("a market skipped by the catch-up pacing publishes too, and sends nothing", async () => {
+    const s = setup({ market: v22MarketBytes({ currentSlot: NOW, slotLast: NOW - 150n * 10n }), spacingMs: 60_000 });
+    const other = key(902).toBase58();
+    assert.equal(await s.run(other), true);
+    assert.equal(s.f.sent.length, 1, "the first market takes the catch-up");
+    assert.equal(await s.run(), true);
+    assert.equal(s.f.sent.length, 1, "paced: nothing sent for the second");
+    const h = getCrankRefreshHealth(MARKET.toBase58());
+    assert.ok(h, "the paced market has a record (tip: none)");
+    assert.equal(h!.status, "ok");
+    assert.equal(h!.overflowError, null);
+    assert.ok(getCrankRefreshHealth(other));
+  });
+});
