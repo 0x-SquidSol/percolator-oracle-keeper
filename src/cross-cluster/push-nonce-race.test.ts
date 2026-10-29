@@ -30,6 +30,8 @@ import {
   V17_ASSET_CONTROL_SEQUENCES_OFF,
 } from "@percolatorct/sdk";
 import { pushAuthMarkBatch, getQuarantinedMarkets } from "./auth-mark-pusher.ts";
+import { nonComputeBudget } from "./test-ix.ts";
+import type { PublicKey } from "@solana/web3.js";
 
 const BLOCKHASH = { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 };
 const PRICE = 1_000_000n;
@@ -51,10 +53,10 @@ function marketAccount(oracleObservation: bigint): Uint8Array {
 }
 
 type Push = { market: string; seq: bigint };
-type IxLike = { keys: Array<{ pubkey: { toBase58(): string } }>; data: Uint8Array };
+type IxLike = { programId: PublicKey; keys: Array<{ pubkey: { toBase58(): string } }>; data: Uint8Array };
 
 function decodePushes(ixs: IxLike[]): Push[] {
-  return ixs.slice(1).map((ix) => ({
+  return nonComputeBudget(ixs).map((ix) => ({
     market: ix.keys[1].pubkey.toBase58(),
     seq: new DataView(ix.data.buffer, ix.data.byteOffset, ix.data.byteLength).getBigUint64(27, true),
   }));

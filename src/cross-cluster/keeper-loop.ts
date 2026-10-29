@@ -18,9 +18,10 @@
  */
 import http from "http";
 import { Connection, Keypair } from "@solana/web3.js";
+import { lifecycleLedger } from "./v22/lifecycle-ledger.ts";
 import type { DexType, Registry } from "./registry.ts";
 import type { DecimalsCache } from "./price-reader.ts";
-import { readAllPoolPricesE6 } from "./price-reader.ts";
+import { isSolUsdEntry, readAllPoolPricesE6 } from "./price-reader.ts";
 import { createMarkSmoother } from "./mark-smoother.ts";
 import type { MarkSmoother } from "./mark-smoother.ts";
 import { createTickPublisher, type TickPublisher, type TickInput } from "./tick-publisher.ts";
@@ -33,7 +34,7 @@ import { getCrankRefreshHealth, getLayoutProblemCounts, isPushHeld, pruneCrankRe
 import { p2bHealthFields } from "./p2b-health.ts";
 import { rpcFailoverHealth } from "../rpc-failover.ts";
 import { restartHealth } from "../restart-escalation.ts";
-import { v22HealthFields } from "./v22/health.ts";
+import { levGuardHealthFields, v22HealthFields } from "./v22/health.ts";
 import { layoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import type { LayoutGuardSnapshot } from "./layout-guard-metrics.ts";
 import { rpcMetrics } from "./rpc-metrics.ts";
@@ -44,6 +45,16 @@ import type { SweepHealth } from "./positioned-sweep.ts";
 import { pushDepthEnabled, resolvePushDepth, type PushDepth } from "./push-depth.ts";
 import { DEPTH_SOURCE_ONCHAIN_DEX, DepthSourceCache, pushDepthOnchainEnabled, type DexDepthPin } from "./depth-source.ts";
 import { WRAPPER_PROGRAM_ID as DEPTH_WRAPPER_PROGRAM_ID } from "../program-ids.ts";
+import {
+  DepthSampleWindow,
+  bracketWarningLine,
+  conservativeReserves,
+  depthMinWindowMs,
+  depthPushJitterPct,
+  jitteredIntervalMs,
+  postPushRereadDelayMs,
+  recordPostPushReads,
+} from "./depth-bracketing.ts";
 import { getMarketAccrual, laggingAssets, multiAssetKey, priceUnitsOfRegistry, pruneMarketAccrual } from "./multi-asset.ts";
 import { DEADLINE_FRESH_MS, getOnChainMarkE6, getPushDeadline, isKnownTerminal, markTerminal, prunePushDeadlines, refreshPushDeadlines } from "./push-deadline.ts";
 import type { PushDeadline } from "./push-deadline.ts";
@@ -52,6 +63,8 @@ import { pushGenerationKey } from "./auth-mark-pusher.ts";
 
 /** Round 2: pins re-read every KEEPER_DEPTH_SRC_REFRESH_MS (default 5 min). */
 const depthSourceCache = new DepthSourceCache(Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) > 0 ? Number(process.env.KEEPER_DEPTH_SRC_REFRESH_MS) : 5 * 60_000);
+/** SEC-RC L-3: short per-pool window of pre/post-push reserve reads; the attested (mode 1) reserve is its min. */
+const depthWindow = new DepthSampleWindow(depthMinWindowMs());
 import {
   type WalletBalanceState,
   createWalletBalanceState,
@@ -146,6 +159,8 @@ interface MarketStat {
   lastDepthE6: bigint | null;
   /** G8: where that depth came from (null when lastDepthE6 is null). */
   lastDepthSource: string | null;
+  /** #174: unix ms since which a constant-product market sent no depth with depth push on (null = it sent one, or none expected). */
+  depthAbsentSince: number | null;
 }
 
 /**
@@ -184,6 +199,7 @@ export function newMarketStat(m: {
     lastRawPriceE6: 0n,
     lastDepthE6: null,
     lastDepthSource: null,
+    depthAbsentSince: null,
   };
 }
 
@@ -202,6 +218,19 @@ export function recordRawPrice(
     stat.sourceUnchangedSince = nowMs;
     stat.lastRawPriceE6 = rawPriceE6;
   }
+}
+
+/**
+ * #174: track how long a market that SHOULD attest depth (KEEPER_PUSH_DEPTH on, constant-product venue) has gone without one. The depth
+ * is null for "the venue has no liquidity" and for "the reserve could not be read this cycle" alike; either way the on-chain sticky cap
+ * is halving, so the run is surfaced (depth-unavailable) instead of being an invisible 35 B push.
+ */
+export function noteDepthAttempt(stat: Pick<MarketStat, "depthAbsentSince">, expected: boolean, got: boolean, nowMs: number): void {
+  if (!expected || got) {
+    stat.depthAbsentSince = null;
+    return;
+  }
+  if (stat.depthAbsentSince === null) stat.depthAbsentSince = nowMs;
 }
 
 /**
@@ -478,6 +507,7 @@ export function recordMultiAssetPushOutcome(
       crossClusterCircuitBreakerStates.set(p.key, commitPublishedBreakerState(crossClusterCircuitBreakerStates.get(p.key), o.pending, o.stamp));
     }
     recordLandedPush(stat, o.stamp, res.signature);
+    lifecycleLedger.recordPushLanded(p.marketAddress, o.stamp);
     stat.lastDepthE6 = p.depth?.depthE6 ?? null;
     stat.lastDepthSource = p.depth?.source ?? null;
     state.landedThisCycle.add(p.key);
@@ -554,21 +584,25 @@ export function multiAssetMarketHealth(
   marketAddress: string,
   label: string,
   assetStats: ReadonlyArray<MarketStat>,
-  ctx: { terminal: boolean; thresholds: ReturnType<typeof getAlertSink>["thresholds"]; nowMs: number; accrualLagWarnSlots: number },
-): { row: Record<string, unknown>; noPush: string[]; markLagging: string[]; accrualLagging: string[] } {
+  ctx: { terminal: boolean; unregistered?: boolean; thresholds: ReturnType<typeof getAlertSink>["thresholds"]; nowMs: number; accrualLagWarnSlots: number },
+): { row: Record<string, unknown>; noPush: string[]; markLagging: string[]; accrualLagging: string[]; sourceFrozen: string[]; unregistered: string[] } {
   const accrual = getMarketAccrual(marketAddress);
   const lagging = new Set(ctx.terminal ? [] : laggingAssets(accrual, ctx.accrualLagWarnSlots));
   const noPush: string[] = [];
   const markLagging: string[] = [];
   const accrualLagging: string[] = [];
+  const sourceFrozen: string[] = [];
+  const unregistered: string[] = [];
   const sorted = [...assetStats].sort((a, b) => (a.multiAsset?.assetIndex ?? 0) - (b.multiAsset?.assetIndex ?? 0));
   const assets = sorted.map((stat) => {
     const assetIndex = stat.multiAsset?.assetIndex ?? 0;
-    const verdict = evaluateMarketPush(marketPushSample(stat, ctx.terminal), ctx.thresholds, ctx.nowMs);
+    const verdict = evaluateMarketPush(marketPushSample(stat, ctx.terminal, ctx.unregistered ?? false), ctx.thresholds, ctx.nowMs);
     const lag = accrual?.assets.find((a) => a.assetIndex === assetIndex) ?? null;
     let status: string = verdict.status;
     if (verdict.status === "no-push") noPush.push(stat.label);
     if (verdict.active.some((a) => a.kind === "mark-lagging")) markLagging.push(stat.label);
+    if (verdict.active.some((a) => a.kind === "source-frozen")) sourceFrozen.push(stat.label);
+    if (verdict.status === "unregistered") unregistered.push(stat.label);
     if (lagging.has(assetIndex)) {
       accrualLagging.push(stat.label);
       if (status === "ok") status = "accrual-lagging";
@@ -615,6 +649,8 @@ export function multiAssetMarketHealth(
     noPush,
     markLagging,
     accrualLagging,
+    sourceFrozen,
+    unregistered,
   };
 }
 
@@ -631,6 +667,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
     const thresholds = getAlertSink().thresholds;
     const noPushMarkets: string[] = [];
     const markLaggingMarkets: string[] = [];
+    const sourceFrozenMarkets: string[] = [];
+    const unregisteredMarkets: string[] = [];
     // K-6: assets of multi-asset markets are grouped under their market (one /health row per market, `assets` inside).
     const multiByMarket = new Map<string, MarketStat[]>();
     /** One {label} per MARKET (single-asset: its stat; multi-asset: the registry label) for the market-level lists. */
@@ -643,9 +681,11 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         continue;
       }
       marketLabels.set(addr, stat);
-      const verdict = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, addr)), thresholds, nowMs);
+      const verdict = evaluateMarketPush(pushSampleFor(state, registry, stat), thresholds, nowMs);
       if (verdict.status === "no-push") noPushMarkets.push(stat.label || addr);
       if (verdict.active.some((a) => a.kind === "mark-lagging")) markLaggingMarkets.push(stat.label || addr);
+      if (verdict.active.some((a) => a.kind === "source-frozen")) sourceFrozenMarkets.push(stat.label || addr);
+      if (verdict.status === "unregistered") unregisteredMarkets.push(stat.label || addr);
       // R3.24 (b): a terminal market reads "resolved" (or closed / recovery), never ok-with-a-stale-error.
       const terminalStatus = terminalHealthStatus(state, addr);
       markets[addr] = {
@@ -674,6 +714,7 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
         lastError: terminalStatus ? null : stat.lastErrorMsg,
         depthE6: stat.lastDepthE6 === null ? null : stat.lastDepthE6.toString(),
         depthSource: stat.lastDepthSource,
+        ...(stat.depthAbsentSince !== null ? { depthAbsentFor: `${Math.floor((nowMs - stat.depthAbsentSince) / 1000)}s` } : {}),
         ...crankHealthFields(getCrankRefreshHealth(addr)),
       };
     }
@@ -682,13 +723,16 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       const label = registry.markets.find((m) => m.marketAddress === addr)?.label ?? addr;
       marketLabels.set(addr, { label });
       const h = multiAssetMarketHealth(addr, label, assetStats, {
-        terminal: !pushExpected(state, registry, addr),
+        terminal: isTerminalForPush(state, addr),
+        unregistered: isUnregistered(state, registry, addr),
         thresholds,
         nowMs,
         accrualLagWarnSlots: thresholds.slotLagWarn,
       });
       noPushMarkets.push(...h.noPush);
       markLaggingMarkets.push(...h.markLagging);
+      sourceFrozenMarkets.push(...h.sourceFrozen);
+      unregisteredMarkets.push(...h.unregistered);
       accrualLaggingAssets.push(...h.accrualLagging);
       const terminalStatus = terminalHealthStatus(state, addr);
       markets[addr] = { ...h.row, ...(terminalStatus ? { status: terminalStatus, terminal: true } : {}), ...crankHealthFields(getCrankRefreshHealth(addr)) };
@@ -731,6 +775,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
               layoutProblemMarkets.length > 0 ||
               noPushMarkets.length > 0 ||
               markLaggingMarkets.length > 0 ||
+              sourceFrozenMarkets.length > 0 ||
+              unregisteredMarkets.length > 0 ||
               accrualLaggingAssets.length > 0
             ? "degraded-markets"
             : rpcFailover.degraded
@@ -752,6 +798,9 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       lossStaleMarkets,
       noPushMarkets,
       markLaggingMarkets,
+      // #214 / #184: present only when non-empty, so a healthy board keeps today's exact key set.
+      ...(sourceFrozenMarkets.length > 0 ? { sourceFrozenMarkets } : {}),
+      ...(unregisteredMarkets.length > 0 ? { unregisteredMarkets } : {}),
       // K-6: present only when a multi-asset market is registered (single-asset deployments keep today's key set).
       ...(multiByMarket.size > 0 ? { accrualLaggingAssets } : {}),
       ...layoutProblemFields(layoutProblemMarkets),
@@ -775,6 +824,8 @@ export function makeHealthHandler(state: LoopState, config: LoopConfig, registry
       ...p2bHealthFields(),
       // v2.2 layer, additive: `v22`. `{}` unless KEEPER_V22=on.
       ...v22HealthFields(),
+      // leverage guard (tag 124), additive: `levGuard`. `{}` unless a KEEPER_LEV_* flag is on.
+      ...levGuardHealthFields(),
       ...healthExtensionFields(),
     });
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -824,7 +875,10 @@ function maybeResetAuthorityLatches(): void {
 // NOTE (mainnet): a real-money deployment should keep a longer window OR move to a
 // pull oracle (Pyth) that prices the trade in-tx — do NOT ship this short window
 // to mainnet without that.
-const MARK_WINDOW_MS = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+// GH#165: validated rather than raw. `cross-cluster.ts` boots first and exits on a
+// bad cadence, so this read was protected by sequence rather than by validation --
+// which stops being true the moment this module is used from anywhere else.
+const MARK_WINDOW_MS = parseCrossClusterPositiveNumberEnv("CC_MARK_WINDOW_MS", 15_000);
 const markSmoother = createMarkSmoother({ windowMs: MARK_WINDOW_MS });
 /**
  * The same median over the same samples, at e12, for the per-LOT mark of v2.2 lot markets (per-lot precision, QA
@@ -1266,6 +1320,7 @@ async function runCycle(
     const msg = (err instanceof Error ? err.message : String(err)).slice(0, 160);
     state.consecutiveBatchReadFailures++;
     state.lastBatchReadError = msg;
+    lifecycleLedger.noteSourceCycle(false, Date.now()); // an unclean observation: the stale-resolve guards restart their clock
     console.error(
       `[loop] batch pool read error (${state.consecutiveBatchReadFailures} consecutive) — ${msg}`,
     );
@@ -1273,6 +1328,12 @@ async function runCycle(
   }
   state.consecutiveBatchReadFailures = 0;
   state.lastBatchReadError = null;
+  lifecycleLedger.noteSourceCycle(true, Date.now());
+  // SEC-RC L-3: attest the MIN of this read and the recent pre/post-push reads, so liquidity added just before a push
+  // and pulled just after it is not what gets attested. Empty (and untouched) when depth pushes are off.
+  const attestReservesUsdE6 = pushDepthOn ? conservativeReserves(depthWindow, quoteReservesUsdE6, Date.now()) : quoteReservesUsdE6;
+  /** market key -> pool, for the pushes that carry a keeper-attested depth (the post-push re-read set). */
+  const attestedDepthPools = new Map<string, string>();
 
   // ── 3. Build the pushable set for this cycle ────────────────────────────────
   const pushes: Array<{ key: string; multi: boolean; marketAddress: string; assetIndex: number; priceE6: bigint; priceE12?: bigint; depth?: PushDepth | null; dex?: DexDepthPin | null }> = [];
@@ -1334,6 +1395,7 @@ async function runCycle(
       }
       stat.sourcePriceE6 = fixed;
       stat.lastPriceE6 = fixed;
+      lifecycleLedger.recordSource(entry.marketAddress, true, smoothNowMs);
       pushes.push({ key: entry.key, multi: entry.multi, marketAddress: entry.marketAddress, assetIndex: entry.assetIndex, priceE6: fixed, depth: null });
       continue;
     }
@@ -1345,6 +1407,7 @@ async function runCycle(
       continue;
     }
     recordRawPrice(stat, rawPriceE6, smoothNowMs);
+    lifecycleLedger.recordSource(entry.marketAddress, true, smoothNowMs); // a source price the keeper could publish: such a market is pushed, never resolved
     // The mark that settles trades is the SMOOTHED price, never raw spot.
     let priceE6 = smoothedThisCycle.get(entry.poolAddress);
     if (priceE6 === undefined) {
@@ -1448,6 +1511,10 @@ async function runCycle(
     stat.lastPriceE6 = publish.priceE6;
     // e12 rides along only when the breaker published the smoothed price itself (not a clamp / hold).
     if (publish.priceE6 !== priceE6) smoothedE12 = null;
+    // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
+    const depth = resolvePushDepth(pushDepthOn, attestReservesUsdE6.get(entry.poolAddress));
+    noteDepthAttempt(stat, pushDepthOn && entry.dexType === "pumpswap", depth !== null, smoothNowMs);
+    if (depth) attestedDepthPools.set(entry.key, entry.poolAddress);
     pushes.push({
       key: entry.key,
       multi: entry.multi,
@@ -1455,8 +1522,7 @@ async function runCycle(
       assetIndex: entry.assetIndex,
       priceE6: publish.priceE6,
       ...(smoothedE12 ? { priceE12: smoothedE12 } : {}),
-      // G8: flag off / non-CPMM / reserve unknown -> null -> the exact 35 B bytes of today.
-      depth: resolvePushDepth(pushDepthOn, quoteReservesUsdE6.get(entry.poolAddress)),
+      depth,
       // Round 2: the active, same-cluster pin (mode 2); the pusher re-checks it against the live generation.
       ...(pushDepthOnchain ? { dex: depthSourceCache.get(entry.marketAddress) } : {}),
     });
@@ -1565,6 +1631,7 @@ async function runCycle(
           );
         }
         recordLandedPush(stat, stamp, res.signature);
+        lifecycleLedger.recordPushLanded(p.marketAddress, stamp);
         stat.lastDepthE6 = dexPushed.has(p.marketAddress) ? null : (p.depth?.depthE6 ?? null);
         stat.lastDepthSource = dexPushed.has(p.marketAddress) ? DEPTH_SOURCE_ONCHAIN_DEX : (p.depth?.source ?? null);
         state.landedThisCycle.add(p.marketAddress);
@@ -1600,6 +1667,15 @@ async function runCycle(
     if (res.pushed && res.signature) {
       state.lastSuccessfulPushAt = stamp;
       console.log(`[loop] batched push × ${res.count}: sig=${res.signature.slice(0, 16)}…`);
+      if (pushDepthOn) {
+        // SEC-RC L-3: re-read the attested pools a random 1-3 slots after the push; the next push attests the min.
+        const reread = new Set<string>();
+        for (const p of pushes) {
+          const pool = attestedDepthPools.get(p.key);
+          if (pool && pushedSet.has(p.marketAddress) && !dexPushed.has(p.marketAddress)) reread.add(pool);
+        }
+        await rereadDepthAfterPush(mainnetConn, units, reread, decimalsCache);
+      }
     } else if (config.dryRun && pushes.length > 0) {
       // Dry-run "pushes" count as liveness — the pipeline produced prices.
       state.lastSuccessfulPushAt = stamp;
@@ -1619,6 +1695,38 @@ async function runCycle(
       s.totalErrors++;
       s.lastErrorMsg = msg;
     }
+  }
+}
+
+/**
+ * SEC-RC L-3: the post-push depth re-read. Waits a CSPRNG-random 1-3 slots, re-reads the attested pools (plus the
+ * SOL/USD source rows a WSOL-quoted reserve needs) and records the reserves in the depth window. A sharp drop since the
+ * pre-push read is logged as a structured warning; the low sample is what the next push attests. Any read failure is
+ * logged and adds no sample (never a guess, never a zero).
+ */
+async function rereadDepthAfterPush(
+  mainnetConn: Connection,
+  units: readonly PriceUnit[],
+  pools: ReadonlySet<string>,
+  decimalsCache: DecimalsCache,
+): Promise<void> {
+  if (pools.size === 0) return;
+  await new Promise((r) => setTimeout(r, postPushRereadDelayMs()));
+  const rows = units.filter((u) => u.source === "pool" && (pools.has(u.poolAddress) || isSolUsdEntry({ dexType: u.dexType as DexType, label: u.label, symbol: u.symbol })));
+  const seen = new Set<string>();
+  const entries = rows
+    .filter((u) => (seen.has(u.poolAddress) ? false : (seen.add(u.poolAddress), true)))
+    .map((u) => ({ poolAddress: u.poolAddress, dexType: u.dexType as DexType, label: u.label, symbol: u.symbol, mainnetCa: u.mainnetCa }));
+  const post = new Map<string, bigint>();
+  try {
+    await readAllPoolPricesE6(mainnetConn, entries, decimalsCache, process.env.SOL_USD_REFERENCE_POOL, undefined, undefined, post);
+  } catch (err) {
+    console.warn(`[loop] post-push depth re-read failed (no sample): ${(err instanceof Error ? err.message : String(err)).slice(0, 100)}`);
+    return;
+  }
+  const labelOf = new Map(rows.map((u) => [u.poolAddress, u.label] as const));
+  for (const s of recordPostPushReads(depthWindow, post, pools, Date.now())) {
+    console.warn(bracketWarningLine(s, labelOf.get(s.pool) ?? s.pool));
   }
 }
 
@@ -1676,6 +1784,19 @@ function pushExpected(state: LoopState, registry: Registry, market: string): boo
   return !isTerminalForPush(state, market) && registry.markets.some((m) => m.marketAddress === market);
 }
 
+/**
+ * #184: a tracked, non-terminal market with no registry row. It is "unregistered" (alertable), NOT terminal: "the keeper has never
+ * heard of this market" must not read the same as "this market is healthy".
+ */
+function isUnregistered(state: LoopState, registry: Registry, market: string): boolean {
+  return !isTerminalForPush(state, market) && !registry.markets.some((m) => m.marketAddress === market);
+}
+
+/** The push sample of one tracked market (single-asset), with terminal / unregistered resolved against the registry. */
+function pushSampleFor(state: LoopState, registry: Registry, stat: MarketStat): MarketPushSample {
+  return marketPushSample(stat, isTerminalForPush(state, stat.marketAddress), isUnregistered(state, registry, stat.marketAddress));
+}
+
 /** Deadline cache entries older than this are not used for the pin alert (the cranker refreshes them every crank). */
 const PIN_ALERT_MAX_AGE_MS = 4 * DEADLINE_FRESH_MS;
 
@@ -1712,7 +1833,7 @@ export function terminalHealthStatus(state: Pick<LoopState, "terminalMarkets">, 
 }
 
 /** K-1/K-3: the per-market sample the alert evaluator and /health read. `terminal` = no push expected. */
-export function marketPushSample(stat: MarketStat, terminal: boolean): MarketPushSample {
+export function marketPushSample(stat: MarketStat, terminal: boolean, unregistered = false): MarketPushSample {
   return {
     label: stat.label,
     market: stat.marketAddress,
@@ -1722,6 +1843,8 @@ export function marketPushSample(stat: MarketStat, terminal: boolean): MarketPus
     markGap: stat.markGap,
     sourceUnchangedSince: stat.sourceUnchangedSince,
     terminal,
+    unregistered,
+    depthAbsentSince: stat.depthAbsentSince,
   };
 }
 
@@ -1732,7 +1855,7 @@ async function reportMarketPush(state: LoopState, registry: Registry): Promise<v
     const now = Date.now();
     const active: Alert[] = [];
     for (const stat of state.stats.values()) {
-      const ev = evaluateMarketPush(marketPushSample(stat, !pushExpected(state, registry, stat.marketAddress)), sink.thresholds, now);
+      const ev = evaluateMarketPush(pushSampleFor(state, registry, stat), sink.thresholds, now);
       active.push(...ev.active);
     }
     // R3.24 (c): a live band market's pin approaching expiry, per market (the pin is market-level: any asset expires it).
@@ -1879,6 +2002,13 @@ export async function startKeeperLoop(
       ` ${registry.markets.length} markets, interval=${config.intervalMs}ms`,
   );
 
+  // Both depth flags are read every cycle; parsing them here first makes a typo refuse the start, not fail each cycle.
+  pushDepthOnchainEnabled();
+  const depthJitterPct = depthPushJitterPct(pushDepthEnabled());
+  if (depthJitterPct > 0) {
+    console.log(`[keeper] depth-push jitter: interval drawn from [${config.intervalMs - Math.floor((config.intervalMs * depthJitterPct) / 100)}, ${config.intervalMs}]ms (SEC-RC L-3)`);
+  }
+
   // Main loop
   while (!stopping) {
     const cycleStart = Date.now();
@@ -1924,7 +2054,8 @@ export async function startKeeperLoop(
     await reportPushCycle(state, countPushableMarkets(priceUnitsOfRegistry(registry.markets), state.terminalMarkets) - (state.standbyThisCycle?.size ?? 0));
     await reportMarketPush(state, registry);
     const elapsed = Date.now() - cycleStart;
-    const remaining = config.intervalMs - elapsed;
+    // SEC-RC L-3: with depth pushes on, the cadence is jittered DOWNWARD only (never above intervalMs).
+    const remaining = jitteredIntervalMs(config.intervalMs, depthJitterPct) - elapsed;
     if (remaining > 0 && !stopping) {
       await new Promise((r) => setTimeout(r, remaining));
     }

@@ -262,7 +262,7 @@ export type TerminalConnection = Pick<
   | "getLatestBlockhash"
   | "simulateTransaction"
   | "sendRawTransaction"
-  | "confirmTransaction"
+  | "getBlockHeight"
   | "getSignatureStatuses"
   | "getTokenAccountsByOwner"
   | "getProgramAccounts"
@@ -417,36 +417,12 @@ export async function windDownOnce(
       }
     }
   }
-  if (!poolState || !poolState.slab.equals(market) || !poolState.percolatorProgram.equals(cfg.wrapperProgramId)) {
-    if (lateNote) return res({ kind: "done", detail: lateNote.trim() }, { state });
-    return res({ kind: "skipped", reason: "no stake pool bound to this market" }, { state });
-  }
-  const [vaultAuth] = deriveStakeVaultAuth(pool, cfg.stakeProgramId);
-  // A tombstone has no profile left; the pool binding above stands in for it.
-  const stakeBound = state.kind === "closed" ? true : !!asset0InsuranceAuthority(data)?.equals(vaultAuth);
-  let budget = state.kind === "resolved" ? state.budget : 0n;
-  if (!stakeBound) {
-    return res({ kind: "skipped", reason: "asset-0 insurance authority is not this pool's vault_auth (not stake-bound)" }, { state, budget });
-  }
-
-  // Unbooked-budget streak (item 3) — counted whether or not tag 29 exists yet.
-  const streak = budget > 0n ? (st.unbookedStreak.get(marketAddress) ?? 0) + 1 : 0;
-  if (streak > 0) st.unbookedStreak.set(marketAddress, streak);
-  else st.unbookedStreak.delete(marketAddress);
-  const unbookedAlert = (why: string): FeeJobOutcome | null =>
-    streak >= cfg.unbookedAlertCycles
-      ? {
-          kind: "blocked",
-          alertKind: "terminal-budget-unbooked",
-          reason: `resolved stake-bound market still holds ${budget} atoms of unbooked insurance budget after ${streak} cycles (${why}) — stakers' money is stranded until stake tag 29 books it (F-9)`,
-        }
-      : null;
-
-  const collateralMint = parseWrapperConfigV17(data).collateralMint;
-
   // B12 cleanup before tag 29: close every materialized portfolio (payout and
   // rent to each owner; PDA owners skipped) so wrapper tag 41 can release the
   // budget. Gated on the wrapper supporting it (no-op on 6377376a).
+  // A6-1: runs on EVERY Resolved market, before the stake-pool gates below, every cycle until none is left: a market with
+  // no stake pool bound still needs its claimants paid and its vault LP settled (101) to reach terminal-flat (77 / 102).
+  let budget = state.kind === "resolved" ? state.budget : 0n;
   let cleanup: CleanupResult | null = null;
   if (cfg.cleanup && state.kind === "resolved" && state.materializedPortfolios > 0n) {
     let nowSlot = 0n;
@@ -455,7 +431,7 @@ export async function windDownOnce(
     } catch {
       nowSlot = 0n; // unknown clock => pdaGraceLeft keeps the full grace (fail safe for holders)
     }
-    cleanup = await cleanupResolvedPortfolios(conn as CleanupConnection, keeper, market, collateralMint, dryRun, cfg.cleanup, st.cleanup, {
+    cleanup = await cleanupResolvedPortfolios(conn as CleanupConnection, keeper, market, parseWrapperConfigV17(data).collateralMint, dryRun, cfg.cleanup, st.cleanup, {
       nowSlot,
       resolvedSlot: state.resolvedSlot,
     });
@@ -491,6 +467,40 @@ export async function windDownOnce(
       }
     }
   }
+  const cleanupNote = cleanup
+    ? ` Cleanup: support=${cleanup.support}, closed ${cleanup.closed}, progressed ${cleanup.progressed}, ${cleanup.remaining.length} left` +
+      (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${r.reason}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
+    : "";
+  // Not stake-bound: no tag 29 here; report what the cleanup did.
+  const unbound = (reason: string, extra: Parameters<typeof res>[1]) =>
+    lateNote || cleanup?.closed
+      ? res({ kind: "done", detail: `${lateNote}${cleanupNote}`.trim() }, extra)
+      : res({ kind: "skipped", reason: `${reason}${cleanupNote ? `.${cleanupNote}` : ""}` }, extra);
+  if (!poolState || !poolState.slab.equals(market) || !poolState.percolatorProgram.equals(cfg.wrapperProgramId)) {
+    return unbound("no stake pool bound to this market", { state });
+  }
+  const [vaultAuth] = deriveStakeVaultAuth(pool, cfg.stakeProgramId);
+  // A tombstone has no profile left; the pool binding above stands in for it.
+  const stakeBound = state.kind === "closed" ? true : !!asset0InsuranceAuthority(data)?.equals(vaultAuth);
+  if (!stakeBound) {
+    return unbound("asset-0 insurance authority is not this pool's vault_auth (not stake-bound)", { state, budget });
+  }
+
+  // Unbooked-budget streak (item 3) — counted whether or not tag 29 exists yet.
+  const streak = budget > 0n ? (st.unbookedStreak.get(marketAddress) ?? 0) + 1 : 0;
+  if (streak > 0) st.unbookedStreak.set(marketAddress, streak);
+  else st.unbookedStreak.delete(marketAddress);
+  const unbookedAlert = (why: string): FeeJobOutcome | null =>
+    streak >= cfg.unbookedAlertCycles
+      ? {
+          kind: "blocked",
+          alertKind: "terminal-budget-unbooked",
+          reason: `resolved stake-bound market still holds ${budget} atoms of unbooked insurance budget after ${streak} cycles (${why}) — stakers' money is stranded until stake tag 29 books it (F-9)`,
+        }
+      : null;
+
+  const collateralMint = parseWrapperConfigV17(data).collateralMint;
+
   // P3 07a1d0eb: once terminal-flat, harvest the pending LP fee leg (tag 78) into
   // the seniors BEFORE tag 29, so bound Earn redemption (77, needs H == 0) unlocks.
   // Wrappers before 07a1d0eb answer EngineLockActive (21) in preflight -> a quiet
@@ -505,11 +515,6 @@ export async function windDownOnce(
             : ` Tag 78 harvest failed: ${h.error}.`;
     if (h === "cranked") console.log(`[terminal-insurance] ${marketAddress.slice(0, 8)}…: resolved terminal-flat LP fee harvest (tag 78) landed`);
   }
-
-  const cleanupNote = cleanup
-    ? ` Cleanup: support=${cleanup.support}, closed ${cleanup.closed}, progressed ${cleanup.progressed}, ${cleanup.remaining.length} left` +
-      (cleanup.remaining.length ? ` [${cleanup.remaining.slice(0, 3).map((r) => `${r.portfolio.slice(0, 8)}…: ${r.reason}`).join("; ")}${cleanup.remaining.length > 3 ? "; …" : ""}]` : "") + "."
-    : "";
 
   // S1 account shape. Only a v5 pool has a creator account; it needs the creator's collateral ATA to EXIST (an
   // uninitialised one would read as 16 and look like an old program). Whether the DEPLOYED stake accepts the shape is
@@ -686,7 +691,19 @@ export async function windDownOnce(
   steps.push(s2);
   const recoveredNote = (lateNote ? `${lateNote.trim()} ` : "") + (harvestNote ? `${harvestNote.trim()} ` : "") + (recovered ? `tag 29 recovered ${budget} atoms of terminal insurance into the stake pool ${recovered.detail}; ` : "");
   if (s2.outcome === "nothing") {
-    // Done ONLY on 31 from the amount-0 step (B14).
+    // A6-1: 31 only says nothing is left to BOOK (amount 0 never reaches tag 41, so it answers 31 with portfolios still
+    // materialized, e.g. inside force_close_delay_slots). Not done while this cycle's view shows any: the cleanup above must
+    // keep running. If a tag 41 landed anyway, the view (and its budget: CloseResolved credits fees back) was stale, so the
+    // next cycle re-reads before marking done.
+    if (state.kind === "resolved" && state.materializedPortfolios > 0n) {
+      return res(recovered
+        ? { kind: "done", detail: `${recoveredNote}tag 29(0) -> Custom(31); re-checked next cycle (portfolios closed since this cycle's read)` }
+        : {
+            kind: "skipped",
+            reason: `tag 29(0) -> Custom(31), but ${state.materializedPortfolios} portfolio(s) still materialized: resolved cleanup continues next cycle.` + cleanupNote,
+          }, { state, budget, stakeBound, support });
+    }
+    // Done ONLY on 31 from the amount-0 step (B14), with nothing left materialized.
     st.done.add(marketAddress);
     return res(
       recovered

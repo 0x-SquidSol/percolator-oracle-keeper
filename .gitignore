@@ -14,3 +14,4 @@ logs/
 !registry.json
 !deploy/registry.*.seed.json
 !src/cross-cluster/__fixtures__/*.json
+!vendor/bigint-buffer/dist/

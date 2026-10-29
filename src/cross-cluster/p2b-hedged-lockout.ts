@@ -26,10 +26,10 @@
  * leg = `basis * A_side / a_basis`, floor: exact to +-1 unit, irrelevant at a few-percent
  * threshold).
  *
- * v2.2 (G8 / controller / continuous leverage, percolator-prog e699d7da): on a v2.2 market the
- * capacity is the program's `n_cap_g8_q_dials`, computed by the SDK exactly as the gate does
- * (`growthCeilingView` -> clamp, tier, cap depth and the continuous-curve dials κ / λ_depth at
- * min(venue, book) depth; then `nCapG8Q`). That needs the market's `band_bps` and the read slot,
+ * v2.2 (G8 / controller / continuous leverage, percolator-prog 21b8ccfd "contlev3"): on a v2.2 market
+ * the capacity is the program's `n_cap_g8_q_dials`, computed by the SDK exactly as the gate does
+ * (`growthCeilingView` -> clamp, tier, cap depth and the dials κ / λ_depth on the LAGGING curve at
+ * min(venue, book) depth, never looser than the round-2 step (security review M-1); then `nCapG8Q`). That needs the market's `band_bps` and the read slot,
  * which `evaluateHedgedLockouts` takes from the market bytes and the RPC context slot. Without
  * them (a v2.1 market) a controller-written record still fails closed (`r3-unsupported`).
  */
@@ -96,8 +96,8 @@ export interface HedgedLockoutInput {
   /** The vault LP's ADL-effective signed position (Q; positive = long). */
   lpEffQ: bigint;
   /**
-   * v2.2: the market's engine `band_bps` and the slot of the read. Given, N_cap is the program's G8 capacity on the continuous
-   * curve (`growthCeilingView` + `nCapG8Q`, SDK); omitted (v2.1), the growth-1 `nCapQ(C_m, lambda)` and a controller (R3)
+   * v2.2: the market's engine `band_bps` and the slot of the read. Given, N_cap is the program's G8 capacity at the lagging
+   * κ / λ_depth dials (`growthCeilingView` + `nCapG8Q`, SDK); omitted (v2.1), the growth-1 `nCapQ(C_m, lambda)` and a controller (R3)
    * record fails closed.
    */
   v22?: { bandBps: number; nowSlot: bigint };
@@ -144,11 +144,14 @@ export function evaluateHedgedLockout(i: HedgedLockoutInput, t: HedgedLockoutThr
 
 /**
  * The program's G8 `N_cap` (Q) of a growth asset: `growthCeilingView` (clamp from band / r_gap, usable and cap depth at
- * `nowSlot`, tier = min(venue, book), the continuous-curve dials at min(venue, book) depth) then `nCapG8Q` with those dials,
+ * `nowSlot`, tier = min(venue, book), the lagging-curve κ / λ_depth dials at min(venue, book) depth, 21b8ccfd) then `nCapG8Q` with those dials,
  * i.e. `n_cap_g8_q_dials` as the gate, the TradeCpi clip and the rent snapshot read it. Stress does not enter N_cap. Pure.
  */
 export function g8NCapQ(growth: AssetGrowthV19, bandBps: number, nowSlot: bigint, cM: bigint, priceE6: bigint): bigint | null {
-  const view = growthCeilingView(growth, bandBps, nowSlot, cM, STRESS_NONE);
+  // rc23Caps: false keeps this reader on the wrapper 21b8ccfd semantics it is tested against. SDK 9aff57d (#433) defaults the rc23 kappa / lambda caps ON
+  // (kappa_eff 253 bps), which moves N_cap here by ~26x. Flip it (and the tests) together with the rc23 wrapper deploy -- an owner call, not part of the
+  // 16-byte key-tag fix (#219).
+  const view = growthCeilingView(growth, bandBps, nowSlot, cM, STRESS_NONE, undefined, { rc23Caps: false });
   return nCapG8Q({ clamp: view.clampEnforced, cM, lambdaBps: growth.lambdaBps, tier: view.tier, capDepth: view.capDepthE6, priceE6, dials: view.dials });
 }
 

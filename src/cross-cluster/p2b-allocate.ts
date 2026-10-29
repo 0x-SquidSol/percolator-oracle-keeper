@@ -110,7 +110,7 @@ export interface AllocateStats {
   walletLow: number;
 }
 
-export type AllocateConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses">;
+export type AllocateConnection = Pick<Connection, "getLatestBlockhash" | "simulateTransaction" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses">;
 
 export interface AllocateDeps {
   programId: PublicKey;
@@ -124,6 +124,12 @@ export interface AllocateDeps {
   now?: () => number;
   rand?: () => number;
   log?: (line: string) => void;
+  /**
+   * Leverage guard (night fix F1, KEEPER_LEV_POKE): awaited after a CLEAN simulation and immediately before the send (also in dry-run, where the hook
+   * itself only simulates and logs), so the guard's NAV sample is taken just before the allocation moves Earn principal into the LP. Must not throw
+   * (a throw is swallowed); absent = today's behaviour exactly. When it ran and the send is real, the transaction is re-signed on a fresh blockhash.
+   */
+  beforeSend?: (market: PublicKey, label: string) => Promise<void>;
 }
 
 /** The tag-103 cranker. One instance per process. */
@@ -277,13 +283,31 @@ export class VaultLpAllocator {
       this.log(`[p2b-allocate] ${snap.ref.label}: ${this.lastFail}`);
       return "failed";
     }
+    let sendBlockhash = blockhash;
+    let sendLastValid = lastValidBlockHeight;
+    if (this.deps.beforeSend) {
+      try {
+        await this.deps.beforeSend(snap.market, snap.ref.label);
+      } catch {
+        // the guard poke never blocks an allocation
+      }
+    }
     if (this.cfg.dryRun) {
       this.log(`[p2b-allocate] [DRY-RUN] ${snap.ref.label}: tag 103 would succeed (not sent)`);
       return "dry-run";
     }
+    if (this.deps.beforeSend) {
+      // the hook may have taken seconds: sign again on a fresh blockhash (the simulation above already passed)
+      const fresh = await conn.getLatestBlockhash("confirmed");
+      sendBlockhash = fresh.blockhash;
+      sendLastValid = fresh.lastValidBlockHeight;
+      tx.recentBlockhash = sendBlockhash;
+      tx.signatures = [];
+      tx.sign(keeper);
+    }
     const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 });
     this.stats.sent++;
-    const c = await confirmBySignature(conn, sig, blockhash, lastValidBlockHeight, this.deps.confirm);
+    const c = await confirmBySignature(conn, sig, sendBlockhash, sendLastValid, this.deps.confirm);
     if (c.status === "landed") {
       this.stats.landed++;
       this.log(`[p2b-allocate] ${snap.ref.label}: tag 103 landed sig=${sig.slice(0, 16)}… (simulated ${sim.value.unitsConsumed ?? "?"} CU of ${this.cfg.computeUnits})`);

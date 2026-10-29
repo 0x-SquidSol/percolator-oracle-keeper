@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     npm install -g pnpm@10.33.0
 
 COPY package.json pnpm-lock.yaml ./
+COPY vendor/ vendor/
 RUN pnpm install --frozen-lockfile --prod
 
 COPY tsconfig.json ./

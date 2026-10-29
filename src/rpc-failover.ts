@@ -25,8 +25,10 @@
  * logged loudly on transitions and `/health` reports `rpc-degraded` with the active endpoint.
  *
  * WEBSOCKETS: only `fetch` is wrapped. web3.js derives its websocket endpoint from the primary URL, so signature
- * subscriptions (confirmTransaction's default path) do not fail over. The keeper never subscribes (confirmation is
- * getSignatureStatuses polling through this seam, pinned to the sending endpoint); a new subscription user must poll.
+ * subscriptions (confirmTransaction's default path) do not fail over. So the keeper does not use them: confirmation is
+ * tx-confirm.ts confirmBySignature, getSignatureStatuses + getBlockHeight polling through this seam, pinned to the
+ * sending endpoint (A7-1: it used to wait inside confirmTransaction, gated on the primary's websocket). A new
+ * confirmTransaction / on*Change user must poll instead (only the uncalled pushAuthMark still calls confirmTransaction).
  *
  * SECRETS: endpoint URLs carry API keys (query string or path token). Nothing here logs or exposes a raw URL;
  * everything goes through `redactUrl` / `redactText`.

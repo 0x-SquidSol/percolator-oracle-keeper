@@ -85,7 +85,16 @@ function conn(pfs: Array<{ key: PublicKey; data: Buffer }>) {
     },
     async getSlot() { return 600_000_000; },
     async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 9 }; },
-    async simulateTransaction(_tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) {
+    async simulateTransaction(tx: VersionedTransaction, o?: { accounts?: { addresses: string[] } }) {
+      // The main cleanup also runs here (A6-1): inside force_close_delay_slots an unsigned CloseResolved is refused
+      // (ExpectedSigner 6), and tag 8 deregisters only an EMPTY portfolio (no claim, no open receipt, not the vault LP).
+      const keys = tx.message.staticAccountKeys;
+      for (const [i, ix] of tx.message.compiledInstructions.entries()) {
+        if (!keys[ix.programIdIndex].equals(WRAPPER)) continue;
+        const p = pfs.find((q) => q.key.equals(keys[ix.accountKeyIndexes[2]]));
+        const empty = !!p && isFinalizedReceiptOnly(p.data) && !REG.equals(new PublicKey(p.data.subarray(80, 112)));
+        if (ix.data[0] === 30 || (ix.data[0] === 8 && !empty)) return { context: { slot: 1 }, value: { err: { InstructionError: [i, { Custom: ix.data[0] === 30 ? 6 : 21 }] }, logs: [] } };
+      }
       if (o?.accounts) return { context: { slot: 1 }, value: { err: null, logs: [], accounts: [{ data: [market(materialized).toString("base64"), "base64"] }, { data: [Buffer.alloc(240, 9).toString("base64"), "base64"] }] } };
       return { context: { slot: 1 }, value: { err: null, logs: [] } };
     },
@@ -135,11 +144,20 @@ describe("late-finalize cleanup: receipt-only portfolios -> tag 8 -> 78 (junior 
 
   it("NEGATIVE CONTROL: step disabled -> nothing sent, market stays materialized (102 would be refused with 21)", async () => {
     const w = conn([{ key: Keypair.generate().publicKey, data: pf(WALLET, { present: true, finalized: true }) }]);
-    const r = await windDownOnce(w.conn, KEEPER, MARKET.toBase58(), false, CFG(false), new TerminalInsuranceState());
+    // A6-1: the main cleanup now runs on unbound markets too and would close it (tag 8 alone): turn it off as well.
+    const r = await windDownOnce(w.conn, KEEPER, MARKET.toBase58(), false, { ...CFG(false), cleanup: undefined }, new TerminalInsuranceState());
     assert.deepEqual(w.order, []);
     assert.equal(r.outcome.kind, "skipped");
     assert.equal(w.materialized(), 1n);
     assert.equal(isTerminalFlat(decodeTerminalState(market(w.materialized()))), false, "not terminal-flat: 78 skipped, junior 102 = 21");
+  });
+
+  it("A6-1: receipt step disabled, main cleanup on -> the main cleanup closes it on the unbound market (tag 8 alone)", async () => {
+    const w = conn([{ key: Keypair.generate().publicKey, data: pf(WALLET, { present: true, finalized: true }) }]);
+    const r = await windDownOnce(w.conn, KEEPER, MARKET.toBase58(), false, CFG(false), new TerminalInsuranceState());
+    assert.deepEqual(w.order, ["w8"], w.order.join(" | "));
+    assert.deepEqual(w.closedTo, [WALLET.toBase58()]);
+    assert.equal(r.outcome.kind, "done", JSON.stringify(r.outcome));
   });
 
   it("an NFT-escrowed receipt-only portfolio is closed too (no holder grace; [3] = the escrow PDA)", async () => {

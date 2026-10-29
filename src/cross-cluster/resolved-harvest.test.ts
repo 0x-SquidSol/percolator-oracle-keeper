@@ -62,8 +62,7 @@ function lpConn(reg: Buffer, mkt: Buffer, sendError?: Error, sim: "changes" | "s
       },
       async getLatestBlockhash() { return { blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 }; },
       async sendRawTransaction(raw: Buffer) { if (sendError) throw sendError; sent.push(Transaction.from(raw)); return "sig"; },
-      async confirmTransaction() { return { value: { err: null } }; },
-      async getSignatureStatuses() { return { value: [null] }; },
+      async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
     },
   };
 }

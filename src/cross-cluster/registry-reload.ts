@@ -39,7 +39,7 @@
 import fs from "fs";
 import { assertRegistryProgramSet, loadRegistry, registryProgramSet } from "./registry.ts";
 import type { MarketEntry, Registry } from "./registry.ts";
-import { validateMultiAssetEntry } from "./multi-asset.ts";
+import { registryRowProblems } from "./multi-asset.ts";
 
 export interface RegistryReloadConfig {
   /** Path to registry.json to poll. */
@@ -58,8 +58,9 @@ function sameEntry(a: MarketEntry, b: MarketEntry): boolean {
 /**
  * Reload `registryPath` from disk once and reconcile any differences into
  * `registry` in place. Never throws — a malformed or transiently unreadable
- * file is logged and skipped, leaving the in-memory registry untouched so a
- * bad/partial write can never blank out a healthy running keeper.
+ * file, a malformed row (registryRowProblems), or an empty market list while
+ * markets are tracked is logged and skipped, leaving the in-memory registry
+ * untouched so a bad/partial write can never blank out a healthy running keeper.
  *
  * Returns `{ added, removed, updated }` counts (all zero if nothing changed).
  */
@@ -77,9 +78,12 @@ export function reloadRegistryOnce(
     // v2.1 cutover: never hot-load the other world's registry into a running
     // keeper (an untagged file on both sides = v1 = unchanged behaviour).
     assertRegistryProgramSet(onDisk, registryProgramSet(registry), registryPath);
-    // K-6: a malformed multi-asset row is refused like a malformed file (the keeper never guesses a source).
-    const problems = onDisk.markets.flatMap((m) => validateMultiAssetEntry(m));
-    if (problems.length > 0) throw new Error(`invalid multi-asset row(s): ${problems.join("; ")}`);
+    // K-6 / A8-4: a malformed row is refused like a malformed file (the keeper never guesses a source or a key).
+    const problems = registryRowProblems(onDisk.markets);
+    if (problems.length > 0) throw new Error(`invalid registry row(s): ${problems.join("; ")}`);
+    if (onDisk.markets.length === 0 && registry.markets.length > 0) {
+      throw new Error(`the file lists no markets while ${registry.markets.length} are tracked (stop or restart the keeper to run with none)`);
+    }
   } catch (err) {
     console.warn(
       `[registry-reload] failed to read/parse ${registryPath} — keeping current in-memory registry: ` +

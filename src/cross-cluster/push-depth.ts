@@ -10,6 +10,7 @@
  * `KEEPER_PUSH_DEPTH` (default OFF). Off = byte-identical to the SDK's `encodePushAuthMark`.
  */
 import { encodePushAuthMark } from "@percolatorct/sdk";
+import { parseFlag } from "./v22/flags.ts";
 
 /** depth_mode value for "keeper-attested". */
 export const DEPTH_MODE_KEEPER_ATTESTED = 1;
@@ -21,10 +22,9 @@ const U64_MAX = (1n << 64n) - 1n;
 /** The only venue the keeper attests depth for: x*y=k pools. CLMM / DLMM and unknown venues send no depth. */
 export const DEPTH_SOURCE_PUMPSWAP_CPMM = "pumpswap-cpmm";
 
-/** `KEEPER_PUSH_DEPTH` is on only for an explicit "1" / "true" / "on" / "yes" (case-insensitive). Unset = OFF. */
+/** `KEEPER_PUSH_DEPTH`: on/1/true/yes or off/0/false/no (case-insensitive); unset = OFF; anything else throws (a typo never silently means off). */
 export function pushDepthEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const v = (env.KEEPER_PUSH_DEPTH ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
+  return parseFlag(env, "KEEPER_PUSH_DEPTH", false);
 }
 
 /** floor(sqrt(n)) for a non-negative bigint (Newton iteration, exact). */
