@@ -12,8 +12,10 @@ import {
   DEPTH_EVER,
   DEPTH_PREV_REAL,
   DEPTH_SOURCE,
+  KAPPA_TABLE_BPS,
   LAMBDA_DEPTH_TABLE_BPS,
   conservativeEquity,
+  curveLagU64,
   curveU64,
   decodeAssetBandStateV22,
   decodeAssetGrowthRecordV19,
@@ -209,39 +211,52 @@ function controllerRecord(o: { venueUsd: bigint; lambdaBps?: number; th?: [numbe
   return decodeAssetGrowthRecordV19(b)!;
 }
 
-describe("G8 N_cap on the continuous curve (v2.2 controller markets, wrapper e699d7da)", () => {
+describe("G8 N_cap on the contlev3 curve (v2.2 controller markets, wrapper 21b8ccfd: κ / λ_depth LAG, review M-1)", () => {
   const M = 1_000_000n;
   const BAND = 1_000;
   const NOW = 1_000n;
-  // venue $75k, LP C_m $40k at stored lambda 3x: book depth $40k, dials at min = $40k: kappa 1.0, lambda_depth 1.339x (curve);
-  // N_cap = min(C_m * min(3x, 1.339x), kappa * $75k) = $53.56k at price 1.0
-  const g = controllerRecord({ venueUsd: 75_000n });
-  const cM = 40_000n * M;
-  it("g8NCapQ = the program's n_cap_g8_q_dials at the curve dials (kappa 1.0, lambda_depth 1.339x at $40k)", () => {
+  // venue $40k (on-chain pool), LP C_m $100k at stored lambda 3x: book depth $100k, tier = min(venue 1, book 2) = 1.
+  // Dials = min over (venue, book) of the LAGGING curve: kappa = lag(40k) = 0.6695 (from 0.5 at T1 toward 1.0 at T2),
+  // lambda_depth = 1x (the lag curve holds 1x until T2). N_cap = min(C_m * min(3x, 1x), kappa * $40k) = $26.78k at price 1.0.
+  const g = controllerRecord({ venueUsd: 40_000n });
+  const cM = 100_000n * M;
+  it("g8NCapQ = the program's n_cap_g8_q_dials at the lagging dials (kappa 0.6695, lambda_depth 1x at $40k)", () => {
     const n = g8NCapQ(g, BAND, NOW, cM, 1_000_000n);
-    assert.equal(n, 53_560_000_000n);
-    const view = growthCeilingView(g, BAND, NOW, cM, 0);
-    assert.deepEqual(view.dials, { lSignalX100: 669, kappaBps: 10_000, lambdaDepthBps: 13_390 });
-    assert.equal(curveU64(40_000n * M, view.thresholdsE6, LAMBDA_DEPTH_TABLE_BPS), 13_390n);
-  });
-  it("NEGATIVE CONTROLS: growth-1 nCapQ(lambda) overstates it 2.24x; the old step / ramp dials (lambda_depth 1x at tier 1) understate it", () => {
-    assert.equal(nCapQ(cM, 30_000, 1_000_000n), 120_000_000_000n);
-    const view = growthCeilingView(g, BAND, NOW, cM, 0);
-    const step = nCapG8Q({ clamp: true, cM, lambdaBps: 30_000, tier: view.tier, capDepth: view.capDepthE6, priceE6: 1_000_000n });
+    assert.equal(n, 26_780_000_000n);
+    const view = growthCeilingView(g, BAND, NOW, cM, 0, undefined, { rc23Caps: false });
     assert.equal(view.tier, 1);
-    assert.equal(step, 40_000_000_000n);
-    assert.notEqual(step, g8NCapQ(g, BAND, NOW, cM, 1_000_000n));
+    assert.deepEqual(view.dials, { lSignalX100: 669, kappaBps: 6_695, lambdaDepthBps: 10_000 });
+    assert.equal(curveLagU64(40_000n * M, view.thresholdsE6, KAPPA_TABLE_BPS), 6_695n);
+    assert.equal(curveLagU64(40_000n * M, view.thresholdsE6, LAMBDA_DEPTH_TABLE_BPS), 10_000n);
   });
-  it("with v22 state a controller record is evaluated (never r3-unsupported): users at 50k each side = 93.35% of the curve N_cap, LP flat -> ALERT", () => {
-    const users = 50_000_000_000n;
+  it("NEGATIVE CONTROLS: growth-1 nCapQ(lambda) overstates it 11.2x; the round-2 step and 3198539a's leading-curve dials overstate it 1.49x", () => {
+    assert.equal(nCapQ(cM, 30_000, 1_000_000n), 300_000_000_000n);
+    const view = growthCeilingView(g, BAND, NOW, cM, 0, undefined, { rc23Caps: false });
+    const step = nCapG8Q({ clamp: true, cM, lambdaBps: 30_000, tier: view.tier, capDepth: view.capDepthE6, priceE6: 1_000_000n });
+    assert.equal(step, 40_000_000_000n);
+    // 3198539a: κ / λ_depth on the LEADING curve (kappa 1.0, lambda_depth 1.339x at $40k)
+    const th = view.thresholdsE6;
+    const lead = (t: readonly [bigint, bigint, bigint, bigint]): number => {
+      const a = curveU64(40_000n * M, th, t);
+      const b = curveU64(100_000n * M, th, t);
+      return Number(a < b ? a : b);
+    };
+    const old = nCapG8Q({ clamp: true, cM, lambdaBps: 30_000, tier: view.tier, capDepth: view.capDepthE6, priceE6: 1_000_000n, dials: { kappaBps: lead(KAPPA_TABLE_BPS), lambdaDepthBps: lead(LAMBDA_DEPTH_TABLE_BPS) } });
+    assert.deepEqual([lead(KAPPA_TABLE_BPS), lead(LAMBDA_DEPTH_TABLE_BPS)], [10_000, 13_390]);
+    assert.equal(old, 40_000_000_000n);
+    const n = g8NCapQ(g, BAND, NOW, cM, 1_000_000n)!;
+    assert.ok(n < step && n < old, "the lagging N_cap is never looser than the step (M-1)");
+  });
+  it("with v22 state a controller record is evaluated (never r3-unsupported): users at 25k each side = 93.35% of the lagging N_cap, LP flat -> ALERT", () => {
+    const users = 25_000_000_000n;
     const v = evaluateHedgedLockout({ growth: g, cM, priceE6: 1_000_000n, oiEffLongQ: users, oiEffShortQ: users, lpEffQ: 0n, v22: { bandBps: BAND, nowSlot: NOW } }, T);
     assert.equal(v.status, "alert");
-    assert.equal(v.nCapQ, 53_560_000_000n);
+    assert.equal(v.nCapQ, 26_780_000_000n);
     assert.equal(v.utilLongBps, 9_335n);
-    // the same OI under growth-1 lambda N_cap would read 41.66%: no alert (the blind spot this closes)
+    // the same OI under growth-1 lambda N_cap would read 8.33%: no alert (the blind spot this closes)
     const blind = evaluateHedgedLockout({ growth: { ...g, r3Layout: false }, cM, priceE6: 1_000_000n, oiEffLongQ: users, oiEffShortQ: users, lpEffQ: 0n }, T);
     assert.equal(blind.status, "ok");
-    assert.equal(blind.utilLongBps, 4_166n);
+    assert.equal(blind.utilLongBps, 833n);
     // and without v22 state the controller record still fails closed
     assert.equal(evaluateHedgedLockout({ growth: g, cM, priceE6: 1_000_000n, oiEffLongQ: users, oiEffShortQ: users, lpEffQ: 0n }, T).status, "r3-unsupported");
   });

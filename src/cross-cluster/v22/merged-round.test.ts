@@ -220,10 +220,11 @@ describe("MERGED_ROUND: single-asset markets are byte-identical", () => {
     assert.ok(eq(f.sentData[0][0], HINT0));
   });
 
-  it("buildSweepTxIxs on a single-asset market: accrue none is all hint-less (unchanged)", () => {
+  it("buildSweepTxIxs on a single-asset market: accrue none observes first (hint {0}), the rest hint-less (A5-1)", () => {
     bindObservationRegistry(() => [SINGLE_ROW]);
     const ixs = buildSweepTxIxs(owner, MARKET, { accrue: "none", accrueTarget: null, refresh: [cp(GV86), cp(OTHER)] });
-    assert.ok(ixs.every((i) => eq(i.data, NO_HINT)));
+    assert.ok(eq(ixs[0].data, HINT0));
+    assert.ok(eq(ixs[1].data, NO_HINT));
     const lp = buildSweepTxIxs(owner, MARKET, { accrue: "lp", accrueTarget: LP, refresh: [cp(GV86)] });
     assert.ok(eq(lp[0].data, HINT0));
     assert.ok(eq(lp[1].data, NO_HINT));

@@ -16,8 +16,13 @@ export interface SweepDelegateArgs {
   dryRun: boolean;
 }
 
-/** Returns true when the v2.2 layer handled the market this cycle (the legacy per-market cycle then returns). */
-export type SweepDelegate = (a: SweepDelegateArgs) => Promise<boolean>;
+/**
+ * true = the v2.2 layer handled the market this cycle (the legacy per-market cycle then returns). false = it declined and
+ * the legacy accrual crank runs. "clock-only" = it declined while the lone vault-LP crank is suppressed: the legacy cycle
+ * may repair and catch up, never send its accrual crank (that crank settles the vault LP alone). A catch-up crank returns
+ * before settling anyone only while an observed asset can accrue (Active / DrainOnly); see the README v2.2 section.
+ */
+export type SweepDelegate = (a: SweepDelegateArgs) => Promise<boolean | "clock-only">;
 
 const state = {
   sweep: null as SweepDelegate | null,

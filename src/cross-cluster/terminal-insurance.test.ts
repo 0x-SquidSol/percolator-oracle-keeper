@@ -239,7 +239,7 @@ describe("windDownOnce — resolved stake-bound market", () => {
 
   it("budget already 0: step 2 (amount 0) books; Custom(31) means done and the market is not touched again", async () => {
     const st = new TerminalInsuranceState();
-    const s = stub(resolved("textit", 0n), TEXTIT, "textit", probeOk(-1n, () => ({ err: { InstructionError: [1, { Custom: 31 }] } })));
+    const s = stub(resolved("textit", 0n, 0n), TEXTIT, "textit", probeOk(-1n, () => ({ err: { InstructionError: [1, { Custom: 31 }] } })));
     const r = await windDownOnce(s.conn, KEEPER, TEXTIT.toBase58(), false, CFG, st);
     assert.equal(r.outcome.kind, "nothing");
     assert.ok(s.calls.sims.every((c) => c.amount === 0n));

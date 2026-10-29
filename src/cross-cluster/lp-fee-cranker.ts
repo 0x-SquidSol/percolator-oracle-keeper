@@ -124,7 +124,7 @@ function extractErrorCode(err: unknown): number | null {
 /** The Connection surface the LP-fee crank uses (stubbable in tests). */
 export type LpFeeConnection = Pick<
   Connection,
-  "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "confirmTransaction" | "getSignatureStatuses" | "simulateTransaction"
+  "getMultipleAccountsInfo" | "getLatestBlockhash" | "sendRawTransaction" | "getBlockHeight" | "getSignatureStatuses" | "simulateTransaction"
 > &
   /** Read only when tag 78 answers OracleStale, to confirm the stale-resolve wait (R3.20). */
   Partial<Pick<Connection, "getSlot">>;

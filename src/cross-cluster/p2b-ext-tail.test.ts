@@ -79,8 +79,7 @@ function rig(s: Script) {
       sent.push(tx);
       return "sig";
     },
-    async confirmTransaction() { return { value: { err: null } }; },
-    async getSignatureStatuses() { return { value: [null] }; },
+    async getSignatureStatuses() { return { value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: "confirmed" }] }; },
   };
   return { conn, sent, attempts, reads };
 }

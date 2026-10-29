@@ -406,17 +406,19 @@ describe("item 13 (F-5): the sweep delegate only claims a market it actually ran
     return { f, loop: new V22Loop({ conn: f.conn as never, keeper: Keypair.generate(), programId: WRAPPER_PROGRAM_ID, markets: () => [entry], flags: v22FlagsFromEnv({ KEEPER_V22: "on", KEEPER_V22_SWEEP: "on" }), dryRun: false, log: () => {} }) };
   };
   const args = (f: ReturnType<typeof loopFor>["f"]) => ({ conn: f.conn as never, keeper: Keypair.generate(), entry, marketData: v22MarketBytes(), slot: 5000, dryRun: false });
-  it("handled (true) only on a normal run; false for no LP, non-Active, unreadable and error paths", async () => {
+  // LF: with pairing on (the default) a decline is "clock-only": the legacy cycle still runs (repairs, catch-up) but never
+  // its LP accrual crank. `false` (the legacy accrual crank too) is left to pairing off.
+  it("handled (true) only on a normal run; declines for no LP, non-Active, unreadable and error paths", async () => {
     const lp = key(901);
     const good = loopFor({ market: v22MarketBytes(), registry: registryBytes({ bound: true }), vaultLpState: vaultLpStateBytes(lp) });
     assert.equal(await good.loop.sweepDelegate(args(good.f)), true);
     assert.ok(good.f.sims.length > 0);
     const noLp = loopFor({ market: v22MarketBytes(), registry: registryBytes({ bound: false }) });
-    assert.equal(await noLp.loop.sweepDelegate(args(noLp.f)), false, "no vault LP: the legacy accrual crank must still run");
+    assert.equal(await noLp.loop.sweepDelegate(args(noLp.f)), "clock-only", "no vault LP: the legacy cycle still runs, without the LP accrual");
     const resolved = loopFor({ market: v22MarketBytes({ lifecycle: 5 }), registry: registryBytes({ bound: true }), vaultLpState: vaultLpStateBytes(lp) });
-    assert.equal(await resolved.loop.sweepDelegate(args(resolved.f)), false, "not Active / DrainOnly");
+    assert.equal(await resolved.loop.sweepDelegate(args(resolved.f)), "clock-only", "not Active / DrainOnly");
     const broken = loopFor({ market: v22MarketBytes(), throwOnRead: true });
-    assert.equal(await broken.loop.sweepDelegate(args(broken.f)), false, "an unreadable market");
+    assert.equal(await broken.loop.sweepDelegate(args(broken.f)), "clock-only", "an unreadable market");
   });
 });
 

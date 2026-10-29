@@ -134,11 +134,11 @@ import {
   selectPositionedPortfolios,
 } from "./positioned-refresh.ts";
 import type { LegCostModel } from "./positioned-refresh.ts";
-import { countLayoutProblem, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
+import { countLayoutProblem, getCrankRefreshHealth, holdPushes, releasePushes, setCrankRefreshHealth } from "./refresh-coordination.ts";
 import { getSweepDelegate } from "./v22/delegation.ts";
 import { observationAssetsFor, recordMarketAccrual, refreshStateForMarket } from "./multi-asset.ts";
 import { formatProgramError } from "./v22/errors.ts";
-import type { MarketLayoutHealth } from "./refresh-coordination.ts";
+import type { CrankRefreshHealth, MarketLayoutHealth } from "./refresh-coordination.ts";
 import { SDK_PORTFOLIO_LENS, describeUnknownLayout, detectLayout } from "./market-layout.ts";
 import type { LayoutDetection } from "./market-layout.ts";
 import {
@@ -650,11 +650,24 @@ export async function crankOneMarket(
      * crank-health record (the v2.2 layer publishes that). It used to fall through to the legacy layout check and raise
      * "variant-B market on the legacy cranker" every time 2xhs backed off (flapping layoutProblemMarkets).
      * Without the v2.2 layer (no delegate) a variant-B market still gets the loud "unsupported" verdict, as before.
+     * LF: the accrual crank targets the vault LP and settles it ALONE. When the delegate answers "clock-only" (the lone LP
+     * crank is suppressed: pairing on, or VAULT_LP_LONE_CRANK=off) it is left out: liveness repairs and catch-up cranks
+     * only, so the clock lags up to about one accrual window plus a cycle and catches up in whole windows. (A
+     * catch-up crank stops before the portfolio only while an observed asset can accrue; with none, it reaches the LP.)
      */
     const v22Owned = sweepDelegate !== null && detection.known && detection.layout.id === "v2.2-b";
+    let clockOnly = false;
     if (v22Owned) {
       const handled = await sweepDelegate({ conn: devnetConn, keeper, entry, marketData: acct.value.data, slot: acct.context.slot, dryRun });
-      if (handled) return;
+      clockOnly = handled === "clock-only";
+      if (handled === true) {
+        // v22price 2026-10-22: the v2.2 layer cranked this cycle, so a legacy revert from an earlier fallthrough (e.g. the
+        // boot catch-up) is over. Without this the cranker's `~drift(rev:1 cons:1)` stayed on the health line forever.
+        if (state.consecutiveReverts > 0) console.log(`[cranker] ${label}: legacy revert streak (${state.consecutiveReverts}) cleared: the v2.2 layer owns and cranked this market`);
+        state.consecutiveReverts = 0;
+        state.lastRevertCode = null;
+        return;
+      }
     }
     let pre: MarketRefreshState | null = null;
     if (detection.known) {
@@ -725,12 +738,13 @@ export async function crankOneMarket(
     const build = (t: ReadonlyArray<PositionedPortfolio>): CrankPlan =>
       sweepCtx
         ? planSweepTx({ owner: keeper.publicKey, market, lpPortfolio, targets: t, cfg: sweepCfg, catchup, repairs, liquidateTargets, cost: legCost })
-        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets, cost: legCost, lp: lpEntry });
+        : planCrankTx({ owner: keeper.publicKey, market, lpPortfolio, catchup, refreshTargets: t, repairs, liquidateTargets, cost: legCost, lp: lpEntry, accrue: !clockOnly });
+    if (clockOnly && build(targets).cranks.length === 0) return; // no repair due and not a window behind: nothing to send
 
     if (dryRun) {
       const plan = build(targets);
       console.log(
-        `[cranker][DRY-RUN] ${label}: catchup=${catchup} accrue=${lpPortfolio.toBase58().slice(0, 8)}… ` +
+        `[cranker][DRY-RUN] ${label}: catchup=${catchup} accrue=${clockOnly ? "none (v2.2 clock-only)" : `${lpPortfolio.toBase58().slice(0, 8)}…`} ` +
           `refresh=[${plan.cranks.filter((c) => c.kind === "refresh").map((c) => c.portfolio.toBase58().slice(0, 8)).join(",")}]` +
           (sweepCtx ? ` sweep=${sweepCtx.pace.level} k=${sweepCtx.pace.k} txs=${sweepCtx.pace.txs} ratio=${sweepCtx.coverage.ratio}` : ""),
       );
@@ -812,6 +826,8 @@ export async function crankOneMarket(
         }
       }
     }
+
+    if (resolved.plan.cranks.length === 0) return; // LF: every repair dropped and no accrual crank: nothing to send
 
     if (resolved.sim.err && isDuplicateOfLandedTx(resolved.sim.err)) {
       // R3.22b: "AlreadyProcessed" = this exact transaction (same cached blockhash, same instructions) already landed,
@@ -1136,8 +1152,8 @@ export function layoutHealthFor(
   // 9,563 B for VERSION 18, 10,603 B for VERSION 19). An explicit argument overrides it (tests).
   // v2.2 variant B is NEVER driven by this legacy path (its [LP crank, refresh xN] sweep settles the LP in every tx, the
   // shape SETTLE_PAIRING exists to avoid). The v2.2 layer takes the market through the sweep delegate BEFORE this
-  // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP, or the delegate declined) gets the
-  // accrual-only crank and a loud "unsupported" status (security review F-1 / F-5).
+  // verdict is reached; anything that gets here (no KEEPER_V22 / KEEPER_V22_SWEEP) gets the accrual-only crank and a loud
+  // "unsupported" status (security review F-1 / F-5). A cycle the delegate declined uses `v22OwnedLayoutHealth` instead.
   if (L.id === "v2.2-b") {
     return {
       id: L.id,
@@ -1875,6 +1891,76 @@ export function crankSample(label: string, market: string, st: Pick<CrankMarketS
   };
 }
 
+/** GH#181: how stale the v2.2 layer's record may be and still be evaluated. */
+export const V22_HEALTH_MAX_AGE_MS = 120_000;
+
+/**
+ * GH#181: a crank-health sample built from the v2.2 layer's PUBLISHED refresh-health record.
+ *
+ * A v2.2-owned market returns from `crankMarketOnce` before `observed` is ever assigned (the
+ * sweep delegate owns it), so `st.obs` is null and `crankSample` yields nothing. The v2.2 layer
+ * publishes a full record instead -- but nothing evaluated it, so eight alert kinds could not
+ * fire for any v2.2 market. This adapts that record so `evaluateCrankHealth` can run on it.
+ *
+ * The record does not carry crank counters, lapsed-bucket counts or bankruptcy counts, so those
+ * are filled with values that CANNOT trigger their alerts (0 reverts, 0 lapsed, 0 bankrupt)
+ * rather than guessed. Restoring `crank-reverts`, `lapsed-bucket` and `bankrupt-unliquidated`
+ * needs the v2.2 round to define those counters, which is a semantic call, not a translation.
+ *
+ * `slot-lag` IS restored: the record now carries the slot pair. When it does not (a record from
+ * before that field), `engineSlot` is null and `slotLag` returns null -- no verdict, never a
+ * wrong one.
+ *
+ * Returns null for a missing or stale record. A stale record means the v2.2 loop has stopped
+ * publishing, which is the watchdog gap in the second half of #181 and deliberately NOT papered
+ * over here: alerting on frozen numbers would be worse than the current silence.
+ */
+export function v22CrankSample(
+  label: string,
+  market: string,
+  h: CrankRefreshHealth | undefined,
+  nowMs: number,
+  maxAgeMs: number = V22_HEALTH_MAX_AGE_MS,
+): CrankHealthSample | null {
+  if (!h) return null;
+  if (nowMs - h.updatedAt > maxAgeMs) return null;
+  const hasSlots = h.chainSlot !== undefined;
+  return {
+    label,
+    market,
+    chainSlot: h.chainSlot ?? 0n,
+    engineSlot: hasSlots ? (h.engineSlot ?? null) : null,
+    crankOk: true,
+    crankReverted: false,
+    totalOk: 0,
+    totalReverts: 0,
+    consecutiveReverts: 0,
+    lastRevertCode: null,
+    lapsedBuckets: 0,
+    bankruptFound: 0,
+    bankruptLiquidated: 0,
+    staleLong: h.staleLong,
+    staleShort: h.staleShort,
+    positioned: h.positioned,
+    overflow: h.overflow,
+    overflowRefreshed: h.overflowRefreshed,
+    lossStaleCycles: h.lossStaleCycles,
+    ...(h.layout ? { layout: h.layout } : {}),
+    ...(h.sweep ? { sweep: h.sweep } : {}),
+    ...(h.adl
+      ? {
+          adl: {
+            reduceOnly: h.adl.reduceOnly,
+            aLong: BigInt(h.adl.aLong),
+            aShort: BigInt(h.adl.aShort),
+            oiEffLong: BigInt(h.adl.oiEffLong),
+            oiEffShort: BigInt(h.adl.oiEffShort),
+          },
+        }
+      : {}),
+  };
+}
+
 /**
  * Evaluate every market's latest observation, reconcile alerts, and every
  * HEALTH_LINE_EVERY_CYCLES cycles print one `[health]` line. Observations are
@@ -1892,7 +1978,12 @@ export async function reportCrankHealth(
   for (const m of registry.markets) {
     const st = states.get(m.marketAddress);
     if (!st) continue;
-    const sample = crankSample(m.label, m.marketAddress, st);
+    // GH#181: a v2.2-owned market has no observation of its own (the sweep delegate owns it and
+    // this function's caller returns before `observed` is set), so fall back to the record the
+    // v2.2 layer publishes. Without this, evaluateCrankHealth never runs for any v2.2 market.
+    const sample =
+      crankSample(m.label, m.marketAddress, st) ??
+      v22CrankSample(m.label, m.marketAddress, getCrankRefreshHealth(m.marketAddress), Date.now());
     if (!sample) continue;
     const ev = evaluateCrankHealth(sample, st.streaks, sink.thresholds);
     st.streaks = ev.streaks;

@@ -134,6 +134,7 @@ export interface PairingStats {
   lpTimeBoundRounds: number;
   /** Accrue went through a counterparty because the market had no keeper-owned flat anchor. */
   counterpartyAccrues: number;
+  /** A landed or simulated Custom(22) was retried refresh-only (the accrue dropped). */
   accrueAlreadyDone: number;
   protectiveRounds: number;
   rentSettlesInRound: number;
@@ -153,6 +154,8 @@ export interface PairingStats {
   mergedRounds: number;
   mergedFallbacks: number;
   mergedDroppedCurrent: number;
+  /** LF: cycles the v2.2 layer declined while the lone LP crank is suppressed: the legacy fallback ran without its LP accrual crank (includes every cycle of a market whose asset 0 is not Active / DrainOnly). */
+  declinedClockOnly: number;
 }
 
 const zeroStats = (): PairingStats => ({
@@ -161,7 +164,7 @@ const zeroStats = (): PairingStats => ({
   lastGapSlots: null, maxGapSlots: 0, bandExpected: 0, prunedCurrent: 0, hardRefusals: 0, quarantinedNow: 0,
   anchorAccrues: 0, anchorFallbacks: 0, quarantineCapped: 0, deferralEscalations: 0, lpTimeBoundRounds: 0, counterpartyAccrues: 0, accrueAlreadyDone: 0, protectiveRounds: 0, rentSettlesInRound: 0, shrinkDeferrals: 0,
   feeAfterRound: 0, feeUnpairedLpSettles: 0, liqIncluded: 0, liqLanded: 0, liqNothingToDo: 0, liqRefused: 0, liqDeferred: 0, liqSkipped: 0,
-  mergedRounds: 0, mergedFallbacks: 0, mergedDroppedCurrent: 0,
+  mergedRounds: 0, mergedFallbacks: 0, mergedDroppedCurrent: 0, declinedClockOnly: 0,
 });
 
 export const pairingStats: PairingStats = zeroStats();
@@ -243,7 +246,7 @@ export interface RoundResult {
   /** Counterparties not settled this round, with why. */
   missing: Array<{ key: string; why: "quarantined" | PruneReason | "unlanded" | "unplanned" }>;
   rentSettled: string[];
-  /** The round was skipped for a gap backoff: nothing ran (the delegate must decline so the legacy accrual crank runs). */
+  /** The round was skipped for a gap backoff: nothing ran (the loop then sends one accrue-only crank, never on the LP). */
   backedOff: boolean;
   /** The program refused an anchor accrue this round (the caller drops the anchor for a while). */
   anchorRefused: boolean;
@@ -290,11 +293,12 @@ export function buildSweepTxSlots(owner: PublicKey, market: PublicKey, tx: Build
     slots.push({ ix: buildObservationCrankIx(owner, market, tx.accrueTarget, tx.oracleAccounts ?? []), kind: "accrue", key: k });
     if (tx.accrue === "counterparty" && liq.has(k)) slots.push({ ix: buildRefreshCrankIx(owner, market, tx.accrueTarget), kind: "liq", key: k });
   }
-  // MULTI-ASSET: a hint-less crank is valid ONLY in the same tx/slot as an observing crank. In a LATER slot it accrues just the
-  // portfolio's first leg's asset and advances the market clock, which makes every other exposed asset loss-stale. So an
-  // `accrue: "none"` tx (the "accrue answered 22, re-send refresh-only" path) never starts with a hint-less crank on a multi-asset
-  // market: its FIRST crank is an observing one carrying a hint for every listed asset. Single-asset markets are unchanged.
-  const firstObserves = tx.accrue === "none" && isMultiAssetMarket(market.toBase58());
+  // A hint-less crank is valid ONLY in the same tx/slot as an observing crank. In a LATER slot it answers Custom(22) for a STALE
+  // portfolio (Hybrid: no report this slot; price-managed: a pending move / funding, v16_program.rs ~:14104 / ~:14146), the same
+  // code as for a current one; on a multi-asset market it also accrues just the first leg's asset and makes every other exposed
+  // asset loss-stale. So an `accrue: "none"` tx (the "accrue answered 22, re-send refresh-only" path) never starts with a
+  // hint-less crank: its FIRST crank is an observing one (multi-asset: a hint for every listed asset).
+  const firstObserves = tx.accrue === "none";
   let first = true;
   for (const p of tx.refresh) {
     const k = p.pubkey.toBase58();
@@ -325,6 +329,8 @@ interface TxRun {
   anchorRefused: boolean;
   /** F1: liquidation-crank attempts of this tx. */
   liq: LiqRecord[];
+  /** Earlier sends of this tx that landed FAILED and were re-simulated (kept so outcomes / txsSent show every send). */
+  retried: ExecOutcome[];
 }
 
 /** F1 settings of one planned tx. `candidates` are the Stage A candidates of the round (liquidation.ts). */
@@ -368,6 +374,7 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
   const liqLog: LiqRecord[] = [];
   let chosen = new Map<string, FlaggedAccount>();
   let activeSlots: SweepSlot[] = [];
+  const retried: ExecOutcome[] = [];
   const emit = deps.exec.log ?? ((l: string) => console.log(l));
   const liqNote = (key: string, result: LiqRecord["result"], code: number | null, note: string) => {
     liqLog.push({ key, result, code, note });
@@ -404,6 +411,7 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     droppedAccrue,
     anchorRefused,
     liq: liqLog,
+    retried,
   });
   for (let attempt = 0; attempt <= budget; attempt++) {
     const hasAccrue = accrue !== "none" && target !== null;
@@ -411,7 +419,11 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
     activeSlots = buildSweepTxSlots(owner, ctx.market, plainArgs);
     const ixs = activeSlots.map((sl) => sl.ix);
     chosen = new Map();
-    if (ixs.length === 0) return { outcome: { kind: "dry-run", unitsConsumed: null, logs: [], ixCount: 0 }, settled: [], pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog };
+    // Every crank was pruned: nothing goes out. Live, that is not a landed tx (an LP tx that sent nothing never settled the LP).
+    if (ixs.length === 0) {
+      if (!deps.exec.dryRun) return fail({ kind: "failed", error: "every crank of the tx was pruned: nothing sent" });
+      return { outcome: { kind: "dry-run", unitsConsumed: null, logs: [], ixCount: 0 }, settled: [], pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog, retried };
+    }
     const cands = candidatesIn();
     /** Stage B: from the post-refresh state the plain simulation returned, the extended instruction list (or null: send the plain tx). */
     const extendWithLiquidations = (post: ReadonlyArray<Uint8Array | null>, cs: ReadonlyArray<PositionedPortfolio>): TransactionInstruction[] | null => {
@@ -444,7 +456,8 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
         }
       });
       if (flagged.length === 0) return null;
-      const fit = fitLiquidations({ flagged, baseCu: estimateBaseCu(accrue !== "none", refresh) + (accrue === "counterparty" ? 114_000 : 0), maxPerTx: liqCfg.maxPerTx });
+      // a refresh-only tx accrues too: its first crank observes (buildSweepTxSlots), so the accrue cost replaces that refresh's
+      const fit = fitLiquidations({ flagged, baseCu: estimateBaseCu(accrue !== "none" || refresh.length > 0, accrue === "none" ? refresh.slice(1) : refresh) + (accrue === "counterparty" ? 114_000 : 0), maxPerTx: liqCfg.maxPerTx });
       for (const d of fit.deferred) {
         pairingStats.liqDeferred++;
         liqNote(d.account.portfolio.pubkey.toBase58(), "deferred", null, `at or below maintenance (${d.account.ratioBps} bps of notional) but not added to this tx: ${d.why}`);
@@ -532,7 +545,7 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
         }
         liqNote(k, landed ? "landed" : "simulated", null, `${landed ? "liquidation crank landed" : "liquidation crank simulated OK (dry-run: not sent)"} with the refresh in one tx; margin ${f.ratioBps} bps of notional after the refresh`);
       }
-      return { outcome, settled: settledKeys(), pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog };
+      return { outcome, settled: settledKeys(), pruned, unlanded: [], noCodeKeys: [...culprits], droppedAccrue, anchorRefused, liq: liqLog, retried };
     }
     // F1: a tx WITH liquidation cranks landed but failed. The code cannot say which crank failed, so never reason about it:
     // drop every liquidation crank and re-send the plain refresh (the price push and the refresh must never wait on a liquidation).
@@ -542,10 +555,14 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
         pairingStats.liqSkipped++;
         liqNote(k, "skipped", outcome.failCode, "the tx with the liquidation crank landed but failed; re-sending the plain refresh");
       }
+      retried.push(outcome);
       continue;
     }
-    // A landed tx that failed on its accrue crank with Custom(22): another tx accrued this slot. Continue refresh-only.
+    // A landed tx that failed with Custom(22), at an instruction the code does not name: another tx in that slot accrued the
+    // market and settled the accrue target or a refreshed portfolio. Re-simulate once, refresh-only: the first crank observes
+    // (buildSweepTxSlots), so in the new slot it accrues, and a portfolio that is now current is refused at its own index.
     if (outcome.kind === "sent" && outcome.landed === "failed" && outcome.failCode === NON_PROGRESS && hasAccrue && !droppedAccrue) {
+      retried.push(outcome);
       pairingStats.accrueAlreadyDone++;
       ({ accrue, target, refresh } = dropAccrue(t, accrue, target, refresh));
       droppedAccrue = true;
@@ -648,9 +665,10 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
       }
       return fail(outcome);
     }
-    // Multi-asset refresh-only tx: its first crank observes (see buildSweepTxSlots). Custom(22) there means the market clock is
-    // already current in this slot, NOT that the portfolio is current: nothing is pruned or counted settled; try next tick.
-    if (!hasAccrue && idx === 0 && refused.code === NON_PROGRESS && isMultiAssetMarket(ctx.market.toBase58())) return fail(outcome);
+    // Refresh-only tx: its first crank observes (see buildSweepTxSlots). Custom(22) there means the market clock is already
+    // current in this slot (or, Hybrid, no report this slot), NOT that the portfolio is current: nothing is pruned or counted
+    // settled; try next tick.
+    if (!hasAccrue && idx === 0 && refused.code === NON_PROGRESS) return fail(outcome);
     const refreshIdx = hasAccrue ? idx - 1 : idx;
     const victim = refresh[refreshIdx];
     if (!victim) return fail(outcome); // a refusal on the tail instruction (e.g. 78): the caller classifies it
@@ -665,9 +683,10 @@ export async function runPlannedTx(deps: SweepDeps, ctx: { market: PublicKey; la
 }
 
 function dropAccrue(t: PlannedTx, accrue: PlannedTx["accrue"], target: PublicKey | null, refresh: PositionedPortfolio[]) {
-  // refresh-only: the accrue target that was also a SETTLE (LP, counterparty) becomes a plain refresh
+  // refresh-only: the accrue target that was also a SETTLE (LP, counterparty) becomes a plain refresh, LAST: it may have just
+  // answered 22 (current, slot already accrued), and as the observing first crank it would answer 22 again in that slot
   let r = refresh;
-  if (target && (accrue === "lp" || accrue === "counterparty")) r = [{ pubkey: target, longLegs: 0, shortLegs: 0, isLp: accrue === "lp" }, ...refresh];
+  if (target && (accrue === "lp" || accrue === "counterparty")) r = [...refresh, { pubkey: target, longLegs: 0, shortLegs: 0, isLp: accrue === "lp" }];
   void t;
   return { accrue: "none" as PlannedTx["accrue"], target: null as PublicKey | null, refresh: r };
 }
@@ -872,7 +891,10 @@ export async function runSettleRound(
       if (miss.length > 0 && cfg.pairing === "strict") return `strict: ${miss.length} counterparties were refused or skipped; the LP waits`;
       return null;
     };
+    const lpKey = input.lp.toBase58();
     const record = (r: TxRun) => {
+      res.outcomes.push(...r.retried);
+      res.txsSent += r.retried.length;
       res.outcomes.push(r.outcome);
       res.liq.push(...r.liq);
       res.pruned += r.pruned.length;
@@ -896,8 +918,9 @@ export async function runSettleRound(
         res.missing.push({ key: k, why: "hard" });
       };
       for (const p of r.pruned) {
-        if (p.reason === "current") res.settled.push(p.key);
-        else if (p.reason === "deferred" && escalatedNow.has(p.key)) escalate(p.key);
+        if (p.reason === "current") {
+          if (p.key !== lpKey) res.settled.push(p.key); // the LP counts only when a landed tx cranked it (lpLanded below)
+        } else if (p.reason === "deferred" && escalatedNow.has(p.key)) escalate(p.key);
         else {
           res.missing.push({ key: p.key, why: p.reason });
           if (p.reason === "band" || p.reason === "hard") q(p.key, p.code);
@@ -985,6 +1008,9 @@ export async function runSettleRound(
     const p1 = await Promise.all(phase1.map(run));
     p1.forEach(record);
     const okRun = (r: TxRun) => (r.outcome.kind === "sent" && r.outcome.landed === "landed") || r.outcome.kind === "dry-run";
+    // The LP is settled only by a landed tx that still cranks it. One pruned "current" in a simulation slot may be stale again
+    // by the slot the tx lands in (a moved mark), so a landed tx without the LP's crank is not an LP settle.
+    const lpLanded = (r: TxRun) => okRun(r) && !r.pruned.some((p) => p.key === lpKey);
     const lastLanded = Math.max(0, ...p1.map((r) => (r.outcome.kind === "sent" ? r.outcome.landedSlot ?? 0 : 0)));
     const noteLp = (landedOk: boolean) => {
       res.lpSettled = landedOk;
@@ -996,7 +1022,7 @@ export async function runSettleRound(
 
     if (lpIsInPhase1) {
       const lpRun = p1[phase1.indexOf(plan.lpTxIndex as number)];
-      noteLp(okRun(lpRun));
+      noteLp(lpLanded(lpRun));
       if (lpRun.outcome.kind === "held") {
         if (lpRun.outcome.reason.startsWith("strict")) pairingStats.lpHeldCounterpartyMiss++;
         else pairingStats.lpHeldPhase1Unlanded++;
@@ -1031,7 +1057,7 @@ export async function runSettleRound(
       }
       const lpRun = await runPlannedTx(deps, ctx, plan.txs[phase2[0]], runOpts(true));
       record(lpRun);
-      noteLp(okRun(lpRun));
+      noteLp(lpLanded(lpRun));
       if (lpRun.outcome.kind === "held") {
         if (lpRun.outcome.reason.startsWith("strict")) pairingStats.lpHeldCounterpartyMiss++;
         else pairingStats.lpHeldPhase1Unlanded++;

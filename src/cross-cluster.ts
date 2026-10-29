@@ -73,8 +73,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { DEFAULT_REGISTRY_FILE, loadRegistryForProgramSet } from "./cross-cluster/registry.ts";
-import { bindObservationRegistry, validateMultiAssetEntry } from "./cross-cluster/multi-asset.ts";
-import { parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
+import { bindObservationRegistry, registryRowProblems } from "./cross-cluster/multi-asset.ts";
+import { bootPositiveNumberEnv, parsePositiveLamportsFromSolEnv, parsePositiveNumberEnv } from "./env-utils.ts";
 import { isExplicitTrue, validateRpcEndpoint } from "./rpc-url.ts";
 import { startKeeperLoop } from "./cross-cluster/keeper-loop.ts";
 import { MIN_POOL_LIQUIDITY_USD_E6 } from "./cross-cluster/price-reader.ts";
@@ -83,6 +83,7 @@ import { crankAllOnce, startRecoveryCrankLoop } from "./cross-cluster/recovery-c
 import { makeLpFeeJob } from "./cross-cluster/lp-fee-cranker.ts";
 import { makeStakeFeeJob, stakeFeeConfigFromEnv } from "./cross-cluster/stake-fee-pusher.ts";
 import { makeTerminalInsuranceJob, terminalInsuranceConfigFromEnv } from "./cross-cluster/terminal-insurance.ts";
+import { loserForceCloseConfigFromEnv, makeResolvedLoserForceCloseJob } from "./cross-cluster/resolved-loser-force-close.ts";
 import type { TerminalInsuranceConfig } from "./cross-cluster/terminal-insurance.ts";
 import type { StakeFeeConfig } from "./cross-cluster/stake-fee-pusher.ts";
 import { startFeeJobLoop } from "./cross-cluster/fee-jobs.ts";
@@ -120,6 +121,8 @@ import { fetchMarketPortfolios } from "./cross-cluster/recovery-cranker.ts";
 import { v22FlagsFromEnv, describeV22Flags } from "./cross-cluster/v22/flags.ts";
 import { V22Loop, startV22Loop } from "./cross-cluster/v22/loop.ts";
 import { setLoneLpCrankSuppressor } from "./cross-cluster/v22/delegation.ts";
+import { LevGuardKeeper, levGuardConfigFromEnv, levGuardEnabled, loadRiskKey } from "./cross-cluster/v22/lev-guard.ts";
+import { setLevGuardHealthProvider } from "./cross-cluster/v22/health.ts";
 import { countingFetch } from "./cross-cluster/rpc-metrics.ts";
 import { failoverFromEnv, parseFallbackUrls } from "./rpc-failover.ts";
 import { readHealth, recordLaunch, restartConfig } from "./restart-escalation.ts";
@@ -277,7 +280,7 @@ const DRY_RUN =
   process.env.KEEPER_DRY_RUN === "true" ||
   process.argv.includes("--dry-run");
 
-const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
+const CC_INTERVAL_MS = bootPositiveNumberEnv("CC_INTERVAL_MS", 7000);
 
 // Cadence footgun (runbook fresh-id-redeploy-plan §8): the mark smoother only
 // publishes once its window SPANS 5/6 of CC_MARK_WINDOW_MS, and samples older
@@ -286,7 +289,7 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
 // `never` refuses to boot (a keeper that never pushes looks alive and prices
 // nothing); `fragile` warns. Skipped in dry-run, which never pushes anyway.
 {
-  const windowMs = Number(process.env.CC_MARK_WINDOW_MS ?? 15_000);
+  const windowMs = bootPositiveNumberEnv("CC_MARK_WINDOW_MS", 15_000);
   const c = markCadenceCheck(CC_INTERVAL_MS, windowMs);
   if (c.verdict === "never" && !DRY_RUN) {
     console.error(`[fatal] this cadence can never publish a mark — the keeper would never push. ${c.detail}. Use e.g. 1500 / 8000 (the live pair).`);
@@ -295,10 +298,10 @@ const CC_INTERVAL_MS = parseInt(process.env.CC_INTERVAL_MS ?? "7000", 10);
   if (c.verdict === "never") console.warn(`[warn] cadence can never publish (dry-run, continuing): ${c.detail}`);
   if (c.verdict === "fragile") console.warn(`[warn] cadence publishes only if every cycle is exactly on time: ${c.detail}`);
 }
-const CC_HEALTH_PORT = parseInt(process.env.CC_HEALTH_PORT ?? "3001", 10);
+const CC_HEALTH_PORT = bootPositiveNumberEnv("CC_HEALTH_PORT", 3001);
 const CC_HEALTH_BIND = process.env.CC_HEALTH_BIND ?? "0.0.0.0";
 // D2a — see cross-cluster/keeper-loop.ts's hang-detection doc comment.
-const CC_CYCLE_TIMEOUT_MS = parseInt(process.env.CC_CYCLE_TIMEOUT_MS ?? "10000", 10);
+const CC_CYCLE_TIMEOUT_MS = bootPositiveNumberEnv("CC_CYCLE_TIMEOUT_MS", 10000);
 
 // Recovery/maintenance crank loop — independent cadence from the oracle push.
 // See cross-cluster/recovery-cranker.ts for why this exists (keeps
@@ -306,12 +309,12 @@ const CC_CYCLE_TIMEOUT_MS = parseInt(process.env.CC_CYCLE_TIMEOUT_MS ?? "10000",
 // EngineLockActive on risk-increasing trades). Defaults to on; set
 // CRANK_ENABLED=false to disable (e.g. for a read-only / dry-run deploy).
 const CRANK_ENABLED = process.env.CRANK_ENABLED !== "false";
-const CRANK_INTERVAL_MS = parseInt(process.env.CRANK_INTERVAL_MS ?? "20000", 10);
+const CRANK_INTERVAL_MS = bootPositiveNumberEnv("CRANK_INTERVAL_MS", 20000);
 // LP_FEE_CRANK_ENABLED=false to disable. 200s by default: fee distribution is not
 // latency-sensitive (it only moves already-accrued atoms into the vault), and a
 // market with no LP depositors costs no transaction at all.
 const LP_FEE_CRANK_ENABLED = process.env.LP_FEE_CRANK_ENABLED !== "false";
-const LP_FEE_CRANK_INTERVAL_MS = parseInt(process.env.LP_FEE_CRANK_INTERVAL_MS ?? "200000", 10);
+const LP_FEE_CRANK_INTERVAL_MS = bootPositiveNumberEnv("LP_FEE_CRANK_INTERVAL_MS", 200000);
 // Stake-fee push (tag 87 -> stake AccrueFees, fee-flow audit F2/F3). Shares the
 // fee-job loop and its interval with the LP-fee crank.
 const STAKE_FEE_PUSH_ENABLED = process.env.STAKE_FEE_PUSH_ENABLED !== "false";
@@ -337,7 +340,7 @@ let registrationStream: RegistrationStream | null = null;
 // so a new market is picked up in ~ms. This loop exists for when that socket is
 // down, throttled, or Realtime is unavailable — registration still converges,
 // just slower. 30s is fine for that role; it does not gate launch latency.
-const REGISTER_POLL_INTERVAL_MS = parseInt(process.env.REGISTER_POLL_INTERVAL_MS ?? "30000", 10);
+const REGISTER_POLL_INTERVAL_MS = bootPositiveNumberEnv("REGISTER_POLL_INTERVAL_MS", 30000);
 
 // v2.1 cutover: the default registry file follows the program set
 // (registry.json for v1 — unchanged — and registry.v21.json for KEEPER_DEVNET_V21=1).
@@ -347,17 +350,17 @@ const REGISTRY_PATH =
 
 // G6 — registry.json hot-reload, so a re-seed is picked up live without a
 // restart. See cross-cluster/registry-reload.ts for the full rationale.
-const REGISTRY_RELOAD_INTERVAL_MS = parseInt(process.env.REGISTRY_RELOAD_INTERVAL_MS ?? "15000", 10);
+const REGISTRY_RELOAD_INTERVAL_MS = bootPositiveNumberEnv("REGISTRY_RELOAD_INTERVAL_MS", 15000);
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 const keeper = loadKeypair();
 const registry = loadRegistryForProgramSet(REGISTRY_PATH, PROGRAM_IDS_RESOLVED.programSet);
-// K-6: multi-asset rows must be well formed (the keeper never guesses a source or an asset), and every observation
+// K-6 / A8-4: every row must be well formed (the keeper never guesses a key, a source or an asset), and every observation
 // crank looks its market's asset list up in the LIVE registry (hot-reloaded in place, hence the getter).
 {
-  const problems = registry.markets.flatMap((m) => validateMultiAssetEntry(m));
+  const problems = registryRowProblems(registry.markets);
   if (problems.length > 0) {
-    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid multi-asset row(s):\n  ${problems.join("\n  ")}`);
+    console.error(`[fatal] registry ${REGISTRY_PATH}: invalid registry row(s):\n  ${problems.join("\n  ")}`);
     process.exit(1);
   }
 }
@@ -501,6 +504,41 @@ if (V22_FLAGS.enabled) {
   console.log("[v22] VAULT_LP_LONE_CRANK=off: the lone vault-LP crank after a landed push is suppressed on every market");
 }
 
+// Leverage guard (wrapper tag 124): POKE after a landed push / before an Earn allocation (KEEPER_LEV_POKE), the hourly holder job
+// (KEEPER_LEV_HOLDER_JOB, optional KEEPER_LEV_RISK_KEY_PATH) and the W1 LP-stop cranker (KEEPER_LEV_W1). All default OFF; with all of them off nothing
+// is constructed, no instruction is built and /health gains no key. See cross-cluster/v22/lev-guard.ts.
+const LEV_GUARD_CONFIG = levGuardConfigFromEnv();
+function loadRiskKeyOrExit(path: string): Keypair | null {
+  try {
+    return loadRiskKey(path);
+  } catch (err) {
+    console.error(`[fatal] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+const levGuard = levGuardEnabled(LEV_GUARD_CONFIG)
+  ? new LevGuardKeeper({
+      conn: devnetConn,
+      keeper,
+      programId: CFG_WRAPPER_PROGRAM_ID,
+      dryRun: DRY_RUN || V22_FLAGS.dryRun,
+      config: LEV_GUARD_CONFIG,
+      riskKey: LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath ? loadRiskKeyOrExit(LEV_GUARD_CONFIG.riskKeyPath) : null,
+    })
+  : null;
+if (levGuard) {
+  setLevGuardHealthProvider(() => levGuard.healthFields());
+  console.log(
+    `[lev-guard] ON poke=${LEV_GUARD_CONFIG.poke} holderJob=${LEV_GUARD_CONFIG.holderJob} w1=${LEV_GUARD_CONFIG.w1} riskKey=${!!(LEV_GUARD_CONFIG.holderJob && LEV_GUARD_CONFIG.riskKeyPath)}${DRY_RUN || V22_FLAGS.dryRun ? " (DRY-RUN: simulate and log, send nothing)" : ""}`,
+  );
+  if (LEV_GUARD_CONFIG.holderJob) {
+    // each market runs at most once per KEEPER_LEV_HOLDER_INTERVAL_MS; this timer only checks who is due
+    setInterval(() => {
+      void levGuard.holderTick(registry.markets).catch(() => {});
+    }, 60_000).unref();
+  }
+}
+
 const bootCrankStates = CRANK_ENABLED ? await crankAllOnce(devnetConn, keeper, registry, DRY_RUN) : undefined;
 
 // Recovery crank loop runs concurrently on its own interval — deliberately
@@ -559,6 +597,11 @@ const vaultLpCranker =
   const feeJobs: FeeJob[] = [];
   if (LP_FEE_CRANK_ENABLED) feeJobs.push(makeLpFeeJob());
   if (STAKE_FEE_PUSH_ENABLED) feeJobs.push(makeStakeFeeJob(STAKE_FEE_CONFIG));
+  // SEC-RC I-S1 (S1-6 a/c, engine e59aa6a6): after a Resolved market's force-close delay, close the claimants that are not
+  // waiting (the loss side) so winners refused with 21 are released. Inert unless the deployed wrapper is a known S1-6 a/c
+  // build (s16ac-engine-gate.ts). Before the wind-down so the same cycle's cleanup sees the losers closed.
+  const loserForceClose = loserForceCloseConfigFromEnv(process.env);
+  if (loserForceClose) feeJobs.push(makeResolvedLoserForceCloseJob(loserForceClose));
   if (TERMINAL_INSURANCE_ENABLED) feeJobs.push(makeTerminalInsuranceJob(TERMINAL_CONFIG));
   // Read-only: alerts when a bound vault's seniors are done but the junior's tag 102 has not run.
   if (process.env.JUNIOR_WATCH_ENABLED !== "false") feeJobs.push(makeJuniorWatchJob(JUNIOR_WATCH_CONFIG));
@@ -611,7 +654,15 @@ if (P2B_GATE_CONFIG.mode !== "off") {
     sink: ALERT_SINK,
     allocator: new VaultLpAllocator(
       { ...P2B_ALLOCATE_CONFIG, dryRun: DRY_RUN },
-      { programId: CFG_WRAPPER_PROGRAM_ID, conn: devnetConn, keeper, walletLow: () => p2bLoop.walletLow(), onUnsupported: () => gate.reportUnsupported() },
+      {
+        programId: CFG_WRAPPER_PROGRAM_ID,
+        conn: devnetConn,
+        keeper,
+        walletLow: () => p2bLoop.walletLow(),
+        onUnsupported: () => gate.reportUnsupported(),
+        // KEEPER_LEV_POKE: sample the guard's NAV immediately before Earn principal moves into the LP (night fix F1)
+        beforeSend: levGuard && LEV_GUARD_CONFIG.poke ? (market, label) => levGuard.beforeAllocate(market.toBase58(), label) : undefined,
+      },
     ),
     windDown: new AdlWindDownRunner(
       { ...P2B_WIND_DOWN_CONFIG, dryRun: DRY_RUN },
@@ -735,11 +786,13 @@ if (MIN_POOL_LIQUIDITY_USD_E6 === 0n) {
 
 await startKeeperLoop(mainnetConn, devnetConn, keeper, registry, {
   withholdPush: (m) => getExhaustedRegistry().shouldWithholdPush(m, P3_EXHAUSTED_WITHHOLD_PUSHES),
-  onPushLanded: vaultLpCranker
-    ? (m, px, label) => {
-        void vaultLpCranker.onPushLanded(m, px, label);
-      }
-    : undefined,
+  onPushLanded:
+    vaultLpCranker || levGuard
+      ? (m, px, label) => {
+          if (vaultLpCranker) void vaultLpCranker.onPushLanded(m, px, label);
+          if (levGuard) void levGuard.onPushLanded(m, label);
+        }
+      : undefined,
   intervalMs: CC_INTERVAL_MS,
   healthPort: CC_HEALTH_PORT,
   healthBind: CC_HEALTH_BIND,

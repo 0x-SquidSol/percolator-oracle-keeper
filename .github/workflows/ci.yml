@@ -24,6 +24,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: shell syntax
+        # deploy/railway-start.sh is the container's CMD: a parse error there fails every Railway boot, and nothing else runs it.
+        run: for f in $(git ls-files '*.sh'); do bash -n "$f"; done
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
           version: 10.33.0
